@@ -1,0 +1,288 @@
+// src/format_record.pdx — mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3)
+// PdxFsFormatRecord@0.1 emitter.
+//
+// design/tooling/volume-tooling-ux.md §3.5 defines the FULL
+// PdxFsFormatRecord@0.1 schema: target_kind, target_uri, block_size,
+// total_blocks, journal_blocks, itable_blocks, data_blocks, uuid,
+// label, sig_key_hash, signed, invoker_user, ts_ns, dry_run,
+// refused_gates -- fourteen fields, most of which require either (a)
+// stat-ing the real target to compute total_blocks/itable_blocks/
+// data_blocks (mkfs.pdxfs.M2), (b) a KIND_USER lookup for
+// invoker_user (mkfs.pdxfs.M3-004, audit integration), or (c) a real
+// clock read for ts_ns. None of that substrate exists at M1.
+//
+// What THIS file emits at M1 is the four-field slice this issue's own
+// acceptance shape asks for -- a line-based, human-readable rendering
+// on stdout of exactly:
+//
+//   PdxFsFormatRecord@0.1 { target: <path>, label: <label>,
+//                           journal_size: <N>, dry_run: true }
+//
+// This is a REAL body, not a placeholder-value stub: every field
+// printed is the caller's actual argument (target string, label string
+// or empty, journal_size as a real decimal conversion of the u64
+// value) -- there is no dummy/fixed data anywhere in this function.
+// What IS deferred to mkfs.pdxfs.M3-003 is (a) the remaining ten
+// schema fields (target_kind, block_size, total_blocks, uuid, ...),
+// none of which this file's single entry point accepts or prints, and
+// (b) the semantic-pipe framing itself -- a schema-typed binary record
+// over a bound KIND_IPC_ENDPOINT (design/tooling/r49-r50-plan.md §3.2),
+// vs. this file's plain `sys_write(1, ...)` of ASCII text. Per
+// mkfs.pdxfs.M1-003's own acceptance text: "line-based, human readable
+// for now -- semantic-pipe framing is M3-003."
+//
+// dry_run is always printed as the literal `true` -- this module has
+// no other caller at M1 (main.pdx only reaches format_record_emit_
+// dry_run on the --dry-run branch); a future real-write path
+// (mkfs.pdxfs.M2) will need its own emit entry point (or a dry_run
+// parameter threaded through this one) once it exists, which is out of
+// scope for this landing.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom. Byte STORES
+// (e.g. `mov al, 0x30; mov [rsp], al`) are unaffected by the paideia-as
+// #1248 load-side gap and use plain sub-register movs, matching
+// src/user/init.pdx's print_u64_dec in the paideia-os monorepo (the
+// precedent this file's decimal-conversion loop is adapted from). No
+// `test` mnemonic; every zero-check is `cmp reg, 0`. No `imul`/`mul`
+// (the decimal conversion only ever DIVIDES by the compile-time
+// constant 10 via `div`, which is unaffected by this codebase's
+// imul-avoidance convention -- that convention is about MULTIPLYING by
+// a compile-time constant, not dividing). Reserved-label discipline:
+// every branch label in this file is prefixed `mkfs_fr_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §3.5 (paideia-os);
+// src/user/init.pdx print_u64_dec (paideia-os monorepo, the decimal-
+// conversion precedent).
+
+module FormatRecord = structure {
+
+  // --- Literal chunks of the printed line (see module header for the
+  //     exact target shape). Lengths are exact byte counts (verified via
+  //     `python3 -c "print(len(...))"` against each literal below), not
+  //     counting any trailing NUL the storage array happens to add for
+  //     any that use one. -------------------------------------------------
+  pub let fr_lit_prefix     : [u8; 33] = "PdxFsFormatRecord@0.1 { target: \0"
+  pub let fr_lit_prefix_len : u64 = 32
+
+  pub let fr_lit_label     : [u8; 10] = ", label: \0"
+  pub let fr_lit_label_len : u64 = 9
+
+  pub let fr_lit_journal     : [u8; 17] = ", journal_size: \0"
+  pub let fr_lit_journal_len : u64 = 16
+
+  pub let fr_lit_suffix     : [u8; 19] = ", dry_run: true }\n\0"
+  pub let fr_lit_suffix_len : u64 = 18
+
+  // ==========================================================================
+  // format_record_strlen(s) -> u64
+  //
+  // Byte-loop strlen, identical shape to src/user/string.pdx's strlen in
+  // the paideia-os monorepo. Not shared with Argv (argv.pdx has no
+  // strlen of its own -- its parser only ever needs equality/prefix
+  // compares, never a length), so this file carries its own copy rather
+  // than introducing a link-order dependency on argv.pdx for one loop.
+  // Pure leaf: rax/rcx/rdi are SysV caller-save.
+  // ==========================================================================
+  pub let format_record_strlen : (u64) -> u64 !{mem} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M1-001/M1-003: format_record_strlen entry point. s in rdi. Loop: xor+mov_b loads *s into rcx (zero-extended); cmp rcx, 0; je mkfs_fr_strlen_done on NUL; else add rax,1 (counter) and add rdi,1 (cursor), loop. Pure leaf -- rax/rcx/rdi all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mkfs_fr_strlen_.",
+      block: {
+        xor rax, rax;
+
+      mkfs_fr_strlen_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je mkfs_fr_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp mkfs_fr_strlen_loop;
+
+      mkfs_fr_strlen_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // format_record_emit_dry_run(target_ptr, label_ptr, journal_size) -> ()
+  //
+  //   rdi = target_ptr    (NUL-terminated <target> string, e.g. from
+  //                         ParsedArgv.target_ptr)
+  //   rsi = label_ptr      (NUL-terminated --label value, or 0 if the
+  //                         flag was not given -- printed as an empty
+  //                         string, i.e. the ", label: " literal is
+  //                         still emitted but with nothing after it
+  //                         before the next literal)
+  //   rdx = journal_size   (u64 block count; already defaulted by
+  //                         Argv::argv_parse to ARGV_DEFAULT_JOURNAL_SIZE
+  //                         if --journal-size was not given)
+  //
+  // Writes exactly one line to fd 1 (stdout) via a fixed sequence of
+  // sys_write calls, one per literal-or-dynamic segment (never
+  // concatenating into a scratch buffer first -- matches cat.pdx's own
+  // cat_open_err error-path splicing convention of several small
+  // sys_write calls in sequence rather than one buffer-assembly pass).
+  // Segments, in wire order:
+  //   1. fr_lit_prefix                     "PdxFsFormatRecord@0.1 { target: "
+  //   2. target_ptr, length via format_record_strlen
+  //   3. fr_lit_label                      ", label: "
+  //   4. label_ptr (skipped entirely if label_ptr == 0), length via
+  //      format_record_strlen
+  //   5. fr_lit_journal                    ", journal_size: "
+  //   6. journal_size, decimal-converted via an inline div-by-10 loop
+  //      into a 24-byte stack scratch buffer (adapted from
+  //      src/user/init.pdx's print_u64_dec in the paideia-os monorepo --
+  //      that function calls sys_debug_puts internally; this one writes
+  //      to fd 1 via sys_write directly instead, since mkfs.pdxfs has no
+  //      link-time access to init.pdx's private routine and this is a
+  //      standalone satellite repo)
+  //   7. fr_lit_suffix                     ", dry_run: true }\n"
+  //
+  // Never returns an error code -- sys_write's return value is ignored
+  // on every call (matches cat.pdx's own "ignored per _start
+  // justification" posture for its tty0-backed stdout writes at this
+  // maturity). Caller (main.pdx) calls sys_exit itself after this
+  // returns.
+  //
+  // Register plan. rbx/r12/r13 are SysV callee-save and are explicitly
+  // saved (push) on entry and restored (pop) before the single `ret` --
+  // this function is a public entry point a future caller may rely on
+  // for register preservation (matching the discipline libpdx-audit's
+  // audit_send_record follows via its own push r12/push r13 pair), so
+  // repurposing them for the duration of this call without saving them
+  // first would be an ABI violation even though THIS file's only
+  // caller (main.pdx) happens not to need them preserved across this
+  // particular call site:
+  //   rbx = target_ptr   (held across segment 2's nested call)
+  //   r12 = label_ptr    (held across segment 4's nested call)
+  //   r13 = journal_size (held across segments 1-5, consumed at segment 6)
+  //
+  // No r14 is needed: format_record_strlen touches only rax/rcx/rdi (its
+  // own justification), never rsi/rdx, so its return value in rax is
+  // moved directly into rdx for the very next sys_write rather than
+  // being stashed in a fourth callee-save register first.
+  // ==========================================================================
+  pub let format_record_emit_dry_run : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (label_ptr: u64) (journal_size: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M1-003 (#3): format_record_emit_dry_run entry point. SysV callee-save discipline: push rbx; push r12; push r13 (3 registers, 24 bytes) BEFORE repurposing any of them -- pops occur in reverse order immediately before the single `ret`. rbx=target_ptr, r12=label_ptr, r13=journal_size, all now-saved SysV callee-save registers that survive the nested `call format_record_strlen` invocations and the several `syscall` instructions below (format_record_strlen clobbers only caller-save registers per its own justification; SYSCALL preserves callee-save registers by the amd64 fast-syscall convention, even though the kernel's #743 info-leak hardening zeroes rdi/rsi/rdx/r8/r9/r10 -- all caller-save -- before every sysret, which is exactly why this function reloads rdi/rsi/rdx fresh before every syscall rather than assuming any of them survive one). Segment 1: sys_write(1, fr_lit_prefix, 32) -- SC+ ID 1, rdi=fd, rsi=buf (rip-relative lea), rdx=count, rax=1, syscall. Segment 2: call format_record_strlen(rbx) -> rax = len, moved directly into rdx (no r14 needed -- format_record_strlen never touches rsi/rdx); sys_write(1, rbx, rdx). Segment 3: sys_write(1, fr_lit_label, 9). Segment 4: cmp r12, 0; je mkfs_fr_no_label skips straight to segment 5 when --label was not given (an empty string is correct output: the literal already printed in segment 3 reads ', label: ' with nothing following before segment 5's ', journal_size: ' literal); otherwise call format_record_strlen(r12) -> rax -> rdx, sys_write(1, r12, rdx). Segment 5: sys_write(1, fr_lit_journal, 16). Segment 6: `sub rsp, 24` scratch (24 = 20 digit-buffer bytes + 4 alignment slop, matching print_u64_dec's own sizing) then a zero-value special case (r13 == 0 writes a single '0' byte) or the general div-by-10 loop: r9 = remaining value, r10 = cursor starting at rsp+19 and walking DOWN (writes digits most-significant-last, so the final [cursor, rsp+20) slice is already MSB-first with no separate reversal pass -- identical algorithm to src/user/init.pdx's print_u64_dec in the paideia-os monorepo, adapted to `sys_write(1, ...)` instead of that function's internal `call sys_debug_puts`, since this is a standalone satellite repo with no link-time access to init.pdx's private routine). `add rsp, 24` restores the stack after the digit sys_write. Segment 7: sys_write(1, fr_lit_suffix, 18). Pops r13/r12/rbx (reverse push order) and returns (no value; caller sys_exits itself). No `add reg,[mem]` (the digit-count computation `mov rax,rsp; add rax,20; sub rax,r10` operates on registers only, never adding a memory operand). No `test` mnemonic. No `imul`/`mul` -- only `div` by the compile-time constant 10, which is not subject to this codebase's imul-avoidance convention (that convention targets compile-time-constant MULTIPLIES). Labels prefixed mkfs_fr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r12, rsi;                       // r12 = label_ptr
+        mov r13, rdx;                       // r13 = journal_size
+
+        // ---- Segment 1: "PdxFsFormatRecord@0.1 { target: " -------------
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_prefix];
+        mov rdx, 32;                        // fr_lit_prefix_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- Segment 2: target path --------------------------------------
+        mov rdi, rbx;
+        call format_record_strlen;
+        mov rdx, rax;                       // rdx = target_len
+        mov rdi, 1;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: ", label: " ---------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_label];
+        mov rdx, 9;                         // fr_lit_label_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: label (skipped when unset) -----------------------
+        cmp r12, 0;
+        je mkfs_fr_no_label;
+
+        mov rdi, r12;
+        call format_record_strlen;
+        mov rdx, rax;                       // rdx = label_len
+        mov rdi, 1;
+        mov rsi, r12;
+        mov rax, 1;
+        syscall;
+
+      mkfs_fr_no_label:
+        // ---- Segment 5: ", journal_size: " --------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_journal];
+        mov rdx, 16;                        // fr_lit_journal_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 6: journal_size, decimal ----------------------------
+        sub rsp, 24;
+
+        cmp r13, 0;
+        jne mkfs_fr_jsz_setup;
+
+        // Zero special case: single '0' digit.
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdi, 1;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_jsz_done;
+
+      mkfs_fr_jsz_setup:
+        mov r9, r13;                        // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                        // r10 = cursor at last staging byte
+
+      mkfs_fr_jsz_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                       // zero-extend rdx:rax for div
+        div rcx;                            // rax = quotient, rdx = remainder
+        add rdx, 0x30;                      // digit -> ASCII '0'..'9'
+        mov [r10], dl;                      // store at cursor
+        mov r9, rax;                        // r9 = quotient
+        cmp r9, 0;
+        je mkfs_fr_jsz_emit;
+        sub r10, 1;                         // advance cursor left (MSB-ward)
+        jmp mkfs_fr_jsz_loop;
+
+      mkfs_fr_jsz_emit:
+        // r10 points at the first (MSB) digit. Length = (rsp + 20) - r10.
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                       // rax = digit count
+        mov rdx, rax;                       // sys_write count
+        mov rdi, 1;                         // fd
+        mov rsi, r10;                       // buf
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+      mkfs_fr_jsz_done:
+        add rsp, 24;
+
+        // ---- Segment 7: ", dry_run: true }\n" ------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_suffix];
+        mov rdx, 18;                        // fr_lit_suffix_len
+        mov rax, 1;
+        syscall;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

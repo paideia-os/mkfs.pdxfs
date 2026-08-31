@@ -1,0 +1,171 @@
+// src/target.pdx — mkfs.pdxfs.M1-001 (scaffold) — target-taxonomy classifier
+//
+// Per design/tooling/volume-tooling-ux.md §3.2, <target> resolves to one
+// of two shapes:
+//
+//   File-backed path.  <target> begins with `/`, `~`, or `.`  --
+//     resolves to a KIND_PDXFS_FILE cap (opened, created + truncated if
+//     absent). Real body: mkfs.pdxfs.M2-002.
+//   Device-cap URI.    <target> begins with `cap:blkdev:`  --
+//     resolves to a KIND_BLOCK_DEVICE cap looked up in the invoker's cap
+//     environment, elevate-required, signing mandatory. Real body:
+//     mkfs.pdxfs.M3-001.
+//
+// This file is the STUB named by this issue: `target_classify` looks
+// only at the leading bytes of the raw argv string to decide WHICH of
+// the two branches a caller (main.pdx) should take -- it never opens a
+// cap, never calls sys_open, never resolves anything beyond a byte
+// prefix. That is a deliberate, narrow scope: mkfs.pdxfs.M1-003 (#3)
+// needs SOME classification to gate its --dry-run happy path ("target
+// parses as a file path"), and a byte-prefix check is the entire
+// contract that gate needs -- it does not need the real
+// open+create+truncate mechanics design/tooling/volume-tooling-ux.md
+// §3.2 describes for the FULL resolver. The full resolver (minting a
+// real KIND_PDXFS_FILE / KIND_BLOCK_DEVICE cap from the classification)
+// is mkfs.pdxfs.M2-001, which this file's own header note flags as the
+// still-open gap: target_classify's result is currently used only to
+// pick a print branch, never to authorize a syscall.
+//
+// Any prefix other than `/`, `~`, `.`, or `cap:blkdev:` is
+// TARGET_INVALID -- per §3.2's closing sentence: "Any other prefix is a
+// parse error (exit 2, invalid argument). No implicit /dev-style
+// resolution -- every cap URI is explicit."
+//
+// Encoder-gap discipline: no `add reg, [mem]` anywhere; every byte load
+// uses `xor reg, reg; mov_b reg, [ptr]`. No `test` mnemonic. Reserved-
+// label discipline: every branch label in this file is prefixed
+// `mkfs_target_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §3.2 (paideia-os).
+
+module Target = structure {
+
+  // --- target_classify return values. ------------------------------------
+  pub let TARGET_FILE        : u64 = 0   // starts with '/', '~', or '.'
+  pub let TARGET_DEVICE_CAP  : u64 = 1   // starts with "cap:blkdev:"
+  pub let TARGET_INVALID     : u64 = 2   // any other prefix
+
+  // --- "cap:blkdev:" literal, used by the device-cap prefix check. -------
+  pub let target_lit_cap_blkdev     : [u8; 11] = "cap:blkdev:"
+  pub let target_lit_cap_blkdev_len : u64 = 11
+
+  // ==========================================================================
+  // target_classify(target_ptr) -> u64 (TARGET_FILE | TARGET_DEVICE_CAP | TARGET_INVALID)
+  //
+  // target_ptr in rdi: a NUL-terminated string, typically
+  // ParsedArgv.target_ptr from Argv::argv_parse. Inspects only the first
+  // byte (for '/', '~', '.') and, failing those, the first 11 bytes
+  // (for the "cap:blkdev:" literal) via a local unrolled prefix compare
+  // -- no shared subroutine call, since this file has no other function
+  // that would benefit from factoring the comparison out, and inlining
+  // keeps this stub a pure leaf with no nested call.
+  //
+  // Pure leaf: rax/rcx/r8/rdi are all SysV caller-save; no push/pop.
+  // ==========================================================================
+  pub let target_classify : (u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3): target_classify entry point. target_ptr in rdi. Gate 1: load the first byte via xor rax,rax; mov_b rax,[rdi] (zero-extended per paideia-as #1248 workaround). cmp rax, 0x2F ('/'); je mkfs_target_is_file. cmp rax, 0x7E ('~'); je mkfs_target_is_file. cmp rax, 0x2E ('.'); je mkfs_target_is_file. Gate 2: an 11-byte unrolled compare of [rdi+0..11) against target_lit_cap_blkdev ('cap:blkdev:') -- each byte pair loaded via xor+mov_b into rax/r8 and compared with cmp/jne to mkfs_target_invalid on any mismatch; on all 11 matching, return TARGET_DEVICE_CAP (1). Unrolled rather than a shared loop subroutine (unlike Argv::argv_prefix_match, which this function deliberately does NOT call) because this stub's whole job is a single fixed-length compare done once, and adding a cross-module call here would pull target.pdx into a link-order dependency on argv.pdx it does not otherwise need. Pure leaf -- rax/rcx/r8/rdi all SysV caller-save, no callee-save touched, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mkfs_target_.",
+      block: {
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0x2F;                      // '/'
+        je mkfs_target_is_file;
+        cmp rax, 0x7E;                      // '~'
+        je mkfs_target_is_file;
+        cmp rax, 0x2E;                      // '.'
+        je mkfs_target_is_file;
+
+        // ---- 11-byte unrolled compare against "cap:blkdev:" -------------
+        lea rsi, [rip + target_lit_cap_blkdev];
+
+        xor rax, rax;
+        mov_b rax, [rdi + 0];
+        xor r8, r8;
+        mov_b r8, [rsi + 0];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 1];
+        xor r8, r8;
+        mov_b r8, [rsi + 1];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 2];
+        xor r8, r8;
+        mov_b r8, [rsi + 2];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 3];
+        xor r8, r8;
+        mov_b r8, [rsi + 3];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 4];
+        xor r8, r8;
+        mov_b r8, [rsi + 4];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 5];
+        xor r8, r8;
+        mov_b r8, [rsi + 5];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 6];
+        xor r8, r8;
+        mov_b r8, [rsi + 6];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 7];
+        xor r8, r8;
+        mov_b r8, [rsi + 7];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 8];
+        xor r8, r8;
+        mov_b r8, [rsi + 8];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 9];
+        xor r8, r8;
+        mov_b r8, [rsi + 9];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        xor rax, rax;
+        mov_b rax, [rdi + 10];
+        xor r8, r8;
+        mov_b r8, [rsi + 10];
+        cmp rax, r8;
+        jne mkfs_target_invalid;
+
+        mov rax, 1;                         // TARGET_DEVICE_CAP
+        ret;
+
+      mkfs_target_is_file:
+        xor rax, rax;                       // TARGET_FILE
+        ret;
+
+      mkfs_target_invalid:
+        mov rax, 2;                         // TARGET_INVALID
+        ret;
+      }
+    }
+}

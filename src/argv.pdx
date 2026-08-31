@@ -1,0 +1,446 @@
+// src/argv.pdx — mkfs.pdxfs.M1-002 (issue #2) — argv surface
+//
+// Long-flag CLI per design/tooling/volume-tooling-ux.md §3.1:
+//
+//   mkfs.pdxfs [--force] [--label=<str>] [--journal-size=<n_blocks>]
+//              [--dry-run] [--verbose] [--sig-key=<key-cap-uri>] <target>
+//
+// libpdx-argv availability note (see design/architecture.md §3 for the
+// full write-up): a `grep libpdx-argv` across the paideia-os monorepo
+// and every repo under paideia-satellites/ finds ZERO occurrences of a
+// `libpdx-argv` implementation -- only design-doc *mentions* of a
+// planned library (design/tooling/r49-r50-plan.md §3.2). No such repo
+// or source file exists to link against as of this landing. Per this
+// issue's own instruction, this file therefore implements a MINIMAL
+// long-flag parser INLINE rather than blocking mkfs.pdxfs.M1 on a
+// library that has not been bootstrapped. A proper libpdx-argv
+// integration is deferred until that library exists; this module's
+// public entry point (`argv_parse`) is intentionally the same shape
+// (argc/argv in, a parsed-fields out-pointer, a u64 status code) a
+// future libpdx-argv-backed rewrite would present, so callers (just
+// src/main.pdx at M1) do not need to change at the call site if/when
+// that swap happens.
+//
+// ----------------------------------------------------------------------
+// ParsedArgv -- out-struct layout (5 u64-aligned slots, 40 bytes)
+// ----------------------------------------------------------------------
+//
+// Every field is stored as a full u64 slot (never a packed u32/narrower
+// width) -- matches the alignment-for-simplicity convention libpdx-volume
+// uses for PdxbSuperblockSummary / MountTableRow (design/architecture.md
+// §2 in that repo: "this library's in-memory struct keeps every slot a
+// full aligned u64 for simplicity of access from paideia-as"). The task
+// brief sketches `flags` as u32; this file widens it to u64 for the same
+// reason -- paideia-as has no native sub-8-byte struct-field addressing
+// beyond raw byte offsets, and a narrower flags slot would save nothing
+// in a 40-byte struct that is otherwise all u64.
+//
+//   PA_OFF_FLAGS          = 0   -- bitmask, see PA_FLAG_* below
+//   PA_OFF_LABEL_PTR      = 8   -- NUL-terminated string ptr, or 0 if unset
+//   PA_OFF_JOURNAL_SIZE   = 16  -- u64 block count; defaults to 1024 (4 MiB
+//                                  at the frozen 4096-byte block size, per
+//                                  volume-tooling-ux.md §3.1) when
+//                                  --journal-size is not given
+//   PA_OFF_SIG_KEY_PTR    = 24  -- NUL-terminated cap-URI ptr, or 0 if unset
+//   PA_OFF_TARGET_PTR     = 32  -- NUL-terminated <target> ptr, or 0 if the
+//                                  caller supplied no positional argument
+//                                  (main.pdx treats 0 as ARGV_ERR_MISSING_TARGET)
+//
+// PA_FLAG_FORCE / PA_FLAG_DRY_RUN / PA_FLAG_VERBOSE are boolean presence
+// bits. PA_FLAG_LABEL_SET / PA_FLAG_JOURNAL_SIZE_SET / PA_FLAG_SIG_KEY_SET
+// additionally record whether the corresponding value-flag was seen at
+// all (distinct from "seen but value pointer happens to be non-zero",
+// which is already implied by a non-zero out-slot -- these bits exist so
+// a future caller can distinguish "explicitly set to the default value"
+// from "left unset" for --journal-size specifically, since 0 is not a
+// sentinel-safe value there the way NULL is for the two string fields).
+//
+// ----------------------------------------------------------------------
+// Parsing strategy
+// ----------------------------------------------------------------------
+//
+// One pass over argv[1..argc). Each token is tested against six known
+// flag literals via one of two shared subroutines:
+//
+//   argv_streq(a, b)              -- exact NUL-terminated equality.
+//                                    Used for --force / --dry-run / --verbose.
+//   argv_prefix_match(a, lit, n)  -- first `n` bytes of `a` equal `lit`
+//                                    byte-for-byte (no NUL requirement on
+//                                    either side past position n). Used
+//                                    for --label= / --journal-size= /
+//                                    --sig-key=, where the value pointer
+//                                    is simply `a + n` on a match.
+//
+// A token matching none of the six flag literals is treated as the
+// positional <target> (last such token wins if more than one appears --
+// acceptable at M1 since the CLI takes exactly one positional argument
+// and a caller passing two is already misusing the tool; a stricter
+// "duplicate positional is an error" gate can be added later without an
+// ABI change).
+//
+// --journal-size=<n> is parsed via argv_parse_u64_dec, a division-free*
+// digit accumulator (*free of the missing `imul`/`mul` primitives, not
+// of the `div` used elsewhere in this codebase for the INVERSE
+// operation -- accumulation only ever multiplies by the compile-time
+// constant 10, which decomposes as 8+1+1 via shl+add+add, the same
+// decomposition src/user/dispatch.pdx's dec_parse and
+// src/kernel/acpi/madt.pdx's count*24 helper use for their own
+// compile-time-constant multiplies). A non-digit byte (including the
+// terminating NUL) stops accumulation at whatever value has been formed
+// so far -- matches dec_parse's own "non-digit chars terminate parsing"
+// contract; there is no ARGV_ERR_BAD_JOURNAL_SIZE at M1 (a malformed
+// value like `--journal-size=abc` silently parses as 0 rather than
+// refusing) since malformed-numeric-flag rejection is not itemised in
+// this issue's argv surface and the target-taxonomy / actual mkfs write
+// path that would care about a bogus journal size does not exist until
+// M2.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline (per project-wide non-negotiable)
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom (paideia-as
+// #1248 workaround), matching cat.pdx / mkdir.pdx / touch.pdx in the
+// paideia-os monorepo. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Reserved-label discipline: every branch label in this
+// file is prefixed `mkfs_argv_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §3.1 (paideia-os).
+
+module Argv = structure {
+
+  // --- ParsedArgv out-struct offsets (see module header). ---------------
+  pub let PA_OFF_FLAGS        : u64 = 0
+  pub let PA_OFF_LABEL_PTR    : u64 = 8
+  pub let PA_OFF_JOURNAL_SIZE : u64 = 16
+  pub let PA_OFF_SIG_KEY_PTR  : u64 = 24
+  pub let PA_OFF_TARGET_PTR   : u64 = 32
+  pub let PA_STRUCT_BYTES     : u64 = 40
+
+  // --- ParsedArgv.flags bit assignments. ---------------------------------
+  pub let PA_FLAG_FORCE              : u64 = 0x1
+  pub let PA_FLAG_DRY_RUN             : u64 = 0x2
+  pub let PA_FLAG_VERBOSE             : u64 = 0x4
+  pub let PA_FLAG_LABEL_SET           : u64 = 0x8
+  pub let PA_FLAG_JOURNAL_SIZE_SET    : u64 = 0x10
+  pub let PA_FLAG_SIG_KEY_SET         : u64 = 0x20
+
+  // Default --journal-size when the flag is not given: 1024 blocks
+  // (4 MiB at the frozen 4096-byte block size), per
+  // volume-tooling-ux.md §3.1 and matching R52 §2.4's own default.
+  pub let ARGV_DEFAULT_JOURNAL_SIZE : u64 = 1024
+
+  // --- argv_parse status codes. ------------------------------------------
+  pub let ARGV_OK                    : u64 = 0
+  pub let ARGV_ERR_MISSING_TARGET    : u64 = 1
+
+  // --- Flag literal storage (NUL-terminated; value-flag literals include
+  //     the trailing '=' so argv_prefix_match's length covers it). -------
+  pub let argv_lit_force         : [u8; 8]  = "--force\0"
+  pub let argv_lit_dry_run       : [u8; 10] = "--dry-run\0"
+  pub let argv_lit_verbose       : [u8; 10] = "--verbose\0"
+  pub let argv_lit_label         : [u8; 8]  = "--label="
+  pub let argv_lit_label_len     : u64 = 8
+  pub let argv_lit_journal_size     : [u8; 15] = "--journal-size="
+  pub let argv_lit_journal_size_len : u64 = 15
+  pub let argv_lit_sig_key       : [u8; 10] = "--sig-key="
+  pub let argv_lit_sig_key_len   : u64 = 10
+
+  // ==========================================================================
+  // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
+  //
+  // Standard NUL-terminated exact-equality compare. Both pointers must be
+  // NUL-terminated C strings. Pure leaf: touches only rax/rcx/rdx/rdi/rsi
+  // (all SysV caller-save), no callee-save writes, no nested call.
+  // ==========================================================================
+  pub let argv_streq : (u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (b_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M1-002 (#2): argv_streq entry point. Byte-loop equality compare, a_ptr in rdi, b_ptr in rsi. Each iteration: xor+mov_b loads a[i] into rcx and b[i] into rdx (zero-extended, per paideia-as #1248 workaround); cmp rcx, rdx; jne mkfs_argv_streq_no on mismatch; cmp rcx, 0; je mkfs_argv_streq_yes when both sides hit NUL simultaneously (rcx==rdx==0 at that point since the prior cmp did not diverge); otherwise advance both pointers and loop. Pure leaf -- rax/rcx/rdx/rdi/rsi are all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mkfs_argv_streq_.",
+      block: {
+      mkfs_argv_streq_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        xor rdx, rdx;
+        mov_b rdx, [rsi];
+        cmp rcx, rdx;
+        jne mkfs_argv_streq_no;
+        cmp rcx, 0;
+        je mkfs_argv_streq_yes;
+        add rdi, 1;
+        add rsi, 1;
+        jmp mkfs_argv_streq_loop;
+
+      mkfs_argv_streq_yes:
+        mov rax, 1;
+        ret;
+
+      mkfs_argv_streq_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // argv_prefix_match(a_ptr, lit_ptr, lit_len) -> u64 (1 = match, 0 = no match)
+  //
+  // Compares the first lit_len bytes of a_ptr against lit_ptr byte-for-byte.
+  // Neither side needs to be NUL-terminated at position lit_len; a caller
+  // matching a value-flag literal (e.g. "--label=") passes its own byte
+  // length in rdx and, on a 1 return, computes the value pointer as
+  // a_ptr + lit_len itself (this function does not return that pointer).
+  // Pure leaf: rax/rcx/r8/rdi/rsi/rdx all SysV caller-save.
+  // ==========================================================================
+  pub let argv_prefix_match : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (lit_ptr: u64) (lit_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M1-002 (#2): argv_prefix_match entry point. a_ptr in rdi, lit_ptr in rsi, lit_len in rdx. rcx = index, starts at 0. Loop: cmp rcx, rdx; jge mkfs_argv_pm_yes once every literal byte has matched (all lit_len bytes consumed with no mismatch). Otherwise xor+mov_b loads a[rcx] into rax and lit[rcx] into r8 via SIB [reg+rcx*1] addressing (same shape as cat.pdx's cat_strlen_loop / cat_open_err path); cmp rax, r8; jne mkfs_argv_pm_no on mismatch; else add rcx,1 and loop. Pure leaf, no push/pop, no `add reg,[mem]`, no `test` mnemonic. Labels prefixed mkfs_argv_pm_.",
+      block: {
+        xor rcx, rcx;
+
+      mkfs_argv_pm_loop:
+        cmp rcx, rdx;
+        jge mkfs_argv_pm_yes;
+
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        xor r8, r8;
+        mov_b r8, [rsi + rcx*1];
+        cmp rax, r8;
+        jne mkfs_argv_pm_no;
+
+        add rcx, 1;
+        jmp mkfs_argv_pm_loop;
+
+      mkfs_argv_pm_yes:
+        mov rax, 1;
+        ret;
+
+      mkfs_argv_pm_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // argv_parse_u64_dec(str_ptr) -> u64
+  //
+  // Parses a NUL-terminated decimal string into a u64, stopping at the
+  // first non-digit byte (including a leading one, which yields 0 -- same
+  // "malformed input silently yields a partial/zero result" contract as
+  // src/user/dispatch.pdx's dec_parse in the paideia-os monorepo). acc*10
+  // is computed as (acc<<3) + acc + acc rather than via `imul`/`mul` --
+  // this codebase avoids those primitives for compile-time-constant
+  // multiplies in userspace leaf helpers (see module header). Pure leaf:
+  // rax/rcx/r8/rdi are SysV caller-save.
+  // ==========================================================================
+  pub let argv_parse_u64_dec : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M1-002 (#2): argv_parse_u64_dec entry point. str_ptr in rdi, accumulator in rax (starts at 0). Loop: xor+mov_b loads the next byte into rcx (zero-extended). cmp rcx, 0x30; jl mkfs_argv_pu_done (below '0' -- non-digit, including a leading NUL/negative-sign byte, stops with whatever rax holds so far, i.e. 0 on the very first iteration). cmp rcx, 0x39; jg mkfs_argv_pu_done (above '9' -- non-digit, stops). Otherwise this is a decimal digit: r8 = rax<<3 (rax*8) via shl, then r8 += rax twice (rax*8 + rax + rax = rax*10) -- avoids the missing-by-convention imul/mul path per module header, same decomposition src/user/dispatch.pdx's dec_parse and src/kernel/acpi/madt.pdx's count*24 helper use. rcx -= 0x30 (digit value 0..9); r8 += rcx; rax = r8 (new accumulator); rdi += 1 (advance cursor); loop. Pure leaf, no push/pop, no `add reg,[mem]` (the accumulator math is register-only), no `test` mnemonic. Labels prefixed mkfs_argv_pu_.",
+      block: {
+        xor rax, rax;
+
+      mkfs_argv_pu_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0x30;
+        jl mkfs_argv_pu_done;
+        cmp rcx, 0x39;
+        jg mkfs_argv_pu_done;
+
+        mov r8, rax;
+        shl r8, 3;
+        add r8, rax;
+        add r8, rax;
+        sub rcx, 0x30;
+        add r8, rcx;
+        mov rax, r8;
+
+        add rdi, 1;
+        jmp mkfs_argv_pu_loop;
+
+      mkfs_argv_pu_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // argv_parse(argc, argv, out_ptr) -> u64 (ARGV_OK | ARGV_ERR_MISSING_TARGET)
+  //
+  //   rdi = argc   (per the frozen execve ABI, design/user/execve-abi.md
+  //                 in paideia-os -- argc arrives in rdi at _start and is
+  //                 forwarded here unchanged by main.pdx)
+  //   rsi = argv   (VA of a char*[]; argv[0] is the program name and is
+  //                 skipped -- this loop starts at index 1)
+  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 40 bytes, caller-
+  //                 allocated .bss per main.pdx)
+  //
+  // Register plan across the loop (all SysV callee-save; pushed on entry
+  // and popped at the shared epilogue -- see the entry-point
+  // justification below -- so they survive the nested argv_streq /
+  // argv_prefix_match / argv_parse_u64_dec calls):
+  //   rbx = argc
+  //   r12 = &argv[0]
+  //   r13 = out_ptr
+  //   r14 = i (loop index, starts at 1)
+  //   r15 = argv[i] (current token pointer, reloaded each iteration)
+  //
+  // Zero-init pass writes PA_FLAG defaults (flags=0, journal_size=
+  // ARGV_DEFAULT_JOURNAL_SIZE, every pointer field = 0) into out_ptr
+  // BEFORE the scan loop, so a caller that supplies none of the optional
+  // flags gets well-defined defaults rather than uninitialised .bss
+  // (which happens to already be zero at process start, but the explicit
+  // write also lands the journal_size default, which is non-zero).
+  // ==========================================================================
+  pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M1-002 (#2) + M1-003 (#3): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mkfs_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching the discipline libpdx-audit's audit_send_record follows via its own push r12/push r13 pair), unlike this file's three pure-leaf helpers (argv_streq / argv_prefix_match / argv_parse_u64_dec), which never touch a callee-save register and so need no push/pop. Zero-init pass writes out.flags=0 (+0), out.label_ptr=0 (+8), out.journal_size=ARGV_DEFAULT_JOURNAL_SIZE=1024 (+16), out.sig_key_ptr=0 (+24), out.target_ptr=0 (+32) before scanning, so every unset field has a well-defined value regardless of .bss zero-init happening to already hold zero for four of the five. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` / `call argv_prefix_match` / `call argv_parse_u64_dec` invocations below -- those three callees clobber only caller-save registers per their own justifications. Main loop (mkfs_argv_scan_loop): cmp r14, rbx; jge mkfs_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Six flag checks in a fixed order (boolean flags via argv_streq against the three exact literals, then value flags via argv_prefix_match against the three '='-terminated literals, each followed by a store into the matching out-struct slot plus its PA_FLAG_*_SET presence bit where applicable) -- --journal-size= additionally pipes its value pointer (r15 + argv_lit_journal_size_len) through argv_parse_u64_dec before storing the resulting u64. Every check that DOESN'T match falls through to the next; a token matching none of the six is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals -- see module header). After a match (or the positional fallthrough), jmp mkfs_argv_scan_next which increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+32]) == 0, jmp mkfs_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed mkfs_argv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = argc
+        mov r12, rsi;                       // r12 = &argv[0]
+        mov r13, rdx;                       // r13 = out_ptr
+
+        // ---- Zero-init pass (+ journal_size default). -------------------
+        xor rax, rax;
+        mov [r13 + 0], rax;                 // flags = 0
+        mov [r13 + 8], rax;                 // label_ptr = 0
+        mov rax, 1024;                      // ARGV_DEFAULT_JOURNAL_SIZE
+        mov [r13 + 16], rax;                // journal_size = default
+        xor rax, rax;
+        mov [r13 + 24], rax;                // sig_key_ptr = 0
+        mov [r13 + 32], rax;                // target_ptr = 0
+
+        mov r14, 1;                         // i = 1 (skip argv[0])
+
+      mkfs_argv_scan_loop:
+        cmp r14, rbx;
+        jge mkfs_argv_scan_done;
+
+        mov r15, [r12 + r14*8];             // r15 = argv[i]
+
+        // ---- --force (exact) ---------------------------------------------
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_force];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_dry_run;
+
+        mov rax, [r13 + 0];
+        or rax, 0x1;                        // PA_FLAG_FORCE
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_dry_run:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_dry_run];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_verbose;
+
+        mov rax, [r13 + 0];
+        or rax, 0x2;                        // PA_FLAG_DRY_RUN
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_verbose:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_verbose];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_label;
+
+        mov rax, [r13 + 0];
+        or rax, 0x4;                        // PA_FLAG_VERBOSE
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_label:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_label];
+        mov rdx, 8;                         // argv_lit_label_len
+        call argv_prefix_match;
+        cmp rax, 0;
+        je mkfs_argv_check_journal_size;
+
+        mov rax, r15;
+        add rax, 8;                         // value = token + literal_len
+        mov [r13 + 8], rax;                 // label_ptr = value
+
+        mov rax, [r13 + 0];
+        or rax, 0x8;                        // PA_FLAG_LABEL_SET
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_journal_size:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_journal_size];
+        mov rdx, 15;                        // argv_lit_journal_size_len
+        call argv_prefix_match;
+        cmp rax, 0;
+        je mkfs_argv_check_sig_key;
+
+        mov rdi, r15;
+        add rdi, 15;                        // value ptr = token + literal_len
+        call argv_parse_u64_dec;
+        mov [r13 + 16], rax;                // journal_size = parsed value
+
+        mov rax, [r13 + 0];
+        or rax, 0x10;                       // PA_FLAG_JOURNAL_SIZE_SET
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_sig_key:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_sig_key];
+        mov rdx, 10;                        // argv_lit_sig_key_len
+        call argv_prefix_match;
+        cmp rax, 0;
+        je mkfs_argv_positional;
+
+        mov rax, r15;
+        add rax, 10;                        // value = token + literal_len
+        mov [r13 + 24], rax;                // sig_key_ptr = value
+
+        mov rax, [r13 + 0];
+        or rax, 0x20;                       // PA_FLAG_SIG_KEY_SET
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_positional:
+        // No flag matched -- this token is the positional <target>.
+        mov [r13 + 32], r15;                // target_ptr = token (last wins)
+
+      mkfs_argv_scan_next:
+        add r14, 1;
+        jmp mkfs_argv_scan_loop;
+
+      mkfs_argv_scan_done:
+        mov rax, [r13 + 32];                // reload target_ptr
+        cmp rax, 0;
+        je mkfs_argv_missing_target;
+
+        xor rax, rax;                       // ARGV_OK
+        jmp mkfs_argv_epilogue;
+
+      mkfs_argv_missing_target:
+        mov rax, 1;                         // ARGV_ERR_MISSING_TARGET
+
+      mkfs_argv_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

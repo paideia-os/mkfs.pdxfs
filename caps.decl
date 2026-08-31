@@ -1,0 +1,99 @@
+# mkfs.pdxfs — caps.decl
+#
+# Wave: R53 (design/tooling/volume-tooling-ux.md §2.1 + §3 + §9.1, paideia-os
+# repo). mkfs.pdxfs is a standalone CLI tool (a ring-3 ELF with its own
+# `_start`, not a shared library like libpdx-volume/libpdx-audit): it
+# performs its own syscalls directly (self-contained inlined-syscall
+# pattern, matching src/user/true.pdx / cat.pdx / mkdir.pdx in the
+# paideia-os monorepo) rather than delegating every kernel touch to a
+# linked library.
+#
+# consumed_kinds (kernel-owned; paideia-os repo):
+#
+#   KIND_USER              = 0x190  (src/kernel/core/cap/kind_user.pdx)
+#     -- invoker identity, consumed for audit attribution
+#        (`invoker_user` field of PdxFsFormatRecord@0.1, §3.5) and for
+#        the sig-key-owner check at M3-002. Not dereferenced by any M1
+#        code path -- M1 never journals and never signs.
+#
+#   KIND_PDXFS_FILE         = 0x195  (src/kernel/core/cap/kind_pdxfs_file.pdx)
+#     -- one cap per invocation when <target> resolves to a filesystem
+#        path (§3.2 "File-backed path"). Opened read+write; if the
+#        target does not exist, mkfs creates it (parent-directory write
+#        authority required) and truncates to --size= (default 128 MiB).
+#        Not opened by any M1 code path -- M1's --dry-run path never
+#        calls sys_open; it only inspects <target>'s STRING form (does
+#        it start with `/`, `~`, `.`, or `cap:blkdev:`) to decide which
+#        branch to print, per target.pdx's M1 classify-only stub. Real
+#        open/truncate lands at mkfs.pdxfs.M2-002.
+#
+#   KIND_BLOCK_DEVICE       = placeholder, 0x198..0x19F band per
+#     volume-tooling-ux.md §2.1 / §12 coordination point 1 (osarch, R51)
+#     -- consumed when <target> resolves to a `cap:blkdev:` URI (§3.2
+#        "Device-cap URI"). The tool holds an `open+write+flush+query`
+#        sub-cap, narrowed via a future libpdx-volume helper once one
+#        exists for KIND_BLOCK_DEVICE (libpdx-volume's own M1 landing
+#        only narrows KIND_VOLUME, not KIND_BLOCK_DEVICE directly --
+#        see libpdx-volume design/architecture.md §5).
+#
+#     NAMING GAP flagged for main (mirrors the discrepancy libpdx-volume's
+#     own caps.decl / design/architecture.md §4 flags for
+#     KIND_PDXFS_MOUNT_TABLE): the kernel-landed block-device kind as of
+#     this M1 landing is `KIND_BLKDEV = 0x42`
+#     (src/kernel/core/cap/kind_blkdev.pdx), NOT a kind at ordinal
+#     0x198..0x19F. `KIND_BLOCK_DEVICE` at the 0x198..0x19F band is this
+#     design doc's own placeholder name for a not-yet-landed R51 osarch
+#     kind distinct from the existing KIND_BLKDEV. This M1 landing
+#     declares the PLACEHOLDER name the design doc's own issue list uses
+#     (`mkfs.pdxfs.M1-001 ... KIND_BLOCK_DEVICE placeholder ...`) rather
+#     than silently substituting the existing KIND_BLKDEV=0x42, since the
+#     two may not be interchangeable (KIND_BLKDEV's tail shape and rights
+#     band have not been audited against this design doc's
+#     open+write+flush+query op list). Confirm with osarch before
+#     mkfs.pdxfs.M3-001 (device-cap target path) implements a real mint/
+#     narrow call against either kind.
+#
+#   KIND_SIG_KEY            = 0x1A3  (src/kernel/core/cap/kind_sig_key.pdx)
+#     -- placeholder at M1: the signing key material used to sign the
+#        superblock byte range [0, 696) at M3-002
+#        (libpdx-volume.pdxb_sign_superblock). Not referenced by any M1
+#        function; M1's --dry-run record always reports `signed: false`
+#        (no --sig-key parsing beyond storing the raw argv pointer in
+#        ParsedArgv.sig_key_path_ptr -- see src/argv.pdx).
+#
+#   KIND_IPC_ENDPOINT       = 5 (base kind, R20b) -- the semantic-pipe
+#     stdin/stdout surface. Per design/tooling/r49-r50-plan.md §3.2, a
+#     semantic pipe is "a subclass of KIND_IPC_ENDPOINT (base kind 5)
+#     carrying a schema handle alongside the byte stream." Declared here
+#     as a placeholder per mkfs.pdxfs.M1-001's own issue text
+#     ("semantic-pipe stdin/stdout kinds"); NOT bound or invoked by any
+#     M1 code. M1's stdout is a plain `sys_write(1, ...)` of a
+#     human-readable line (src/format_record.pdx); the schema-typed
+#     framing over a bound KIND_IPC_ENDPOINT lands at
+#     mkfs.pdxfs.M3-003 once libpdx-semantic-pipe (or an equivalent) is
+#     linkable -- see design/architecture.md §4 for the deferral note.
+#
+#   KIND_ELEVATE_CHANNEL    = 0x191 -- referenced by volume-tooling-ux.md
+#     §2.1 for the device-cap elevate path (M3-005). Not declared as a
+#     consumed kind at M1: no code path in this landing calls
+#     libpdx-elevate (which itself has not been located under
+#     paideia-satellites/ as of this landing -- see design/architecture.md
+#     §3 for the libpdx-argv/libpdx-elevate availability note).
+#
+# declares_output_schemas: none bound at M1. `PdxFsFormatRecord@0.1`'s
+# FIELD SHAPE is fixed by design/tooling/volume-tooling-ux.md §3.5 and
+# this M1 landing's --dry-run path prints a line-based textual rendering
+# of exactly four of its fields (target, label, journal_size, dry_run --
+# see src/format_record.pdx module header for which fields M1 omits and
+# why). The typed schema-registry binding (BLAKE3-truncated fingerprint
+# constant, semantic-pipe framing) is owned by mkfs.pdxfs.M3-003 per
+# volume-tooling-ux.md §7.4, not this issue.
+#
+# M1 landing status (see STATUS.md): this repo performs exactly two
+# syscalls at M1 -- `sys_write` (SC+ ID 1, to fd 1 for the dry-run record
+# and fd 2 for error diagnostics) and `sys_exit` (SC+ ID 60). No
+# sys_open, no sys_svc_lookup, no sys_ipc_send, no cap-invoke of any
+# kind -- every KIND above is declared for the SHAPE this tool's future
+# milestones consume, per the same "typed-against, not yet touched"
+# posture libpdx-volume's own M1 caps.decl documents for its stub
+# functions.
