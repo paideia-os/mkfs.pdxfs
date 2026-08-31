@@ -1,30 +1,42 @@
-// src/target.pdx — mkfs.pdxfs.M1-001 (scaffold) — target-taxonomy classifier
+// src/target.pdx — mkfs.pdxfs.M1-001 (scaffold) + M2-001 (#4) —
+// target-taxonomy classifier
 //
 // Per design/tooling/volume-tooling-ux.md §3.2, <target> resolves to one
 // of two shapes:
 //
 //   File-backed path.  <target> begins with `/`, `~`, or `.`  --
 //     resolves to a KIND_PDXFS_FILE cap (opened, created + truncated if
-//     absent). Real body: mkfs.pdxfs.M2-002.
+//     absent). Real write body: mkfs.pdxfs.M2-002/M2-003 (src/format.pdx).
 //   Device-cap URI.    <target> begins with `cap:blkdev:`  --
 //     resolves to a KIND_BLOCK_DEVICE cap looked up in the invoker's cap
 //     environment, elevate-required, signing mandatory. Real body:
-//     mkfs.pdxfs.M3-001.
+//     mkfs.pdxfs.M3-001 (still not implemented -- see below).
 //
-// This file is the STUB named by this issue: `target_classify` looks
-// only at the leading bytes of the raw argv string to decide WHICH of
-// the two branches a caller (main.pdx) should take -- it never opens a
-// cap, never calls sys_open, never resolves anything beyond a byte
-// prefix. That is a deliberate, narrow scope: mkfs.pdxfs.M1-003 (#3)
-// needs SOME classification to gate its --dry-run happy path ("target
-// parses as a file path"), and a byte-prefix check is the entire
-// contract that gate needs -- it does not need the real
-// open+create+truncate mechanics design/tooling/volume-tooling-ux.md
-// §3.2 describes for the FULL resolver. The full resolver (minting a
-// real KIND_PDXFS_FILE / KIND_BLOCK_DEVICE cap from the classification)
-// is mkfs.pdxfs.M2-001, which this file's own header note flags as the
-// still-open gap: target_classify's result is currently used only to
-// pick a print branch, never to authorize a syscall.
+// `target_classify` itself is UNCHANGED from its M1 landing: it was
+// already a complete, real implementation of "classify by leading
+// bytes" (never a placeholder-value stub), and its three-way contract
+// -- `/`, `~`, `.` prefix -> TARGET_FILE; `cap:blkdev:` prefix ->
+// TARGET_DEVICE_CAP; anything else -> TARGET_INVALID -- already matches
+// design/tooling/volume-tooling-ux.md §3.2's full acceptance criterion
+// verbatim (issue #4's own restatement, "if path starts with /", is a
+// shorthand for this same three-way split in the issue text, not a
+// narrower spec superseding the upstream design doc -- see
+// design/architecture.md §9 for this call spelled out for main).
+//
+// What #4 (mkfs.pdxfs.M2-001) actually changes is NOT this file: it is
+// src/main.pdx's USE of this classification. At M1, target_classify's
+// result only picked which of two PRINT branches --dry-run took ("main.
+// pdx's only use of this classification is to decide which of two print
+// branches to take on --dry-run -- it is not (yet) used to authorize
+// anything," per this file's own prior header). As of M2, a TARGET_FILE
+// classification now authorizes the REAL write pipeline
+// (src/format.pdx's mkfs_format_run) whenever --dry-run is not set --
+// see main.pdx's own header for the updated flow. A TARGET_DEVICE_CAP or
+// TARGET_INVALID classification still falls through to the "not yet
+// implemented" diagnostic (exit 1) regardless of --dry-run: the full
+// device-cap resolver (minting a real KIND_BLOCK_DEVICE cap, invoking
+// libpdx-elevate, mandatory signing) remains mkfs.pdxfs.M3-001,
+// unchanged from the M1 scoping this file originally documented.
 //
 // Any prefix other than `/`, `~`, `.`, or `cap:blkdev:` is
 // TARGET_INVALID -- per §3.2's closing sentence: "Any other prefix is a

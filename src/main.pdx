@@ -1,4 +1,5 @@
-// src/main.pdx — mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) — _start
+// src/main.pdx — mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2 (#4) —
+// _start
 //
 // mkfs.pdxfs is a standalone ring-3 ELF, not a library: this file is
 // its `_start` entry point, argv-wired per the frozen execve ABI
@@ -8,39 +9,46 @@
 //   pointers -- no walker or syscall needed to dereference argv[i]),
 //   rdx = envp (unused by this tool), rsp % 16 == 0 at entry.
 //
-// M1 flow (mkfs.pdxfs.M1-003, issue #3):
+// M2 flow (mkfs.pdxfs.M2-001, issue #4 -- supersedes the M1-003 flow
+// this header previously described; see git history / STATUS.md for
+// the M1 shape):
 //
 //   1. Parse argv via Argv::argv_parse (src/argv.pdx, #2). On
 //      ARGV_ERR_MISSING_TARGET, print a usage diagnostic to fd 2 and
 //      exit 2 (matches design/tooling/volume-tooling-ux.md §3.2's
 //      "Any other prefix is a parse error (exit 2, invalid argument)"
 //      convention -- a missing positional is the same class of misuse).
-//   2. If --dry-run is set AND Target::target_classify (src/target.pdx)
-//      says the target is TARGET_FILE: call
+//   2. Classify the target via Target::target_classify (src/target.pdx).
+//      A non-TARGET_FILE result (device-cap or invalid prefix) falls
+//      straight through to the "not yet implemented" diagnostic + exit
+//      1, REGARDLESS of --dry-run -- the device-cap path is
+//      mkfs.pdxfs.M3-001, still not implemented (see target.pdx's own
+//      header for why this is unchanged from M1).
+//   3. TARGET_FILE + --dry-run set: unchanged M1 behavior -- call
 //      FormatRecord::format_record_emit_dry_run (src/format_record.pdx,
-//      #3) to print the PdxFsFormatRecord@0.1 line, then exit 0.
-//   3. Otherwise (no --dry-run, or a device-cap / invalid target): print
-//      "mkfs.pdxfs: not yet implemented\n" to fd 2 and exit 1 -- the
-//      real write path (file-backed superblock write, device-cap
-//      resolution + signing) lands at mkfs.pdxfs.M2 / M3 per
-//      design/tooling/volume-tooling-ux.md §9.1. This collapses BOTH
-//      "no --dry-run" and "--dry-run against a non-file target" into
-//      the same not-yet-implemented branch -- mkfs.pdxfs.M1-003's own
-//      acceptance text scopes the dry-run happy path to file targets
-//      only ("If --dry-run set AND target parses as a file path"), and
-//      a --dry-run device-cap invocation has no real target-taxonomy
-//      resolution to preview yet (that is mkfs.pdxfs.M3-001), so it is
-//      not meaningfully different from the real-write path being absent.
+//      #3) to print the M1 four-field PdxFsFormatRecord@0.1 preview
+//      line, then exit 0. No write of any kind happens on this path.
+//   4. TARGET_FILE + --dry-run NOT set: the NEW M2 real-write path.
+//      Call Format::mkfs_format_run (src/format.pdx, #5/#6/#7) with
+//      (target_ptr, force_flag, journal_size) -- it runs the non-blank
+//      refusal gate, then (if not refused) the real superblock/inode-
+//      table/bitmap/journal write pipeline, emitting the terminal
+//      PdxFsFormatRecord@0.1 (OK / a REFUSED_* variant / FAIL) itself.
+//      Its u64 return value IS the process exit status (0, 3, or 5 per
+//      design/tooling/volume-tooling-ux.md's exit-code contract) --
+//      passed to sys_exit unchanged, no further branching needed here.
 //
 // ----------------------------------------------------------------------
 // Register plan
 // ----------------------------------------------------------------------
 //
-// All callee-save (SysV rbx/r12-r15), so they survive the three nested
-// `call`s (argv_parse, target_classify, format_record_emit_dry_run)
-// without any push/pop -- each callee clobbers only caller-save
-// registers per its own justification, and SYSCALL preserves callee-
-// save registers by the amd64 fast-syscall convention:
+// All callee-save (SysV rbx/r12-r15), so they survive every nested
+// `call` (argv_parse, target_classify, format_record_emit_dry_run,
+// mkfs_format_run) without any push/pop -- each callee clobbers only
+// caller-save registers, or explicitly preserves callee-save registers
+// itself via its own push/pop (mkfs_format_run does, per
+// design/architecture.md §7), and SYSCALL preserves callee-save
+// registers by the amd64 fast-syscall convention:
 //
 //   r12 = argc (saved immediately from rdi, before any call)
 //   r13 = argv (saved immediately from rsi)
@@ -88,7 +96,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3): mkfs.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mkfs_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to mkfs_main_missing_target: sys_write(2, mkfs_msg_missing_target, 27), sys_exit(2) -- exit code 2 matches design/tooling/volume-tooling-ux.md §3.2's 'parse error (exit 2, invalid argument)' convention for a malformed invocation, extended here to cover a missing positional as the same misuse class. Phase 2 (on ARGV_OK): r14 = &mkfs_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); r15 = [r14+32] (ParsedArgv.target_ptr, Argv::PA_OFF_TARGET_PTR). Gate 1: rax = rbx & 0x2 (Argv::PA_FLAG_DRY_RUN); cmp rax, 0; je mkfs_main_not_implemented when --dry-run was not given. Gate 2: rdi = r15; call target_classify (src/target.pdx); cmp rax, 0 (Target::TARGET_FILE); jne mkfs_main_not_implemented when the target is not a plain file path (device-cap or invalid prefix -- mkfs.pdxfs.M1-003's dry-run happy path is scoped to file targets only per its own acceptance text). Both gates passing: rdi = r15 (target_ptr), rsi = [r14+8] (ParsedArgv.label_ptr, Argv::PA_OFF_LABEL_PTR, 0 if unset), rdx = [r14+16] (ParsedArgv.journal_size, Argv::PA_OFF_JOURNAL_SIZE, already defaulted by argv_parse); call format_record_emit_dry_run (src/format_record.pdx, #3) -- prints the PdxFsFormatRecord@0.1 line to fd 1. Then sys_exit(0). mkfs_main_not_implemented: sys_write(2, mkfs_msg_not_implemented, 32), sys_exit(1) -- covers both 'no --dry-run' (the real write path is mkfs.pdxfs.M2/M3, not yet implemented) and '--dry-run against a non-file target' (target-taxonomy resolution for device-cap targets is mkfs.pdxfs.M3-001). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mkfs_main_.",
+      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001 (#4): mkfs.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mkfs_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to mkfs_main_missing_target: sys_write(2, mkfs_msg_missing_target, 27), sys_exit(2) -- exit code 2 matches design/tooling/volume-tooling-ux.md §3.2's 'parse error (exit 2, invalid argument)' convention for a malformed invocation, extended here to cover a missing positional as the same misuse class. Phase 2 (on ARGV_OK): r14 = &mkfs_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); r15 = [r14+32] (ParsedArgv.target_ptr, Argv::PA_OFF_TARGET_PTR). Gate 1 (M2, unconditional on --dry-run): rdi=r15; call target_classify (src/target.pdx); cmp rax,0 (Target::TARGET_FILE); jne mkfs_main_not_implemented -- a device-cap or invalid target falls straight to 'not yet implemented' + exit 1 regardless of --dry-run (mkfs.pdxfs.M3-001 still owns the device-cap path; see target.pdx's own header). Gate 2 (only reached for TARGET_FILE): rax = rbx & 0x2 (Argv::PA_FLAG_DRY_RUN); cmp rax,0; je mkfs_main_file_real when --dry-run was NOT given -- branches into the NEW M2 real-write path. When --dry-run WAS given: rdi=r15 (target_ptr), rsi=[r14+8] (label_ptr), rdx=[r14+16] (journal_size); call format_record_emit_dry_run (src/format_record.pdx, #3, UNCHANGED from M1) -- prints the M1 four-field preview line to fd 1; sys_exit(0). mkfs_main_file_real (the M2-001/#4 real-write path): rdi=r15 (target_ptr); rax=rbx & 0x1 (Argv::PA_FLAG_FORCE), rsi=rax (force_flag, reduced to a single 0/1 bit); rdx=[r14+16] (journal_size, already in BLOCKS per argv_parse's own documented default); call mkfs_format_run (src/format.pdx, #5/#6/#7) -- runs the refusal gate then (if not refused) the real write pipeline, emitting its own terminal PdxFsFormatRecord@0.1 and returning the process exit status (0 OK / 3 SYSCALL_ERROR / 5 REFUSED) directly in rax; mov rdi,rax; sys_exit(rdi) -- no further branching needed, mkfs_format_run's return value IS the exit status verbatim. mkfs_main_not_implemented: sys_write(2, mkfs_msg_not_implemented, 32), sys_exit(1) -- now reached only for a device-cap or invalid target (mkfs.pdxfs.M3-001), independent of --dry-run. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree. target_classify, format_record_emit_dry_run are pure/self-preserving per their own justifications; mkfs_format_run explicitly preserves every callee-save register it touches (design/architecture.md §7) -- so rbx/r14/r15 all survive every call in this function transparently, needing no push/pop here. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mkfs_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -120,25 +128,41 @@ module Main = structure {
         mov rbx, [r14 + 0];                  // rbx = flags (Argv::PA_OFF_FLAGS)
         mov r15, [r14 + 32];                 // r15 = target_ptr (Argv::PA_OFF_TARGET_PTR)
 
-        // ---- Gate 1: --dry-run set? (Argv::PA_FLAG_DRY_RUN = 0x2) ---------
-        mov rax, rbx;
-        and rax, 0x2;
-        cmp rax, 0;
-        je mkfs_main_not_implemented;
-
-        // ---- Gate 2: target classifies as TARGET_FILE (0)? -----------------
+        // ---- Gate 1: target classifies as TARGET_FILE (0)? Unconditional
+        //      on --dry-run -- a device-cap/invalid target is "not yet
+        //      implemented" either way (mkfs.pdxfs.M3-001). --------------
         mov rdi, r15;
         call target_classify;
         cmp rax, 0;                          // Target::TARGET_FILE
         jne mkfs_main_not_implemented;
 
-        // ---- Both gates passed: emit the dry-run format record. -----------
+        // ---- Gate 2: --dry-run set? (Argv::PA_FLAG_DRY_RUN = 0x2) ---------
+        mov rax, rbx;
+        and rax, 0x2;
+        cmp rax, 0;
+        je mkfs_main_file_real;
+
+        // ---- --dry-run + TARGET_FILE: unchanged M1 preview path. ----------
         mov rdi, r15;                        // target_ptr
         mov rsi, [r14 + 8];                  // label_ptr (Argv::PA_OFF_LABEL_PTR)
         mov rdx, [r14 + 16];                 // journal_size (Argv::PA_OFF_JOURNAL_SIZE)
         call format_record_emit_dry_run;
 
         xor rdi, rdi;                        // status = 0 (OK)
+        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      mkfs_main_file_real:
+        // ---- M2 (#4/#5/#6/#7): the real write pipeline. -------------------
+        mov rdi, r15;                        // target_ptr
+        mov rax, rbx;
+        and rax, 0x1;                        // Argv::PA_FLAG_FORCE
+        mov rsi, rax;                        // force_flag (0 or 1)
+        mov rdx, [r14 + 16];                 // journal_size (blocks)
+        call mkfs_format_run;
+
+        mov rdi, rax;                        // exit status returned verbatim
         mov rax, 60;                          // SC+ ID 60 = sys_exit
         syscall;
         hlt;

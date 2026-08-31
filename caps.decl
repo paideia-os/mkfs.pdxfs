@@ -24,8 +24,21 @@
 #        Not opened by any M1 code path -- M1's --dry-run path never
 #        calls sys_open; it only inspects <target>'s STRING form (does
 #        it start with `/`, `~`, `.`, or `cap:blkdev:`) to decide which
-#        branch to print, per target.pdx's M1 classify-only stub. Real
-#        open/truncate lands at mkfs.pdxfs.M2-002.
+#        branch to print, per target.pdx's M1 classify-only stub.
+#
+#        M2 (src/format.pdx's mkfs_format_run, src/refusal.pdx's
+#        mkfs_refuse_check) DOES now call sys_open/sys_read/sys_write/
+#        sys_close for real against a file-backed target -- but as a
+#        BARE syscall on the raw path string, not as a cap-invoke
+#        against a minted KIND_PDXFS_FILE row. This KIND remains
+#        undeclared-in-practice at M2: no code path in this repo mints,
+#        holds, or narrows one. Whether the real write pipeline should
+#        route through a KIND_PDXFS_FILE cap instead of bare syscalls is
+#        an open question for a later milestone (mount.pdxfs's own
+#        design already assumes cap-mediated access post-mount; whether
+#        mkfs, which runs pre-mount against a not-yet-formatted target,
+#        needs the same is unresolved -- flagged in
+#        design/architecture.md §10 for main/osarch).
 #
 #   KIND_BLOCK_DEVICE       = placeholder, 0x198..0x19F band per
 #     volume-tooling-ux.md §2.1 / §12 coordination point 1 (osarch, R51)
@@ -89,7 +102,7 @@
 # constant, semantic-pipe framing) is owned by mkfs.pdxfs.M3-003 per
 # volume-tooling-ux.md §7.4, not this issue.
 #
-# M1 landing status (see STATUS.md): this repo performs exactly two
+# M1 landing status (see STATUS.md): this repo performed exactly two
 # syscalls at M1 -- `sys_write` (SC+ ID 1, to fd 1 for the dry-run record
 # and fd 2 for error diagnostics) and `sys_exit` (SC+ ID 60). No
 # sys_open, no sys_svc_lookup, no sys_ipc_send, no cap-invoke of any
@@ -97,3 +110,20 @@
 # milestones consume, per the same "typed-against, not yet touched"
 # posture libpdx-volume's own M1 caps.decl documents for its stub
 # functions.
+#
+# M2 landing status (see STATUS.md, design/architecture.md §9): the
+# real file-target write pipeline (src/format.pdx) and non-blank
+# refusal gate (src/refusal.pdx) add four more syscalls, all against a
+# raw filesystem path -- `sys_open` (SC+ ID 2, O_RDONLY for the refusal
+# gate's peek read, O_CREAT|O_WRONLY|O_TRUNC for the real format
+# write), `sys_read` (SC+ ID 0, the refusal gate's 4-byte magic peek),
+# `sys_write` (SC+ ID 1, now also used for the superblock/inode-table/
+# bitmap/journal byte payloads, not just diagnostic text), and
+# `sys_close` (SC+ ID 3). All four operate directly on the bare
+# filesystem path string from argv -- none of them are cap-invokes, and
+# none of the KIND_PDXFS_FILE / KIND_BLOCK_DEVICE / KIND_SIG_KEY /
+# KIND_IPC_ENDPOINT / KIND_ELEVATE_CHANNEL kinds above are minted,
+# looked up, or otherwise touched by any M2 code path -- the "typed-
+# against, not yet touched" posture above is unchanged for every KIND
+# except KIND_USER, which M2 also does not touch (invoker attribution
+# is still mkfs.pdxfs.M3-004, audit integration).

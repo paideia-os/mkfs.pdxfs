@@ -1,0 +1,543 @@
+// src/format.pdx — mkfs.pdxfs.M2-002/M2-003 (#5, #6) — the real,
+// file-target-only write pipeline.
+//
+// This is the first file in this repo to perform a REAL write: given a
+// TARGET_FILE target (src/target.pdx's classification), it creates or
+// truncates the target, writes a fresh PDXB v1 superblock (via
+// libpdx-volume's `pdxb_encode_superblock`), zeroes the inode-table
+// region except for a real root-directory inode at slot 1, zeroes the
+// allocator bitmap, zeroes the journal ring, and closes. The
+// non-blank refusal gate (src/refusal.pdx, #7) runs first and can
+// short-circuit the whole pipeline before any write happens.
+//
+// ----------------------------------------------------------------------
+// Layout this file chooses (a fixed, small M2 default -- see design/
+// architecture.md §9 for the full byte-offset <-> LBA/bcount derivation
+// and the gaps this leaves for later milestones)
+// ----------------------------------------------------------------------
+//
+//   Block 0            : PDXB superblock (4096 B, written by
+//                         pdxb_encode_superblock)
+//   Blocks [1, 9)       : inode table -- 256 inodes * 128 B = 32768 B =
+//                         8 blocks (itable_lba=1, itable_bcount=8)
+//   Block  9            : allocator bitmap -- only 1024 B of this block
+//                         are meaningful; the rest is zero padding
+//                         (alloc_lba=9, alloc_bcount=1 -- see design/
+//                         architecture.md §9 for why this is a fixed
+//                         1024-byte default rather than a real
+//                         data_bcount/8 computation)
+//   Blocks [10, 10+N)   : journal ring, N = the caller's journal_size
+//                         (already in BLOCKS -- src/argv.pdx's
+//                         ParsedArgv.journal_size is documented as
+//                         "u64 block count", default 1024 -- see
+//                         design/architecture.md §9 for the task-brief
+//                         byte-count wording this reconciles)
+//                         (journal_lba=10, journal_bcount=N)
+//
+// total_blocks is set to journal_lba + journal_bcount (10 + N) -- i.e.
+// this M2 landing allocates NO data region (data_lba/data_bcount are
+// left at 0). There is no `--size=` flag yet (src/argv.pdx's M1
+// surface does not have one) to size a real data region against; see
+// design/architecture.md §9 for why this is flagged as a gap rather
+// than silently guessed.
+//
+// ----------------------------------------------------------------------
+// Root inode #1 (mkfs.pdxfs.M2-003, #6)
+// ----------------------------------------------------------------------
+//
+// design/filesystem/volume-fs-substrate.md §2.3 (paideia-os) is the
+// authoritative 128-byte on-disk inode layout (header/inode_no/
+// byte_len/created_ns/mtime_ns/refcount/root_block/cow_gen/
+// content_hash/sig_prefix/sig_hash) -- NOT the looser "mode/size/
+// link_count/timestamp/block_ptrs" vocabulary #6's own task brief uses.
+// This file encodes the REAL wire layout (so a future mount.pdxfs reads
+// back a valid inode) and maps the brief's intent onto it: mode=DIR ->
+// header's file_type nibble = PDX_INODE_FT_DIR (a LOCAL placeholder
+// constant -- no canonical file_type registry exists yet anywhere in
+// the tree, see design/architecture.md §9); size=0 -> byte_len=0;
+// link_count=2 -> refcount=2 (the "on-disk hardlink count" field per
+// §2.3's own row); timestamp=0 -> created_ns=mtime_ns=0; block_ptrs=
+// all-zero -> root_block=0 (an empty directory has no CoW-tree yet).
+// cow_gen/content_hash/sig_prefix/sig_hash are all zero (unsigned,
+// untouched -- signing is mkfs.pdxfs.M3-002).
+//
+// There is no `libpdx-volume.inode_encoders` module yet (flagged by
+// #6's own task brief and confirmed absent here too -- this file
+// therefore encodes the 128 bytes inline, matching the encoder-gap
+// discipline and register-preservation conventions this whole repo
+// already uses for its own inline PDXB-adjacent encoding). See
+// design/architecture.md §9 for the follow-up this leaves for
+// libpdx-volume.
+//
+// ----------------------------------------------------------------------
+// Cross-repo call: pdxb_encode_superblock
+// ----------------------------------------------------------------------
+//
+// `call pdxb_encode_superblock;` below reaches libpdx-volume's
+// src/pdxb_superblock.pdx WITHOUT any `extern`/import declaration --
+// paideia-as has no such keyword (confirmed: no grep hit anywhere in
+// tools/paideia-as's own source or design docs). This repo's OWN
+// build.sh already relies on the identical mechanism for every
+// cross-FILE call within mkfs.pdxfs itself (main.pdx calls
+// argv_parse/target_classify/format_record_emit_dry_run, each defined
+// in a different src/*.pdx, yet build.sh compiles every src/*.pdx into
+// an INDEPENDENT .o with no multi-file compilation unit) -- a bare
+// `call <label>` where <label> is not defined in the current
+// compilation unit becomes an ordinary undefined-global-symbol ELF
+// relocation, resolved whenever something finally links this repo's
+// .o files together with libpdx-volume's (the same "once built and
+// linked into a runnable image" step README.md already flags as
+// outside build.sh's own scope). A cross-REPO call is therefore
+// syntactically and mechanically IDENTICAL to a cross-file call within
+// one repo -- both are just "a label this compilation unit does not
+// define." See design/architecture.md §9 for this write-up in full.
+//
+// ----------------------------------------------------------------------
+// No lseek anywhere -- and why
+// ----------------------------------------------------------------------
+//
+// design/user/syscall-table.md (paideia-os, refreshed through sysno 95)
+// has NO lseek entry at any number -- this kernel does not have one.
+// #6's task brief describes writing the zeroed inode table, then
+// "seek back to inode #1's offset ... and write" the real root inode --
+// impossible without lseek. This file instead writes the inode-table
+// region as three SEQUENTIAL sys_write calls that together cover the
+// whole region in the correct final byte layout, relying only on each
+// fd's cursor auto-advancing after every write (the same mechanism the
+// task brief's own steps 3-7 already use for the superblock -> inode
+// table -> bitmap -> journal sequence): (1) 128 zero bytes for inode 0
+// (the invalid-inode sentinel, design/filesystem/volume-fs-substrate.md
+// §2.3), (2) the 128-byte real root inode for inode 1, (3)
+// (256-2)*128 = 32512 zero bytes for inodes 2..255. This produces the
+// byte-identical on-disk region a seek-back-and-patch approach would,
+// using only forward-sequential writes. See design/architecture.md §9.
+//
+// ----------------------------------------------------------------------
+// Exit-status contract
+// ----------------------------------------------------------------------
+//
+// design/tooling/volume-tooling-ux.md's own exit-code table (§ near
+// "Exit codes: 0=OK, 2=argv parse error, 3=system error ..., 5=data-
+// integrity refusal"): `mkfs_format_run` returns 0 (OK), 3
+// (MKFS_EXIT_SYSCALL_ERROR -- any open/write/encode failure), or 5
+// (MKFS_EXIT_REFUSED -- the non-blank gate fired without --force).
+// main.pdx passes this return value straight to sys_exit.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero/equality
+// check is `cmp reg, 0` or `cmp reg, imm`. No `imul`/`mul` for a
+// compile-time-constant multiply -- the one such multiply this file
+// needs (journal_size_blocks * 4096) is done via `shl reg, 12` (4096 =
+// 2^12), matching this codebase's established shl/add decomposition
+// convention (src/argv.pdx's argv_parse_u64_dec, `count*24` in
+// src/kernel/acpi/madt.pdx). A negative syscall return is turned into a
+// positive errno via `xor reg,reg; sub reg,rax` (NOT a bare `neg`),
+// matching src/user/errno.pdx's syscall_check precedent exactly.
+// Reserved-label discipline: every branch label in this file is
+// prefixed `mkfs_format_`.
+//
+// SC+ IDs used (design/user/syscall-table.md): 1 = sys_write,
+// 2 = sys_open, 3 = sys_close.
+//
+// Register-preservation discipline (design/architecture.md §7): every
+// function below that repurposes a SysV callee-save register pushes it
+// on entry and pops it (reverse order) before its single `ret`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §3 (paideia-os);
+// design/filesystem/volume-fs-substrate.md §2.1, §2.3 (paideia-os);
+// src/pdxb_superblock.pdx (libpdx-volume, the encoder this file calls).
+
+module Format = structure {
+
+  // --- Fixed M2 layout constants (see module header). All LBA/bcount
+  //     values are in 4096-byte BLOCKS, matching volume-fs-substrate.md
+  //     §2.1's on-disk field semantics -- NOT raw byte offsets. -------
+  pub let MKFS_BLOCK_SIZE     : u64 = 4096
+  pub let MKFS_INODE_COUNT    : u64 = 256
+  pub let MKFS_INODE_SIZE     : u64 = 128
+  pub let MKFS_ITABLE_LBA     : u64 = 1
+  pub let MKFS_ITABLE_BCOUNT  : u64 = 8      // 256*128 / 4096
+  pub let MKFS_BITMAP_BYTES   : u64 = 1024
+  pub let MKFS_ALLOC_LBA      : u64 = 9      // ITABLE_LBA + ITABLE_BCOUNT
+  pub let MKFS_ALLOC_BCOUNT   : u64 = 1
+  pub let MKFS_JOURNAL_LBA    : u64 = 10     // ALLOC_LBA + ALLOC_BCOUNT
+  pub let MKFS_ROOT_INODE_NO  : u64 = 1
+
+  // --- sys_open flags/mode (verified against src/user/cp.pdx's dst-open
+  //     precedent in the paideia-os monorepo: O_CREAT|O_WRONLY|O_TRUNC =
+  //     0x40|0x01|0x80 = 0xC1, mode 0x1A4 = 0644). ----------------------
+  pub let MKFS_OPEN_FLAGS : u64 = 0xC1
+  pub let MKFS_OPEN_MODE  : u64 = 0x1A4
+
+  // --- mkfs_format_run exit-status contract (see module header). -----
+  pub let MKFS_EXIT_OK             : u64 = 0
+  pub let MKFS_EXIT_SYSCALL_ERROR  : u64 = 3
+  pub let MKFS_EXIT_REFUSED        : u64 = 5
+
+  // --- .bss scratch. All zero-initialised by the loader; every buffer
+  //     below is fully re-stamped by its owning function before use
+  //     except mkfs_format_zero_buf, which is NEVER written by any
+  //     function in this file and stays permanently zero for the
+  //     whole process lifetime -- it exists solely to be the source
+  //     buffer of every zero-fill sys_write. -----------------------
+  pub let mut mkfs_format_sb_summary : [u8; 176]  = uninit @align(8)  // PdxbSuperblockSummary (libpdx-volume SBS_OFF_* layout)
+  pub let mut mkfs_format_sb_encoded : [u8; 4096] = uninit @align(8)  // on-disk superblock image
+  pub let mut mkfs_format_root_inode : [u8; 128]  = uninit @align(8)  // encoded root inode #1
+  pub let mut mkfs_format_zero_buf   : [u8; 4096] = uninit @align(8)  // permanently-zero scratch
+
+  // ==========================================================================
+  // mkfs_format_write_zeros(fd, total_bytes) -> u64
+  //   (0 on success, or the negative errno from the first failing
+  //   sys_write -- same sentinel convention as a raw syscall return)
+  //
+  // Writes `total_bytes` zero bytes to `fd` at its current cursor
+  // position, via repeated sys_write calls of at most 4096 bytes each
+  // (mkfs_format_zero_buf's fixed size). This is the mechanism this
+  // whole file uses instead of lseek + a single big write, or instead
+  // of a giant .bss buffer sized to the largest zero-fill span needed
+  // (the journal region can be arbitrarily large per --journal-size) --
+  // see module header for why lseek is unavailable.
+  //
+  // A non-negative sys_write return is trusted to mean "the whole
+  // requested chunk was written" with no short-write retry loop, same
+  // posture src/user/cat.pdx documents for its own sys_write calls
+  // ("a short write would technically require a retry loop... adding
+  // one here would be defensive dead code at this round").
+  //
+  // Register plan: rbx = fd, r12 = remaining byte count, both SysV
+  // callee-save, pushed on entry and popped before either `ret`.
+  // ==========================================================================
+  pub let mkfs_format_write_zeros : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (total_bytes: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M2-002 (#5): mkfs_format_write_zeros entry point. push rbx; push r12. rbx=fd, r12=remaining bytes. Loop (mkfs_format_wz_loop): `cmp r12, 0; je mkfs_format_wz_done` (all bytes written -- success, rax=0). Otherwise compute this iteration's chunk size in rdx via a branch-based min(remaining, 4096): `mov rdx, r12; cmp rdx, 4096; jbe mkfs_format_wz_have_chunk` (remaining already <= 4096, rdx is correct as-is) else `mov rdx, 4096`. sys_write(rdi=rbx, rsi=&mkfs_format_zero_buf, rdx=chunk, rax=1); `cmp rax, 0; jl mkfs_format_wz_err` returns the negative errno unchanged (rax untouched since the syscall) with rbx/r12 popped first. On success: `sub r12, rdx` (register-only, no add-reg-mem) and loop. Pops rbx/r12 (reverse push order) before every return. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_wz_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                       // rbx = fd
+        mov r12, rsi;                       // r12 = remaining bytes
+
+      mkfs_format_wz_loop:
+        cmp r12, 0;
+        je mkfs_format_wz_done;
+
+        mov rdx, r12;
+        cmp rdx, 4096;
+        jbe mkfs_format_wz_have_chunk;
+        mov rdx, 4096;
+
+      mkfs_format_wz_have_chunk:
+        mov rdi, rbx;
+        lea rsi, [rip + mkfs_format_zero_buf];
+        mov rax, 1;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_format_wz_err;
+
+        sub r12, rdx;
+        jmp mkfs_format_wz_loop;
+
+      mkfs_format_wz_err:
+        pop r12;
+        pop rbx;
+        ret;
+
+      mkfs_format_wz_done:
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_format_build_superblock(journal_size_blocks) -> ()
+  //
+  // Populates mkfs_format_sb_summary (176-byte PdxbSuperblockSummary,
+  // libpdx-volume's SBS_OFF_* layout) with this file's fixed M2 layout
+  // (see module header). Every one of the 22 8-byte slots is stamped --
+  // 10 explicit field writes plus a full zero-fill pass first so the
+  // untouched slots (flags, uuid_lo/hi, alloc_bcount is NOT zero-only,
+  // data_lba, data_bcount, mount_gen, snap_head, sig_key_hash x4) are
+  // deterministically zero rather than relying on mkfs_format_sb_summary's
+  // one-time bss zero-init (this buffer, unlike mkfs_format_zero_buf, IS
+  // written by this function -- explicit zeroing here matches
+  // src/argv.pdx's own stated caution: "so this function never reads
+  // stale/uninit bytes even on a build where .bss zero-init were
+  // somehow skipped").
+  //
+  // Leaf function: no nested calls, touches only caller-save registers
+  // (rax/rcx/rdx and the incoming rdi, read-only) -- no push/pop needed.
+  // ==========================================================================
+  pub let mkfs_format_build_superblock : (u64) -> () !{mem} @{} =
+    fn (journal_size_blocks: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M2-002 (#5): mkfs_format_build_superblock entry point. journal_size_blocks arrives in rdi and is read-only throughout (no nested call clobbers it). rax = &mkfs_format_sb_summary (rip-relative lea). Zero-fill pass: `xor rcx,rcx; xor rdx,rdx` then a 22-iteration `mov [rax+rcx*8], rdx; add rcx,1; cmp rcx,22; jb loop` (176/8=22 slots -- same scale-8 SIB store idiom libpdx-volume's pdxb_encode_superblock uses for its own zero-fill). Then ten explicit field stores at their SBS_OFF_* offsets: magic=0x42584450 (+0), version=1 (+8), block_size=4096 (+32), itable_lba=1 (+56), itable_bcount=8 (+64), alloc_lba=9 (+72), alloc_bcount=1 (+80), journal_lba=10 (+88), journal_bcount=rdi (+96, the caller's argument verbatim -- ParsedArgv.journal_size is already in BLOCKS per src/argv.pdx's own documented contract, see module header), total_blocks=10+rdi (+48, `mov rdx,rdi; add rdx,10; mov [rax+48],rdx` -- register-only addition, no add-reg-mem), root_inode=1 (+120). Every other slot (flags, uuid_lo/hi, data_lba, data_bcount, mount_gen, snap_head, four sig_key_hash words) is left at the zero-fill pass's value -- see module header for why (no --size= flag to size a data region, unsigned at M2). No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_bsb_.",
+      block: {
+        lea rax, [rip + mkfs_format_sb_summary];
+
+        xor rcx, rcx;
+        xor rdx, rdx;
+
+      mkfs_format_bsb_zero_loop:
+        mov [rax + rcx*8], rdx;
+        add rcx, 1;
+        cmp rcx, 22;
+        jb mkfs_format_bsb_zero_loop;
+
+        mov rdx, 0x42584450;                // magic ("PDXB")
+        mov [rax + 0], rdx;
+
+        mov rdx, 1;                         // version
+        mov [rax + 8], rdx;
+
+        mov rdx, 4096;                      // block_size
+        mov [rax + 32], rdx;
+
+        mov rdx, rdi;                       // total_blocks = journal_lba + journal_bcount
+        add rdx, 10;
+        mov [rax + 48], rdx;
+
+        mov rdx, 1;                         // itable_lba
+        mov [rax + 56], rdx;
+
+        mov rdx, 8;                         // itable_bcount
+        mov [rax + 64], rdx;
+
+        mov rdx, 9;                         // alloc_lba
+        mov [rax + 72], rdx;
+
+        mov rdx, 1;                         // alloc_bcount
+        mov [rax + 80], rdx;
+
+        mov rdx, 10;                        // journal_lba
+        mov [rax + 88], rdx;
+
+        mov [rax + 96], rdi;                // journal_bcount = journal_size_blocks (verbatim)
+
+        mov rdx, 1;                         // root_inode = inode #1
+        mov [rax + 120], rdx;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_format_encode_root_inode() -> ()
+  //
+  // Populates mkfs_format_root_inode (128 bytes, design/filesystem/
+  // volume-fs-substrate.md §2.3's on-disk layout) as an empty root
+  // directory -- see module header for the mapping from #6's task-brief
+  // vocabulary onto this real layout. No args, no return.
+  //
+  // Leaf function: touches only caller-save registers -- no push/pop.
+  // ==========================================================================
+  pub let mkfs_format_encode_root_inode : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M2-003 (#6): mkfs_format_encode_root_inode entry point. rax = &mkfs_format_root_inode. Zero-fill pass: 16-iteration `mov [rax+rcx*8], rdx; add rcx,1; cmp rcx,16; jb loop` (128/8=16 slots), same idiom as mkfs_format_build_superblock's zero-fill. Then three explicit field stores: header (+0) = 0x01010000000001ED -- built from `in_use[63:56]=1` (bit 56 set, 0x0100000000000000), `file_type[55:48]=PDX_INODE_FT_DIR=1` (bit 48 set, 0x0001000000000000), `mode_bits[15:0]=0755` (0x1ED octal-755), summed at compile time into one verbatim 64-bit immediate (a bare `mov reg, imm64` loads this exact bit pattern unsigned via MOVABS, which is the CORRECT behaviour here since every bit is meant literally -- unlike src/user/errno.pdx's #613 hazard, which was about wanting a SIGN-EXTENDED negative boundary and getting a verbatim load instead; this constant wants exactly a verbatim load, matching libpdx-volume's own PDXB_ENC_ERR_BUF_TOO_SHORT=0xFFFFFFFFFFFFFFFF precedent for the same pattern). inode_no (+8) = 1 (MKFS_ROOT_INODE_NO). refcount (+40) = 2 (empty directory's link count: itself + its would-be '.' entry, matching the task brief's link_count=2). Every other slot (byte_len, created_ns, mtime_ns, root_block, cow_gen, content_hash, sig_prefix x3, sig_hash x4) is left at the zero-fill pass's value, matching the task brief's size=0/timestamp=0/block_ptrs=all-zero intent verbatim. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_eri_.",
+      block: {
+        lea rax, [rip + mkfs_format_root_inode];
+
+        xor rcx, rcx;
+        xor rdx, rdx;
+
+      mkfs_format_eri_zero_loop:
+        mov [rax + rcx*8], rdx;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb mkfs_format_eri_zero_loop;
+
+        mov rdx, 0x01010000000001ED;        // header: in_use=1, file_type=DIR(1), mode=0755
+        mov [rax + 0], rdx;
+
+        mov rdx, 1;                         // inode_no = 1 (root)
+        mov [rax + 8], rdx;
+
+        mov rdx, 2;                         // refcount (link_count) = 2
+        mov [rax + 40], rdx;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_format_run(target_ptr, force_flag, journal_size_blocks) -> u64
+  //   (MKFS_EXIT_OK | MKFS_EXIT_SYSCALL_ERROR | MKFS_EXIT_REFUSED)
+  //
+  //   rdi = target_ptr          (NUL-terminated <target> path, already
+  //                               classified TARGET_FILE by the caller)
+  //   rsi = force_flag          (0 or 1 -- ParsedArgv.flags & PA_FLAG_FORCE)
+  //   rdx = journal_size_blocks (ParsedArgv.journal_size, already in
+  //                               BLOCKS with its M1 default applied)
+  //
+  // The full M2 pipeline: refusal gate -> open(create+trunc) -> encode +
+  // write superblock -> write inode table (sentinel + root inode +
+  // remaining zeroed slots) -> write allocator bitmap zeros -> write
+  // journal zeros -> close -> emit the terminal PdxFsFormatRecord@0.1
+  // (OK, a REFUSED_* variant, or FAIL) itself, then return the exit
+  // status for main.pdx to pass to sys_exit unchanged.
+  //
+  // Register plan: rbx=target_ptr, r12=force_flag (dead after the
+  // refusal-gate call), r13=journal_size_blocks, r14=fd (valid only
+  // from mkfs_format_run_open onward), r15=errno scratch on a failure
+  // path. All five are SysV callee-save, pushed on entry and popped
+  // (reverse order) before the single shared epilogue's `ret`.
+  // ==========================================================================
+  pub let mkfs_format_run : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (force_flag: u64) (journal_size_blocks: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M2-002/M2-003/M2-004 (#5, #6, #7): mkfs_format_run entry point, the M2 real-write pipeline. Pushes rbx/r12/r13/r14/r15 (5 registers) before repurposing any; pops all five (reverse order) at the single shared epilogue (mkfs_format_run_epilogue) before every return. rbx=target_ptr, r12=force_flag, r13=journal_size_blocks. Phase 1 (refusal gate): rdi=rbx, rsi=r12, `call mkfs_refuse_check` (src/refusal.pdx) -> rax in {REFUSE_OK=0, REFUSE_ALREADY_PDXB=2, REFUSE_ALREADY_PDXL=3, REFUSE_NON_BLANK=4}. `cmp rax,0; je mkfs_format_run_open` on OK. Otherwise: rdi=rbx, rsi=rax (the refusal code IS the matching FormatRecord::FR_RESULT_* code, by the one-for-one numbering src/refusal.pdx's own header documents), rdx=0 (errno unused for a refusal), `call format_record_emit_result`; `mov rax,5` (MKFS_EXIT_REFUSED); jmp epilogue. Phase 2 (open): sys_open(rdi=rbx, rsi=0xC1 (O_CREAT|O_WRONLY|O_TRUNC), rdx=0x1A4 (0644), rax=2); `cmp rax,0; jl mkfs_format_run_open_fail` (no fd to close on this path). On success r14=fd. Phase 3 (superblock): rdi=r13, `call mkfs_format_build_superblock`; rdi=&mkfs_format_sb_summary, rsi=&mkfs_format_sb_encoded, rdx=4096, `call pdxb_encode_superblock` (libpdx-volume, cross-repo call by bare label -- see module header); `cmp rax,4096; jne mkfs_format_run_encode_fail` (defensive -- cannot actually fail since out_len is always exactly 4096, but pdxb_encode_superblock's own contract returns a distinct sentinel on a too-small buffer, so this gate is honoured rather than assumed). sys_write(r14, &mkfs_format_sb_encoded, 4096); `cmp rax,0; jl mkfs_format_run_close_fail`. Phase 4 (inode table, no lseek -- see module header): sys_write(r14, &mkfs_format_zero_buf, 128) for inode 0's sentinel slot via a DIRECT sys_write (128 <= 4096, one call suffices, no need for the write_zeros helper's chunking loop) -- fail check as above; `call mkfs_format_encode_root_inode`; sys_write(r14, &mkfs_format_root_inode, 128) for inode 1 -- fail check; rdi=r14, rsi=32512 ((256-2)*128), `call mkfs_format_write_zeros` for inodes 2..255 -- `cmp rax,0; jl mkfs_format_run_close_fail` (write_zeros itself returns the raw negative errno on failure, matching a direct syscall's convention). Phase 5 (bitmap): rdi=r14, rsi=1024 (MKFS_BITMAP_BYTES), `call mkfs_format_write_zeros` -- same fail check. Phase 6 (journal): `mov r8,r13; shl r8,12` (journal_size_blocks * 4096 via shift, avoiding imul per this codebase's compile-time-constant-multiply convention); rdi=r14, rsi=r8, `call mkfs_format_write_zeros` -- same fail check. Phase 7 (close + success record): sys_close(r14) (SC+ ID 3, return ignored per this repo's fd_close-of-live-fd posture); rdi=rbx, rsi=0 (FR_RESULT_OK), rdx=0, `call format_record_emit_result`; `xor rax,rax` (MKFS_EXIT_OK); jmp epilogue. Failure paths: mkfs_format_run_encode_fail sets r15 to the sentinel 0xFFFFFFFFFFFFFFFF (an encode failure has no syscall errno) then falls into mkfs_format_run_close_and_fail; mkfs_format_run_close_fail computes `xor r15,r15; sub r15,rax` (positive errno from the just-failed syscall's negative rax, matching src/user/errno.pdx's syscall_check idiom exactly -- NOT a bare `neg`) then falls into the same close_and_fail; mkfs_format_run_open_fail (no fd yet) computes the same positive-errno idiom directly. mkfs_format_run_close_and_fail: sys_close(r14) best-effort (skipped on the open-fail path, which jumps straight past it since no fd exists); rdi=rbx, rsi=1 (FR_RESULT_FAIL), rdx=r15, `call format_record_emit_result`; `mov rax,3` (MKFS_EXIT_SYSCALL_ERROR); jmp epilogue. Every call site above either targets a leaf that touches no callee-save register (mkfs_refuse_check touches r12 internally but pushes/pops it; mkfs_format_build_superblock/mkfs_format_encode_root_inode/pdxb_encode_superblock are all pure leaves per their own documented register plans) or targets format_record_emit_result/mkfs_format_write_zeros, both of which push/pop every callee-save register they repurpose -- so rbx/r13/r14/r15 all survive every `call` in this function transparently. No `add reg,[mem]` anywhere (`add rdx,10` / `add r15... ` are all register-only). No `test` -- every check is `cmp reg,imm`/`cmp reg,0`. No `imul`/`mul` -- the one compile-time-constant multiply (journal bytes = blocks*4096) is `shl r8,12`. Labels prefixed mkfs_format_run_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r12, rsi;                       // r12 = force_flag
+        mov r13, rdx;                       // r13 = journal_size_blocks
+
+        // ---- Phase 1: non-blank refusal gate. ----------------------------
+        mov rdi, rbx;
+        mov rsi, r12;
+        call mkfs_refuse_check;
+        cmp rax, 0;
+        je mkfs_format_run_open;
+
+        mov rdi, rbx;
+        mov rsi, rax;                       // refusal code == matching FR_RESULT_* code
+        xor rdx, rdx;
+        call format_record_emit_result;
+        mov rax, 5;                         // MKFS_EXIT_REFUSED
+        jmp mkfs_format_run_epilogue;
+
+      mkfs_format_run_open:
+        // ---- Phase 2: sys_open(target, O_CREAT|O_WRONLY|O_TRUNC, 0644). --
+        mov rdi, rbx;
+        mov rsi, 0xC1;
+        mov rdx, 0x1A4;
+        mov rax, 2;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_format_run_open_fail;
+
+        mov r14, rax;                       // r14 = fd
+
+        // ---- Phase 3: build + encode + write superblock. -----------------
+        mov rdi, r13;
+        call mkfs_format_build_superblock;
+
+        lea rdi, [rip + mkfs_format_sb_summary];
+        lea rsi, [rip + mkfs_format_sb_encoded];
+        mov rdx, 4096;
+        call pdxb_encode_superblock;
+        cmp rax, 4096;
+        jne mkfs_format_run_encode_fail;
+
+        mov rdi, r14;
+        lea rsi, [rip + mkfs_format_sb_encoded];
+        mov rdx, 4096;
+        mov rax, 1;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_format_run_close_fail;
+
+        // ---- Phase 4: inode table (no lseek -- see module header). -------
+        mov rdi, r14;
+        lea rsi, [rip + mkfs_format_zero_buf];
+        mov rdx, 128;
+        mov rax, 1;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_format_run_close_fail;
+
+        call mkfs_format_encode_root_inode;
+
+        mov rdi, r14;
+        lea rsi, [rip + mkfs_format_root_inode];
+        mov rdx, 128;
+        mov rax, 1;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_format_run_close_fail;
+
+        mov rdi, r14;
+        mov rsi, 32512;                     // (256 - 2) * 128
+        call mkfs_format_write_zeros;
+        cmp rax, 0;
+        jl mkfs_format_run_close_fail;
+
+        // ---- Phase 5: allocator bitmap zeros. -----------------------------
+        mov rdi, r14;
+        mov rsi, 1024;                      // MKFS_BITMAP_BYTES
+        call mkfs_format_write_zeros;
+        cmp rax, 0;
+        jl mkfs_format_run_close_fail;
+
+        // ---- Phase 6: journal zeros (blocks -> bytes via shl 12). ---------
+        mov r8, r13;
+        shl r8, 12;                         // journal_size_blocks * 4096
+        mov rdi, r14;
+        mov rsi, r8;
+        call mkfs_format_write_zeros;
+        cmp rax, 0;
+        jl mkfs_format_run_close_fail;
+
+        // ---- Phase 7: close + success record. -----------------------------
+        mov rdi, r14;
+        mov rax, 3;
+        syscall;
+
+        mov rdi, rbx;
+        xor rsi, rsi;                       // FR_RESULT_OK
+        xor rdx, rdx;
+        call format_record_emit_result;
+        xor rax, rax;                       // MKFS_EXIT_OK
+        jmp mkfs_format_run_epilogue;
+
+      mkfs_format_run_encode_fail:
+        mov r15, 0xFFFFFFFFFFFFFFFF;        // no syscall errno; encode-failure sentinel
+        jmp mkfs_format_run_close_and_fail;
+
+      mkfs_format_run_close_fail:
+        xor r15, r15;
+        sub r15, rax;                       // positive errno from the failing syscall
+
+      mkfs_format_run_close_and_fail:
+        mov rdi, r14;
+        mov rax, 3;
+        syscall;                            // best-effort close; return ignored
+
+        mov rdi, rbx;
+        mov rsi, 1;                         // FR_RESULT_FAIL
+        mov rdx, r15;
+        call format_record_emit_result;
+        mov rax, 3;                         // MKFS_EXIT_SYSCALL_ERROR
+        jmp mkfs_format_run_epilogue;
+
+      mkfs_format_run_open_fail:
+        xor r15, r15;
+        sub r15, rax;                       // positive errno from sys_open
+
+        mov rdi, rbx;
+        mov rsi, 1;                         // FR_RESULT_FAIL
+        mov rdx, r15;
+        call format_record_emit_result;
+        mov rax, 3;                         // MKFS_EXIT_SYSCALL_ERROR
+
+      mkfs_format_run_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

@@ -1,0 +1,186 @@
+// src/refusal.pdx — mkfs.pdxfs.M2-004 (#7) — non-blank-target refusal gate
+//
+// design/tooling/volume-tooling-ux.md §3.3 (paideia-os): before writing
+// anything, mkfs reads the target's leading bytes and refuses to
+// overwrite a non-blank target unless `--force`:
+//
+//   1. First 4 bytes == "PDXB" (0x42584450) -> already a PDXB
+//      superblock. Refuse without --force.
+//   2. First 4 bytes == "PDXL" (0x4C584450) -> an R25 lite-format
+//      superblock. Refuse and (eventually) suggest --upgrade
+//      (mkfs.pdxfs.M4-004; not this issue).
+//   3. Any other non-zero first bytes. Refuse with a generic
+//      NON_BLANK diagnostic.
+//   4. All-zero (or the target does not exist yet) -> blank/fresh.
+//      Proceed.
+//
+// `--force` bypasses this ENTIRE check (per the task brief's own
+// wording: "If the target file exists AND --force is NOT set"). The
+// upstream design doc additionally wants a `REFUSED_OVERRIDDEN` audit
+// sub-record on every `--force` override (§3.3, "This is deliberate:
+// --force bypasses the refusal but never the audit trail") -- that
+// requires `libpdx-audit`, which is not linked by this repo until
+// mkfs.pdxfs.M3-004. At M2, `--force` therefore skips the check with
+// no audit trace; flagged here (and in design/architecture.md) as a
+// known gap M3-004 must close.
+//
+// Scope note vs. §3.3's literal text: the design doc says mkfs "reads
+// the first 4096 bytes" and inspects them broadly (gate 3's "any other
+// non-zero-filled first-block content" is nominally a 4096-byte scan,
+// with a 32-byte hex-dump for the operator). This issue's own task
+// brief narrows that to reading and inspecting only the first 4 BYTES
+// -- the same four bytes gates 1 and 2 already need for the magic
+// compare. This file implements the narrower, explicitly-specified
+// 4-byte check; scanning the full first block (and hex-dumping it on
+// refusal) is deferred as a documented gap for a later milestone (see
+// design/architecture.md).
+//
+// Read-error handling: this file treats a failed `sys_open` (most
+// commonly ENOENT -- the common case, a target that does not exist
+// yet) as "nothing to refuse, proceed" -- there is no existing content
+// to inspect. A different open failure (e.g. EACCES) is NOT
+// distinguished from ENOENT at M2 and also falls through to "proceed"
+// -- the subsequent real sys_open in src/format.pdx's mkfs_format_run
+// (with O_CREAT|O_WRONLY|O_TRUNC) will surface any real permission
+// problem as its own FAIL record. A failed sys_read past a successful
+// open is handled the same way (proceed) rather than refusing or
+// failing outright. Both simplifications are flagged for main in
+// design/architecture.md as an M2 scope call to revisit.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero/equality
+// check is `cmp reg, 0` or `cmp reg, imm`. PDXB_MAGIC (0x42584450) and
+// PDXL_MAGIC (0x4C584450) both fit the imm32 sign-extend bound for
+// `cmp reg, imm` directly (same note libpdx-volume's pdxb_superblock.pdx
+// documents for the identical two constants) -- no r11 staging needed.
+// Reserved-label discipline: every branch label in this file is
+// prefixed `mkfs_refuse_`.
+//
+// SC+ IDs used (design/user/syscall-table.md, paideia-os): 0 = sys_read,
+// 2 = sys_open, 3 = sys_close.
+//
+// Register-preservation discipline (design/architecture.md §7 in this
+// repo): `mkfs_refuse_check` repurposes one SysV callee-save register
+// (r12, to hold the fd across the sys_read/sys_close pair -- the
+// kernel's #743 info-leak hardening zeroes every CALLER-save register
+// on syscall return, so a caller-save register cannot carry state
+// across a syscall boundary the way r12 can) and explicitly
+// `push`es/`pop`s it.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §3.3 (paideia-os).
+
+module Refusal = structure {
+
+  // --- mkfs_refuse_check return codes. Mirror FormatRecord::FR_RESULT_*
+  //     one-for-one (src/format_record.pdx) EXCEPT this function never
+  //     returns FR_RESULT_FAIL (1) -- a refusal-gate outcome is either
+  //     "proceed" or one of three refusal reasons, never a syscall
+  //     failure in its own right (see the read-error-handling note
+  //     above for why an open/read failure here folds into "proceed"
+  //     rather than a distinct FAIL code). Kept as this file's own
+  //     integer literals (not an import of format_record.pdx's `pub
+  //     let` bindings) per this codebase's established convention of
+  //     citing a cross-file constant by comment rather than importing
+  //     it as an immediate operand (see src/format_record.pdx's own
+  //     note on this). -----------------------------------------------
+  pub let REFUSE_OK                   : u64 = 0   // FormatRecord::FR_RESULT_OK
+  pub let REFUSE_ALREADY_PDXB         : u64 = 2   // FormatRecord::FR_RESULT_REFUSED_ALREADY_PDXB
+  pub let REFUSE_ALREADY_PDXL         : u64 = 3   // FormatRecord::FR_RESULT_REFUSED_ALREADY_PDXL
+  pub let REFUSE_NON_BLANK            : u64 = 4   // FormatRecord::FR_RESULT_REFUSED_NON_BLANK
+
+  // --- Scratch: first 4 bytes read back from an existing target. .bss,
+  //     zero-initialised by the loader -- a short (<4 byte) sys_read
+  //     leaves any untouched trailing byte(s) at this zero value, which
+  //     is exactly the correct "blank" reading for those bytes (see
+  //     mkfs_refuse_check's justification for why no explicit
+  //     pre-clear is needed beyond this one-time bss zero-init). ------
+  pub let mut mkfs_refuse_buf4 : [u8; 4] = uninit @align(4)
+
+  // ==========================================================================
+  // mkfs_refuse_check(target_ptr, force_flag) -> u64
+  //   (REFUSE_OK | REFUSE_ALREADY_PDXB | REFUSE_ALREADY_PDXL | REFUSE_NON_BLANK)
+  //
+  //   rdi = target_ptr   (NUL-terminated <target> path)
+  //   rsi = force_flag   (0 or 1 -- ParsedArgv.flags & PA_FLAG_FORCE,
+  //                        already reduced to a single bit by the
+  //                        caller, src/format.pdx's mkfs_format_run)
+  //
+  // force_flag != 0 short-circuits to REFUSE_OK before any syscall --
+  // `--force` bypasses this entire gate (see module header for the
+  // audit-trail gap that leaves open).
+  // ==========================================================================
+  pub let mkfs_refuse_check : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (force_flag: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M2-004 (#7): mkfs_refuse_check entry point. `push r12` before repurposing it (the only callee-save register this function touches). target_ptr arrives in rdi and is used immediately as sys_open's path arg with no need to stash it in a callee-save register (it is not read again after the open call). Gate 0: `cmp rsi, 0; jne mkfs_refuse_ok` -- force_flag set skips straight to REFUSE_OK. Otherwise: sys_open(rdi=target_ptr, rsi=0 (O_RDONLY), rdx=0 (mode unused), rax=2); `cmp rax, 0; jl mkfs_refuse_ok` -- any open failure (ENOENT being the common case: target does not exist yet, nothing to refuse; other errors intentionally not distinguished at M2, see module header) folds into 'proceed'. On success: r12 = fd (must survive the syscall boundary -- see module header's note on why a caller-save register cannot hold this). sys_read(rdi=r12, rsi=&mkfs_refuse_buf4, rdx=4, rax=0); `cmp rax, 0; jl mkfs_refuse_close_ok` routes a read error to a close-then-proceed path (mkfs_refuse_close_ok: sys_close(r12); jmp mkfs_refuse_ok) rather than leaving the fd open. On a non-negative read (0..4 bytes, short reads included -- the untouched tail of mkfs_refuse_buf4 is already zero per its own bss-zero-init comment, so a short read still yields the correct 'blank' classification for the unread bytes): sys_close(r12) unconditionally (SC+ ID 3; return ignored, matching this repo's fd_close-of-live-fd posture), then classify: `lea rcx, [rip + mkfs_refuse_buf4]; mov_d rax, [rcx + 0]` (zero-extended 32-bit load, mirrors pdxb_parse_superblock's own magic-field load in libpdx-volume). `cmp rax, 0; je mkfs_refuse_ok`. `cmp rax, 0x42584450; je mkfs_refuse_pdxb` (PDXB_MAGIC; fits the imm32 sign-extend bound directly per libpdx-volume's pdxb_superblock.pdx precedent, no r11 staging). `cmp rax, 0x4C584450; je mkfs_refuse_pdxl` (PDXL_MAGIC, same note). Any other nonzero value: `jmp mkfs_refuse_non_blank`. Each of the four terminal labels sets rax to its REFUSE_* code and falls into the shared epilogue (`pop r12; ret`). No `add reg,[mem]`. No `test` -- every check is `cmp reg,imm`. Labels prefixed mkfs_refuse_.",
+      block: {
+        push r12;
+
+        cmp rsi, 0;
+        jne mkfs_refuse_ok;
+
+        // ---- sys_open(target_ptr, O_RDONLY=0, mode=0). SC+ ID 2. --------
+        mov rsi, 0;
+        mov rdx, 0;
+        mov rax, 2;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_refuse_ok;
+
+        mov r12, rax;                        // r12 = fd
+
+        // ---- sys_read(fd, mkfs_refuse_buf4, 4). SC+ ID 0. ---------------
+        mov rdi, r12;
+        lea rsi, [rip + mkfs_refuse_buf4];
+        mov rdx, 4;
+        xor rax, rax;
+        syscall;
+        cmp rax, 0;
+        jl mkfs_refuse_close_ok;
+
+        // ---- sys_close(fd). SC+ ID 3. Return ignored. -------------------
+        mov rdi, r12;
+        mov rax, 3;
+        syscall;
+
+        // ---- Classify the (possibly short) 4-byte read. -----------------
+        lea rcx, [rip + mkfs_refuse_buf4];
+        mov_d rax, [rcx + 0];
+        cmp rax, 0;
+        je mkfs_refuse_ok;
+        cmp rax, 0x42584450;                 // "PDXB"
+        je mkfs_refuse_pdxb;
+        cmp rax, 0x4C584450;                 // "PDXL"
+        je mkfs_refuse_pdxl;
+        jmp mkfs_refuse_non_blank;
+
+      mkfs_refuse_close_ok:
+        mov rdi, r12;
+        mov rax, 3;
+        syscall;
+        jmp mkfs_refuse_ok;
+
+      mkfs_refuse_ok:
+        xor rax, rax;                        // REFUSE_OK
+        jmp mkfs_refuse_epilogue;
+
+      mkfs_refuse_pdxb:
+        mov rax, 2;                          // REFUSE_ALREADY_PDXB
+        jmp mkfs_refuse_epilogue;
+
+      mkfs_refuse_pdxl:
+        mov rax, 3;                          // REFUSE_ALREADY_PDXL
+        jmp mkfs_refuse_epilogue;
+
+      mkfs_refuse_non_blank:
+        mov rax, 4;                          // REFUSE_NON_BLANK
+
+      mkfs_refuse_epilogue:
+        pop r12;
+        ret;
+      }
+    }
+}

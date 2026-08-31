@@ -285,4 +285,280 @@ module FormatRecord = structure {
         ret;
       }
     }
+
+  // ==========================================================================
+  // mkfs.pdxfs.M2 (#5, #7) -- format_record_emit_result + its private
+  // decimal-print helper.
+  //
+  // format_record_emit_dry_run (above) is the M1 four-field slice
+  // ("target, label, journal_size, dry_run: true") and is left
+  // completely untouched by this addition -- it is still the only
+  // emitter main.pdx calls on the --dry-run path. The M2 real-write
+  // pipeline (src/format.pdx's mkfs_format_run) needs a DIFFERENT
+  // record shape: a `result_code` field (and, only when that code is
+  // FAIL, an `error: <errno>` field) rather than the label/journal_size
+  // pair a dry-run preview cares about. That shape is:
+  //
+  //   PdxFsFormatRecord@0.1 { target: <path>, result_code: OK }
+  //   PdxFsFormatRecord@0.1 { target: <path>, result_code: FAIL, error: <n> }
+  //   PdxFsFormatRecord@0.1 { target: <path>, result_code: REFUSED_ALREADY_PDXB }
+  //   PdxFsFormatRecord@0.1 { target: <path>, result_code: REFUSED_ALREADY_PDXL }
+  //   PdxFsFormatRecord@0.1 { target: <path>, result_code: REFUSED_NON_BLANK }
+  //
+  // Still a fixed sequence of `sys_write(1, ...)` calls, same posture as
+  // format_record_emit_dry_run (no schema-registry binding, no
+  // KIND_IPC_ENDPOINT framing -- that is still mkfs.pdxfs.M3-003's job).
+  // The five FR_RESULT_* codes below are this repo's own numbering (not
+  // sourced from volume-tooling-ux.md §3.5, which only sketches
+  // `refused_gates: Vec<enum{NON_BLANK_PDXB, NON_BLANK_PDXL, NON_BLANK_OTHER}>`
+  // as part of the FULL 14-field record, not a top-level `result_code`
+  // scalar) -- src/format.pdx and src/refusal.pdx both reference these
+  // same five integers by comment, matching this codebase's established
+  // convention (see e.g. src/main.pdx's `and rax, 0x2; // PA_FLAG_DRY_RUN`)
+  // of hard-coding a small cross-file integer constant with a citing
+  // comment rather than importing another file's `pub let` binding as an
+  // immediate operand.
+  // ==========================================================================
+  pub let FR_RESULT_OK                   : u64 = 0
+  pub let FR_RESULT_FAIL                 : u64 = 1
+  pub let FR_RESULT_REFUSED_ALREADY_PDXB : u64 = 2
+  pub let FR_RESULT_REFUSED_ALREADY_PDXL : u64 = 3
+  pub let FR_RESULT_REFUSED_NON_BLANK    : u64 = 4
+
+  // --- Literal chunks for format_record_emit_result. Lengths verified via
+  //     `python3 -c "print(len(...))"` against each literal, same
+  //     discipline as the M1 literals above. fr_lit_prefix (M1, above) is
+  //     reused verbatim for this emitter's target-path segment -- both
+  //     record shapes open with the identical "PdxFsFormatRecord@0.1 {
+  //     target: " chunk. -------------------------------------------------
+  pub let fr_lit_result_code     : [u8; 16] = ", result_code: \0"
+  pub let fr_lit_result_code_len : u64 = 15
+
+  pub let fr_lit_ok     : [u8; 6] = "OK }\n\0"
+  pub let fr_lit_ok_len : u64 = 5
+
+  pub let fr_lit_fail_prefix     : [u8; 14] = "FAIL, error: \0"
+  pub let fr_lit_fail_prefix_len : u64 = 13
+
+  pub let fr_lit_fail_suffix     : [u8; 4] = " }\n\0"
+  pub let fr_lit_fail_suffix_len : u64 = 3
+
+  pub let fr_lit_refused_pdxb     : [u8; 24] = "REFUSED_ALREADY_PDXB }\n\0"
+  pub let fr_lit_refused_pdxb_len : u64 = 23
+
+  pub let fr_lit_refused_pdxl     : [u8; 24] = "REFUSED_ALREADY_PDXL }\n\0"
+  pub let fr_lit_refused_pdxl_len : u64 = 23
+
+  pub let fr_lit_refused_non_blank     : [u8; 21] = "REFUSED_NON_BLANK }\n\0"
+  pub let fr_lit_refused_non_blank_len : u64 = 20
+
+  // ==========================================================================
+  // format_record_write_u64_dec(fd, value) -> ()
+  //
+  // Writes `value`'s decimal ASCII rendering to `fd` via a single
+  // sys_write. Same div-by-10 algorithm as format_record_emit_dry_run's
+  // inline segment 6 (adapted from src/user/init.pdx's print_u64_dec in
+  // the paideia-os monorepo), factored out here as its own function
+  // rather than inlined a second time, since format_record_emit_result
+  // (below) is the second call site that needs it (the errno field on a
+  // FAIL record) and format_record_emit_dry_run's own inline copy is
+  // left untouched -- this is a NEW function, not a refactor of the
+  // already-landed M1 body, so M1's call site is unaffected.
+  //
+  // Register plan: rbx = fd (held across the sys_write calls), r12 =
+  // remaining value during the division loop -- both SysV callee-save,
+  // pushed on entry and popped before the single `ret`, matching this
+  // file's and this repo's register-preservation discipline
+  // (design/architecture.md §7).
+  // ==========================================================================
+  pub let format_record_write_u64_dec : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (fd: u64) (value: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M2 (#5, #7): format_record_write_u64_dec entry point. push rbx; push r12 before repurposing either. rbx=fd, r12=value. `sub rsp, 24` scratch (20 digit bytes + 4 alignment slop, matching format_record_emit_dry_run's own sizing). Zero special case (r12==0): store a single '0' byte at [rsp], sys_write(rbx, rsp, 1). General case: r9=remaining value, r10=cursor at rsp+19 walking DOWN (digits most-significant-last, so [cursor, rsp+20) is already MSB-first -- identical algorithm to format_record_emit_dry_run's segment 6 and src/user/init.pdx's print_u64_dec in the paideia-os monorepo). Loop body: `mov rax,r9; mov rcx,10; xor rdx,rdx; div rcx` (rax=quotient, rdx=remainder), `add rdx,0x30` (ASCII), `mov [r10],dl`, `mov r9,rax`; `cmp r9,0; je emit` else `sub r10,1` and loop. Emit: digit count = (rsp+20) - r10, one sys_write(rbx, r10, count). `add rsp, 24` restores the stack; pop r12; pop rbx; ret. No `add reg,[mem]` (all math is register-only). No `test`. No `imul`/`mul` -- only `div` by the compile-time constant 10, which this codebase's imul-avoidance convention does not cover (that convention targets compile-time-constant MULTIPLIES). Labels prefixed mkfs_fr_wud_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                       // rbx = fd
+        mov r12, rsi;                       // r12 = value
+
+        sub rsp, 24;
+
+        cmp r12, 0;
+        jne mkfs_fr_wud_setup;
+
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdi, rbx;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_wud_done;
+
+      mkfs_fr_wud_setup:
+        mov r9, r12;
+        mov r10, rsp;
+        add r10, 19;
+
+      mkfs_fr_wud_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov [r10], dl;
+        mov r9, rax;
+        cmp r9, 0;
+        je mkfs_fr_wud_emit;
+        sub r10, 1;
+        jmp mkfs_fr_wud_loop;
+
+      mkfs_fr_wud_emit:
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;
+        mov rdx, rax;
+        mov rdi, rbx;
+        mov rsi, r10;
+        mov rax, 1;
+        syscall;
+
+      mkfs_fr_wud_done:
+        add rsp, 24;
+
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // format_record_emit_result(target_ptr, result_code, errno) -> ()
+  //
+  //   rdi = target_ptr    (NUL-terminated <target> string)
+  //   rsi = result_code   (one of FR_RESULT_* above)
+  //   rdx = errno         (positive errno; only read when result_code ==
+  //                         FR_RESULT_FAIL, ignored otherwise -- callers
+  //                         with nothing to report pass 0)
+  //
+  // Segments, in wire order: (1) fr_lit_prefix -- reused from the M1
+  // dry-run emitter above, identical opening chunk; (2) target_ptr via
+  // format_record_strlen; (3) fr_lit_result_code; (4) a dispatch on
+  // result_code selecting exactly one closing segment -- fr_lit_ok, OR
+  // fr_lit_fail_prefix + the decimal errno (via format_record_write_u64_dec)
+  // + fr_lit_fail_suffix, OR fr_lit_refused_pdxb, OR fr_lit_refused_pdxl,
+  // OR fr_lit_refused_non_blank (the fall-through default -- the only
+  // caller of this function, src/format.pdx's mkfs_format_run, never
+  // passes a sixth value, so this default is defensive belt-and-suspenders
+  // rather than a reachable distinct case).
+  //
+  // Register plan: rbx=target_ptr, r12=result_code, r13=errno, all SysV
+  // callee-save, pushed on entry and popped before the single `ret` --
+  // this is a public entry point matching format_record_emit_dry_run's
+  // own register-preservation discipline (design/architecture.md §7).
+  // ==========================================================================
+  pub let format_record_emit_result : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (result_code: u64) (errno: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M2 (#5, #7): format_record_emit_result entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=result_code, r13=errno. Segment 1: sys_write(1, fr_lit_prefix, 32) (reused M1 literal). Segment 2: call format_record_strlen(rbx) -> rax -> rdx; sys_write(1, rbx, rdx). Segment 3: sys_write(1, fr_lit_result_code, 15). Segment 4 dispatch: `cmp r12, 0; je mkfs_fr_er_ok` (FR_RESULT_OK); `cmp r12, 1; je mkfs_fr_er_fail` (FR_RESULT_FAIL); `cmp r12, 2; je mkfs_fr_er_pdxb` (FR_RESULT_REFUSED_ALREADY_PDXB); `cmp r12, 3; je mkfs_fr_er_pdxl` (FR_RESULT_REFUSED_ALREADY_PDXL); unconditional `jmp mkfs_fr_er_non_blank` for FR_RESULT_REFUSED_NON_BLANK (4) and as a defensive default (see module comment above). mkfs_fr_er_ok: sys_write(1, fr_lit_ok, 5); jmp done. mkfs_fr_er_fail: sys_write(1, fr_lit_fail_prefix, 13); call format_record_write_u64_dec(1, r13); sys_write(1, fr_lit_fail_suffix, 3); jmp done. mkfs_fr_er_pdxb: sys_write(1, fr_lit_refused_pdxb, 23); jmp done. mkfs_fr_er_pdxl: sys_write(1, fr_lit_refused_pdxl, 23); jmp done. mkfs_fr_er_non_blank: sys_write(1, fr_lit_refused_non_blank, 20). done: pop r13; pop r12; pop rbx; ret. No `add reg,[mem]`. No `test` -- every branch is `cmp reg,imm`. Labels prefixed mkfs_fr_er_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r12, rsi;                       // r12 = result_code
+        mov r13, rdx;                       // r13 = errno
+
+        // ---- Segment 1: "PdxFsFormatRecord@0.1 { target: " -------------
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_prefix];
+        mov rdx, 32;                        // fr_lit_prefix_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 2: target path --------------------------------------
+        mov rdi, rbx;
+        call format_record_strlen;
+        mov rdx, rax;
+        mov rdi, 1;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: ", result_code: " ---------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_result_code];
+        mov rdx, 15;                        // fr_lit_result_code_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: dispatch on result_code --------------------------
+        cmp r12, 0;
+        je mkfs_fr_er_ok;
+        cmp r12, 1;
+        je mkfs_fr_er_fail;
+        cmp r12, 2;
+        je mkfs_fr_er_pdxb;
+        cmp r12, 3;
+        je mkfs_fr_er_pdxl;
+        jmp mkfs_fr_er_non_blank;
+
+      mkfs_fr_er_ok:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_ok];
+        mov rdx, 5;                         // fr_lit_ok_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_fail:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_fail_prefix];
+        mov rdx, 13;                        // fr_lit_fail_prefix_len
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 1;
+        mov rsi, r13;
+        call format_record_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_fail_suffix];
+        mov rdx, 3;                         // fr_lit_fail_suffix_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_pdxb:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_refused_pdxb];
+        mov rdx, 23;                        // fr_lit_refused_pdxb_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_pdxl:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_refused_pdxl];
+        mov rdx, 23;                        // fr_lit_refused_pdxl_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_non_blank:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_refused_non_blank];
+        mov rdx, 20;                        // fr_lit_refused_non_blank_len
+        mov rax, 1;
+        syscall;
+
+      mkfs_fr_er_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
 }
