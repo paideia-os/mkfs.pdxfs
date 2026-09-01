@@ -1,5 +1,20 @@
 # mkfs.pdxfs — CHANGELOG
 
+## Unreleased
+
+- **ELF-linking phase** for `tools/build.sh`, part of wiring this repo
+  into paideia-os's boot-time `/bin` seeding pipeline
+  (paideia-os#1976/#1977). Adds `link.ld` (the `PT_LOAD`/`text`+`data`
+  pattern from paideia-os's `src/user/true.ld`, `.data`/`.bss`
+  contiguous per paideia-os#1595) and a link step that runs `ld
+  -nostdlib --warn-common --fatal-warnings -T link.ld` over this
+  repo's own `src/*.o` objects (not `tests/*.o`) once compilation
+  succeeds, producing `build-out/mkfs.pdxfs.elf` (plus a matching
+  `.bin` via `objcopy`). `tools/build.sh` now also accepts one or more
+  repeatable `--extra-obj-dir DIR` flags to fold in pre-built
+  dependency objects (e.g. `libpdx-volume`, `libpdx-audit`) at link
+  time; a missing or empty `DIR` is not an error.
+
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5)
 
 **First release.** Manifest scaffolded for a future dual-signed
