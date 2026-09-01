@@ -13,7 +13,8 @@
   `.bin` via `objcopy`). `tools/build.sh` now also accepts one or more
   repeatable `--extra-obj-dir DIR` flags to fold in pre-built
   dependency objects (e.g. `libpdx-volume`, `libpdx-audit`) at link
-  time; a missing or empty `DIR` is not an error.
+  time; a `--extra-obj-dir` naming a missing or empty directory
+  contributes nothing and is never an error.
 
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5)
 

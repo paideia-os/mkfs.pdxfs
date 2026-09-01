@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Per-repo build script. Runs paideia-as build over every .pdx source, then
-# (R64v2 satellite-linking closure) links build-out/*.o into a standalone
-# ELF via build-out/mkfs.pdxfs.elf when at least one --extra-obj-dir is
-# given.
+# Per-repo build script. Runs paideia-as build over every .pdx source,
+# then links this repo's own objects (plus any --extra-obj-dir objects)
+# into a flat ELF via `ld -T link.ld`, per paideia-os issue #1976/#1977
+# (satellite-tool /bin seeding pipeline).
 #
 # Resolves paideia-as via (in order):
 #   1. $PAIDEIA_AS env var
@@ -13,33 +13,32 @@
 # Requires paideia-as >= 0.21.0. The 0.9.0 shipped in $PATH by default does not
 # accept the syntax used in this repo.
 #
-# Linking (R64v2): this repo has no link-time access to libpdx-volume,
-# libpdx-audit, or libpdx-elevate's own .o's -- the caller (paideia-os's
-# tools/build.sh, or a developer working on this repo standalone) passes
-# each dependency's build-out directory via a repeatable --extra-obj-dir
-# flag. Every *.o found in each --extra-obj-dir is added to the ld command
-# line alongside this repo's own build-out/*.o (excluding build-out/tests-
-# *.o, which are unit-test objects, never part of the linked binary).
+# Usage:
+#   tools/build.sh [--extra-obj-dir DIR]...
 #
-# With zero --extra-obj-dir flags, linking is skipped entirely and this
-# script behaves exactly as before R64v2 (compile-only, build-out/*.o) --
-# this repo's own test/CI usage does not pass the flag and does not need
-# a linked ELF.
-#
-# Usage: tools/build.sh [--extra-obj-dir DIR]...
+# --extra-obj-dir DIR may be repeated. Every *.o file found directly
+# inside DIR (e.g. pre-built libpdx-* dependency objects) is linked
+# alongside this repo's own src/*.o objects. A DIR that does not exist
+# or holds no .o files contributes nothing — it is not an error.
+# tests/*.o objects are compiled but never linked into the ELF.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MIN_VERSION="0.21.0"
-TOOL_NAME="mkfs.pdxfs"
+EXTRA_OBJECTS=()
+OWN_OBJECTS=()
 
-EXTRA_OBJ_DIRS=()
-while [ $# -gt 0 ]; do
+while [ "$#" -gt 0 ]; do
     case "$1" in
         --extra-obj-dir)
-            EXTRA_OBJ_DIRS+=("$2")
+            [ "$#" -ge 2 ] || { echo "[build] FAIL: --extra-obj-dir requires an argument" >&2; exit 2; }
+            extra_dir="$2"
             shift 2
+            shopt -s nullglob
+            for obj in "$extra_dir"/*.o; do
+                [ -f "$obj" ] && EXTRA_OBJECTS+=("$obj")
+            done
+            shopt -u nullglob
             ;;
         *)
             echo "[build] FAIL: unrecognized argument: $1" >&2
@@ -47,6 +46,8 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+MIN_VERSION="0.21.0"
 
 resolve_paideia_as() {
     if [ -n "${PAIDEIA_AS:-}" ] && [ -x "$PAIDEIA_AS" ]; then
@@ -88,15 +89,13 @@ mkdir -p "$BUILD_DIR"
 
 FAIL=0
 COUNT=0
-OWN_OBJS=()
 for pdx in src/*.pdx; do
     [ -f "$pdx" ] || continue
     COUNT=$((COUNT + 1))
     obj="$BUILD_DIR/$(basename "$pdx" .pdx).o"
+    OWN_OBJECTS+=("$obj")
     if ! "$PA" build --emit elf64 "$pdx" -o "$obj" 2>&1; then
         FAIL=$((FAIL + 1))
-    else
-        OWN_OBJS+=("$obj")
     fi
 done
 
@@ -115,33 +114,14 @@ echo "[build] $COUNT source(s), $FAIL failure(s)"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "[build] OK"
 
-if [ ${#EXTRA_OBJ_DIRS[@]} -eq 0 ]; then
-    echo "[build] no --extra-obj-dir given -- skipping link phase (compile-only)"
-    exit 0
-fi
+if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
+    echo "[link] ld -T link.ld -> $BUILD_DIR/mkfs.pdxfs.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T link.ld \
+        -o "$BUILD_DIR/mkfs.pdxfs.elf" \
+        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}"
+    echo "[link] OK -> $BUILD_DIR/mkfs.pdxfs.elf"
 
-LINK_OBJS=("${OWN_OBJS[@]}")
-for d in "${EXTRA_OBJ_DIRS[@]}"; do
-    if [ ! -d "$d" ]; then
-        echo "[build] FAIL: --extra-obj-dir $d does not exist" >&2
-        exit 2
-    fi
-    found=0
-    for o in "$d"/*.o; do
-        [ -f "$o" ] || continue
-        LINK_OBJS+=("$o")
-        found=1
-    done
-    if [ "$found" -eq 0 ]; then
-        echo "[build] FAIL: --extra-obj-dir $d has no .o files" >&2
-        exit 2
-    fi
-done
-
-ELF="$BUILD_DIR/$TOOL_NAME.elf"
-echo "[build] linking $ELF ($(( ${#LINK_OBJS[@]} )) object(s))"
-if ! ld -nostdlib -T link.ld -o "$ELF" "${LINK_OBJS[@]}"; then
-    echo "[build] FAIL: ld failed for $ELF" >&2
-    exit 1
+    objcopy -O binary "$BUILD_DIR/mkfs.pdxfs.elf" "$BUILD_DIR/mkfs.pdxfs.bin"
+    echo "[link] OK -> $BUILD_DIR/mkfs.pdxfs.bin"
 fi
-echo "[build] OK -- $ELF"
