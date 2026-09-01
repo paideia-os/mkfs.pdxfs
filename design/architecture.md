@@ -667,3 +667,147 @@ body needs to change, not any caller.
   equivalent library.
 - `libpdx-schema-registry` (GitHub paideia-os#2000) needs to land
   before `src/pipe_wire.pdx` can bind a real schema by name (§11.3).
+
+## 12. M4 landing (#13-#16) — tests + smoke, two of them documented stubs
+
+Four test drivers under `tests/`, one per M4 issue, following the
+`run() -> u64` return-code convention `libpdx-volume`'s own M4 drivers
+established (see `tests/README.md` for the full convention writeup).
+The key difference from `libpdx-volume`'s drivers: THIS repo issues
+real syscalls in its own call graph (no `KIND_PDXFS_FILE`/
+`KIND_BLKDEV` cap is minted or consumed anywhere — `caps.decl`'s own
+note), so a "smoke test" of `mkfs_format_run`/`mkfs_refuse_check`
+cannot be a hermetic `.bss`-fixture unit test the way that library's
+own `pdxb_encode_superblock` round-trip driver is. Two of the four
+drivers here perform REAL destructive I/O against scratch paths under
+`/tmp` when linked and run under a real QEMU boot.
+
+### 12.1 `mkfs.pdxfs.M4-001` (#13) — file-target happy path
+
+`tests/test_file_target_happy.pdx` calls `PipeWire::
+mkfs_sp_emit_dry_run` and `Format::mkfs_format_run` directly (bypassing
+`argv_parse` and `_start`'s own `sys_exit`-terminated dispatch, neither
+of which returns to a caller) against two real scratch paths. Four
+phases: (1) dry-run against a path this driver never writes any other
+way, verified via a direct `sys_open(O_RDONLY)` returning ENOENT
+afterward — the only externally observable proof "no write occurred"
+without a stdout-capture harness, standing in for the issue's own
+"dry-run -> DRY_RUN" expectation (there is no `FR_RESULT_DRY_RUN` code
+in this repo's vocabulary, since dry-run's record shape is the
+four-field M1 slice, not the `result_code`-shaped M2+ record); (2) a
+fresh-target real write, expecting `MKFS_EXIT_OK`; (3) a repeat against
+the now-formatted target with `force=0`, expecting `MKFS_EXIT_REFUSED`;
+(4) a repeat with `force=1`, expecting `MKFS_EXIT_OK` again. Both
+scratch paths are best-effort `sys_unlink`'d at entry so a stale file
+from a prior run cannot bias any phase.
+
+### 12.2 `mkfs.pdxfs.M4-002` (#14) — refusal matrix + force + audit wiring
+
+`tests/test_refusal_matrix.pdx` writes three real 4-byte fixture files
+via its own `mkfs_test_write_fixture` helper (`"PDXB"`, `"PDXL"`,
+`"XYZQ"` — the first two chosen because their bytes, read as a
+little-endian u32, equal `PDXB_MAGIC`/`PDXL_MAGIC` exactly, by the same
+byte-order argument `src/refusal.pdx` itself relies on) and calls
+`Refusal::mkfs_refuse_check` against each, plus a best-effort-unlinked
+blank target and a `--force` override against the PDXB fixture — five
+comparable phases, each asserting the expected `REFUSE_*` code. A
+sixth phase exercises `AuditWire::mkfs_audit_begin`/`mkfs_audit_commit`
+once per `force_flag` value (covering both `op_name` literal
+branches), but asserts NO return code: `audit_wire.pdx`'s own
+documented "forgiving posture" means neither call's return value means
+anything given `libpdx-audit`'s stubbed daemon dispatch — this phase's
+pass signal is that the sequence completes and control reaches the
+shared success path, not a compared value. **Flagged for main**: a
+real audit-trail assertion needs a live (non-stubbed) audit-journal
+daemon this repo cannot stand up itself.
+
+### 12.3 `mkfs.pdxfs.M4-003` (#15) — device-target smoke: a documented stub
+
+`tests/test_device_target_smoke.pdx` calls `Format::
+mkfs_format_run_device` directly (bypassing the elevate gate, which
+always denies — see §11.1/§11.5) and asserts its return equals
+`MKFS_EXIT_DEVICE_STUB` (4). This is explicitly NOT the "device-target
+smoke against QEMU virtio disk" the issue's own title names — §11.1's
+own write-up already establishes why no such smoke is constructible
+today: no `sys_cap_query`-equivalent syscall exists to validate a
+`cap:blkdev:` slot's kind, and no block-granularity write syscall
+exists at any sysno (only the cap-minting `blkdev_cap_request`, sysno
+74). This driver is the honest, buildable substitute: it proves the
+STUB's documented contract holds (real slot parse, stub record emit,
+stub exit code) so a future landing of all three substrate items §11.6
+lists has a driver already in place to extend, rather than writing one
+from scratch.
+
+### 12.4 `mkfs.pdxfs.M4-004` (#16) — `--upgrade`: minimal-effort stub
+
+Per this issue's own fallback instruction ("If wiring is
+minimal-effort, add `--upgrade` to argv.pdx + a stub result_code
+`UPGRADE_NOT_IMPLEMENTED`"), this landing does exactly the minimal
+half, not a real PDXL->PDXB rewrite (no `pdxl_*` decoder module exists
+anywhere in `libpdx-volume` to rewrite from — confirmed absent by the
+same kind of grep this repo's other module headers document for
+`libpdx-argv`/`libpdx-key`):
+
+- `src/argv.pdx` gained an eighth boolean flag, `PA_FLAG_UPGRADE`
+  (`0x40`), parsed via the same `argv_streq` exact-match path
+  `--force`/`--dry-run`/`--verbose` already use.
+- `src/format_record.pdx` gained `FR_RESULT_UPGRADE_NOT_IMPLEMENTED`
+  (`9`) and its matching literal/dispatch case, following the exact
+  pattern every prior result code in that file already uses.
+- `src/upgrade.pdx` (new) gives that flag a real, callable (if unwired)
+  target: `Upgrade::mkfs_upgrade_run(target_ptr) -> u64` unconditionally
+  emits the new result code via `PipeWire::mkfs_sp_emit_result` and
+  returns `MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED` (`7`).
+
+**Flagged for main** (restated from `src/upgrade.pdx`'s own module
+header): `src/main.pdx`'s `_start` does NOT call `mkfs_upgrade_run`
+from any dispatch branch. Wiring it in requires a real design decision
+this issue's own "minimal-effort" instruction does not settle — does
+`--upgrade` short-circuit before or after the refusal gate, and does it
+apply to a target that is NOT actually PDXL-magic-tagged? — so this
+landing leaves `mkfs_upgrade_run` reachable only by direct call
+(`tests/test_upgrade_stub.pdx`'s own exercise of it), not via any
+argv-driven invocation of the compiled tool.
+
+## 13. M5 landing (#17-#18) — dual-signed release scaffold + distribution docs
+
+Mirrors `libpdx-volume`'s own M5 landing shape exactly (see that repo's
+`design/architecture.md` for the template this follows): a
+`release/manifest.pdxsig.txt` source form (every `<BLAKE3-*>` hash and
+every `[signatures]` slot a documented `SIGNATURE_PLACEHOLDER_PENDING_
+LIVE_SIGN` placeholder — no live release-line seed key lives in this
+repo, by the same discipline `src/format.pdx`'s own
+`mkfs_sign_seed_zero` placeholder documents one layer down), a
+`release/RELEASE-1.0.0.md` operator runbook + release note, a
+`doc/mkfs.pdxfs.pdxdoc` source-form user-facing doc (man-page-shaped:
+`NAME`/`SYNOPSIS`/`DESCRIPTION`/`OPTIONS`/`EXIT-CODES`/`RECORD`/
+`EXAMPLES`/`LIMITATIONS`/`SEE-ALSO`/`VERSION`, since this repo is a CLI
+tool rather than a library `doc/libpdx-volume.pdxdoc`'s own
+API-reference shape does not fit as directly), and a `CHANGELOG.md`
+`## 1.0.0` entry summarising M1..M5.
+
+One structural difference from `libpdx-volume`'s own M5 landing, called
+out in `release/RELEASE-1.0.0.md` §5: `mkfs.pdxfs` is a **runnable CLI
+tool**, not a leaf library, so its documented mirror layout carries a
+`/bin/mkfs.pdxfs` entry (plus the package tool's own `/bin/mkfs.pdxfs
+-> /pkgs/mkfs.pdxfs-1.0.0/bin/mkfs.pdxfs` PATH symlink convention)
+that `libpdx-volume`'s own layout explicitly has none of. `manifest.
+pdxsig.txt`'s `[depends-on]` section also differs from `libpdx-volume`'s
+(a leaf library with an empty `[depends-on]`): this repo declares real
+cross-repo links to `libpdx-volume >= 1.0.0` and `libpdx-audit >= 0.2.0`
+(the two satellite libraries it actually calls, per §9.6/§11.4), plus a
+`[not-linked]` section documenting that `libpdx-semantic-pipe` and
+`libpdx-elevate` are named in `caps.decl` but never actually called by
+any function in this repo at v1.0.0 (§11.3, §11.5) — a consumer-side
+installer should not treat either as a hard dependency.
+
+Per issue #18's own scope ("document what would be pushed... actual
+mirror push is out of scope"), `release/RELEASE-1.0.0.md` §5
+documents the expected `pkgs.paideia-os` mirror layout and dependency
+declarations in full but performs no push, and this landing creates no
+`pkgs.paideia-os`-side artifacts of any kind — main handles the actual
+push once the mirror endpoint exists and the substrate items in §13's
+own runbook (toolchain, live seed key, an actual link pass against
+`libpdx-volume`'s and `libpdx-audit`'s compiled objects — `tools/
+build.sh` compiles every `src/*.pdx` independently with no link step,
+same as every other repo in this org) go green.

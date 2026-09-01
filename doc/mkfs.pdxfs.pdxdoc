@@ -1,0 +1,227 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc mkfs.pdxfs`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5 source lives in the repo under version control and
+%%% the release tool ships the compiled `.pdxdoc` alongside the tool
+%%% into /pkgs/mkfs.pdxfs-1.0.0/doc/mkfs.pdxfs.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+mkfs.pdxfs — format a file or block-device-capability target with a
+fresh PDXB v1 superblock, allocator bitmap, journal ring, and root
+inode, for paideia-os volume tooling.
+
+==== SYNOPSIS
+    mkfs.pdxfs [--force] [--label=<str>] [--journal-size=<n_blocks>]
+               [--dry-run] [--verbose] [--sig-key=<key-cap-uri>]
+               [--upgrade] <target>
+
+`<target>` is either a filesystem path (dev workflow, no root, no
+signing required — begins with `/`, `~`, or `.`) or a `cap:blkdev:`
+device-capability URI (production workflow, elevate-required, signing
+mandatory).
+
+==== DESCRIPTION
+`mkfs.pdxfs` is a standalone ring-3 ELF — its own `_start`, not a
+shared library — that writes a fresh PDXB v1 superblock, a zeroed
+allocator bitmap, a zeroed write-ahead-log journal ring, and a single
+real root-directory inode (slot 1) onto `<target>`. It is the first of
+three actions that bring a blank disk or image file online for PdxFS
+v1: **format** (this tool), then **mount** (`mount.pdxfs`), with
+`umount.pdxfs` as the reversal. See [[cref: OPTIONS]] for the full flag
+reference, [[cref: EXIT-CODES]] for the exit-status contract, and
+[[cref: RECORD]] for the `PdxFsFormatRecord@0.1` shape every invocation
+emits on stdout.
+
+`mkfs.pdxfs` performs real, direct syscalls against `<target>`'s bare
+path when it is a file (no capability is minted or consumed for this —
+see [[cref: LIMITATIONS]]); it links `libpdx-volume` (real superblock
+codec + ML-DSA-65 signing) and `libpdx-audit` (real per-invocation
+journal-record open/commit, though the daemon dispatch behind it is
+still stubbed).
+
+==== OPTIONS
+
+---- --force
+Bypass the non-blank-target refusal gate ([[cref: REFUSAL]])
+unconditionally, regardless of what `<target>`'s leading bytes look
+like. Does NOT bypass the audit trail — every invocation, forced or
+not, opens and commits an audit record (`AuditWire::mkfs_audit_begin`/
+`mkfs_audit_commit`), distinguished by `op_name`
+(`"mkfs.pdxfs.format"` vs `"mkfs.pdxfs.format.force"`).
+
+---- --label=<str>
+An operator-facing label string, printed verbatim in the `--dry-run`
+preview record. Not yet written into the on-disk superblock (no
+`label` field is stamped by `mkfs_format_build_superblock` at this
+landing).
+
+---- --journal-size=<n_blocks>
+Journal-ring size in 4096-byte BLOCKS (not bytes — see
+[[cref: LIMITATIONS]] for a task-brief-vs-implementation reconciliation
+note). Defaults to 1024 blocks (4 MiB) when not given.
+
+---- --dry-run
+Print the `PdxFsFormatRecord@0.1` preview line ([[cref: RECORD]]) and
+exit 0 without performing any write of any kind. File targets only —
+see [[cref: EXIT-CODES]] for what a `--dry-run` device-cap or invalid
+target does instead.
+
+---- --verbose
+Parsed and stored (`ParsedArgv.flags & PA_FLAG_VERBOSE`); not yet
+consulted by any code path in this repo.
+
+---- --sig-key=<key-cap-uri>
+Parsed and stored as a raw pointer to the cap-URI string; NEVER
+dereferenced or resolved into real key material by any code path in
+this repo. Every superblock this tool signs uses a PLACEHOLDER
+all-zero 32-byte seed regardless of this flag's value — see
+[[cref: LIMITATIONS]].
+
+---- --upgrade
+**STUB, unwired.** Parses into `ParsedArgv.flags & PA_FLAG_UPGRADE`;
+no dispatch branch in this tool's `_start` currently reads that bit. A
+future PDXL->PDXB rewrite body (`Upgrade::mkfs_upgrade_run`) exists and
+is directly callable but is not reachable from any argv-driven
+invocation of the compiled tool at this landing. See
+[[cref: LIMITATIONS]].
+
+==== EXIT-CODES
+Per `design/tooling/volume-tooling-ux.md`'s own exit-code table,
+extended at M3 for device-target and elevation outcomes:
+
+    0   OK — the write (or --dry-run preview) succeeded.
+    1   argv missing <target>, OR "not yet implemented" (a
+        TARGET_INVALID target — any prefix other than `/`, `~`, `.`,
+        or `cap:blkdev:`).
+    2   argv parse error (missing target — same code as 1's first case;
+        distinguished only by the stderr diagnostic text).
+    3   MKFS_EXIT_SYSCALL_ERROR — an open/write/encode/sign failure
+        during the real write pipeline.
+    4   MKFS_EXIT_DEVICE_STUB — a `cap:blkdev:` target reached the
+        (documented-stub) write-attempt arm. UNREACHABLE via normal
+        invocation at this landing, since elevation always denies
+        first (exit 6) — see [[cref: LIMITATIONS]].
+    5   MKFS_EXIT_REFUSED — the non-blank-target refusal gate fired
+        and `--force` was not given.
+    6   MKFS_EXIT_ELEVATION_DENIED — a `cap:blkdev:` target's
+        elevation check denied (the ONLY outcome this landing's
+        elevation stub can produce — every `cap:blkdev:` invocation
+        exits 6).
+    7   MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED — `Upgrade::mkfs_upgrade_run`'s
+        own stub return code. Not reachable via any argv-driven
+        invocation yet (see `--upgrade` above).
+
+==== RECORD
+Every invocation emits exactly one `PdxFsFormatRecord@0.1` line to
+stdout, preceded by one documented deferral header line (`# semantic-
+pipe emit deferred (svc.schema-registry not yet live, paideia-os#2000)
+-- PdxFsFormatRecord@0.1 line-based fallback below`) — this tool does
+not yet bind a real `libpdx-semantic-pipe` schema (see
+[[cref: LIMITATIONS]]). Two shapes:
+
+    PdxFsFormatRecord@0.1 { target: <path>, label: <label>,
+                            journal_size: <N>, dry_run: true }
+
+emitted only by `--dry-run` against a file target, and
+
+    PdxFsFormatRecord@0.1 { target: <path>, result_code: <CODE> }
+    PdxFsFormatRecord@0.1 { target: <path>, result_code: FAIL, error: <errno> }
+
+emitted by every real-write, refusal, device-stub, elevation-deny, or
+`--upgrade`-stub outcome, where `<CODE>` is one of `SIGNED_OK`,
+`REFUSED_ALREADY_PDXB`, `REFUSED_ALREADY_PDXL`, `REFUSED_NON_BLANK`,
+`DEVICE_TARGET_STUB`, `ELEVATION_DENIED`, `AUDIT_FAIL` (defined,
+unreachable at this landing), or `UPGRADE_NOT_IMPLEMENTED` (reachable
+only via a direct call to `Upgrade::mkfs_upgrade_run`, not via argv —
+see `--upgrade` above). `FAIL` additionally carries a positive `errno`
+field. This is a REAL rendering of the caller's actual arguments and
+outcome in every case — none of these fields is a fixed placeholder
+value.
+
+==== EXAMPLES
+    mkfs.pdxfs --dry-run --label=data --journal-size=2048 /tmp/foo.img
+
+prints the four-field preview line and exits 0 without writing
+anything.
+
+    mkfs.pdxfs /tmp/foo.img
+
+really formats `/tmp/foo.img`: a signed PDXB v1 superblock, a zeroed
+inode table with a real root-directory inode at slot 1, a zeroed
+allocator bitmap, and a zeroed journal ring (1024 blocks by default).
+Prints `PdxFsFormatRecord@0.1 { target: /tmp/foo.img, result_code:
+SIGNED_OK }` and exits 0.
+
+    mkfs.pdxfs /tmp/foo.img
+
+run a second time against the same now-formatted target: refuses
+(`result_code: REFUSED_ALREADY_PDXB`, exit 5) without `--force`.
+
+    mkfs.pdxfs --force /tmp/foo.img
+
+bypasses the refusal and rewrites the target (`result_code:
+SIGNED_OK`, exit 0).
+
+    mkfs.pdxfs cap:blkdev:0x05
+
+exits 6 (`ELEVATION_DENIED`) — device-cap targets always fail closed
+at this landing (no broker-endpoint capability this tool could use to
+prove real elevation).
+
+==== LIMITATIONS
+Cited from `design/architecture.md`; each item names the section with
+the full rationale.
+
+- **Device-target writes are fully stubbed.** No `sys_cap_query`-
+  equivalent primitive exists to validate a `cap:blkdev:` slot's kind,
+  and no block-granularity write syscall exists in this kernel at any
+  sysno (§11.1). A `cap:blkdev:` target always fails elevation first
+  (exit 6) — the write-stub arm (exit 4) is real, wired code but
+  unreachable via normal invocation.
+- **Superblock signatures use a placeholder all-zero seed.**
+  `--sig-key=` is parsed and stored but never resolved into real key
+  material — every signature is well-formed (a real ML-DSA-65
+  intrinsic call over the correct message) but verifies against no
+  real key (§11.2).
+- **`libpdx-semantic-pipe` is not linked.** Every record stays the
+  line-based `sys_write` rendering described in [[cref: RECORD]] until
+  `svc.schema-registry` lands (§11.3).
+- **`--upgrade` is unwired.** The flag parses and a stub target
+  function exists, but no dispatch branch calls it, and no PDXL
+  on-disk decoder exists anywhere in `libpdx-volume` to rewrite from
+  (`src/upgrade.pdx`'s own module header).
+- **No `--size=`-equivalent flag.** Every volume this tool formats has
+  a zero-sized data region (`data_lba`/`data_bcount` = 0) — there is
+  no flag to size a real data region against yet (§9.1, §11.6).
+- **`--journal-size` is in BLOCKS, not bytes**, matching this repo's
+  own frozen argv default (1024 blocks = 4 MiB) — a task-brief
+  reconciliation note, not an upstream design-doc discrepancy (§9.2).
+- **The refusal gate inspects only the first 4 bytes** of an existing
+  target, not the full first 4096-byte block the upstream design doc's
+  fuller text describes, and does not hex-dump on refusal (§9.5).
+- **No `KIND_PDXFS_FILE` capability is minted or consumed anywhere.**
+  Every file-target syscall in this repo operates on the bare
+  filesystem path string, not a cap-invoke (`caps.decl`'s own note,
+  §10).
+
+==== SEE-ALSO
+Upstream design: `design/tooling/volume-tooling-ux.md` §2.1 + §3 +
+§9.1 and `design/filesystem/volume-fs-substrate.md` §2.1 + §2.3 in the
+paideia-os repo. Repo-internal shape: `design/architecture.md` in this
+repo. Per-driver test contracts: `tests/README.md`. Release workflow:
+`release/RELEASE-1.0.0.md`. Companion tools: `mount.pdxfs`,
+`umount.pdxfs` (not yet created as repos). Companion library:
+`libpdx-volume` (the PDXB codec + signing this tool links).
+
+==== VERSION
+mkfs.pdxfs 1.0.0 (R53 wave, M1..M5 close). The actual link + dual-sign
++ mirror-push run happens once substrates S1 (paideia-as toolchain),
+S2 (pkgs.paideia-os endpoint), S3 (a live release-line seed key), and
+S5 (a real link pass against `libpdx-volume`/`libpdx-audit`) go green,
+per `release/RELEASE-1.0.0.md` §3.

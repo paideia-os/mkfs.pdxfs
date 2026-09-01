@@ -1,0 +1,153 @@
+// tests/test_device_target_smoke.pdx — mkfs.pdxfs.M4-003 (#15)
+// TestDeviceTargetSmoke: STUB smoke, with a documented forward-scope
+// deferral. Calls src/format.pdx's `mkfs_format_run_device` directly
+// and asserts its documented stub return code.
+//
+// ================================================================
+// Why this cannot be a real device-write smoke test against QEMU
+// virtio disk, and why that is a repo-wide, not test-specific, gap
+// ================================================================
+//
+// Issue #15's own title asks for "device-target smoke against QEMU
+// virtio disk". `src/format.pdx`'s own module header (mkfs.pdxfs.M3-001,
+// #8) already documents, in full, why NO real device-target write path
+// exists anywhere in this repo to smoke-test: a repo-tree grep of
+// `design/user/syscall-table.md` (paideia-os, refreshed through sysno
+// 95) finds exactly ONE block-device-cap-shaped syscall,
+// `blkdev_cap_request(bus, devfn, flags)` (sysno 74) -- a cap-MINTING
+// call, not a block-granularity open/write/flush op. There is no
+// `sys_blkdev_write`/`sys_blkdev_read`-shaped syscall at any number.
+// Separately, `src/elevate_wire.pdx`'s `mkfs_elev_require_device_write`
+// is a documented fail-closed stub (always `MKFS_ELEV_DENY`) because
+// this repo holds no `KIND_ELEVATE_CHANNEL` broker-endpoint capability
+// to construct a real `libpdx-elevate` request with at all (that file's
+// own module header). Both gaps are REPO-WIDE substrate absences this
+// M4-003 landing cannot manufacture a fixture around -- there is no
+// virtio-block-cap this driver could acquire, narrow, or write through
+// even inside a real QEMU boot, since the kernel itself has no
+// ring-3-reachable block-write syscall yet.
+//
+// Per this issue's own instruction ("STUB with a documented deferral"),
+// this driver therefore does the one thing that IS real and callable at
+// this landing: it calls `mkfs_format_run_device` -- the function
+// `src/main.pdx`'s device-target dispatch reaches in its (today
+// unreachable, since `mkfs_elev_require_device_write` always denies)
+// GRANT arm -- directly, bypassing the elevate gate entirely (this
+// driver is exercising `mkfs_format_run_device`'s own body, not the
+// end-to-end argv-to-elevate-to-format dispatch chain, which always
+// resolves to `ELEVATION_DENIED` today regardless of target content --
+// see `src/elevate_wire.pdx`'s own module header). This is the
+// documented STUB body itself: it parses the device-cap slot (a real,
+// working call into `Target::mkfs_dev_parse_slot`) and then
+// unconditionally emits `PdxFsFormatRecord@0.1 { result_code:
+// DEVICE_TARGET_STUB }` (`FormatRecord::FR_RESULT_DEVICE_TARGET_STUB`,
+// 5 -- observable only on stdout via the semantic-pipe fallback line,
+// not through this function's own return value) and returns
+// `MKFS_EXIT_DEVICE_STUB` (4, a DIFFERENT constant at a different
+// layer -- the function's own u64 exit-status contract, not the
+// record's `result_code` field). This driver asserts the one layer it
+// CAN programmatically observe: `mkfs_format_run_device`'s return
+// value.
+//
+// ================================================================
+// Forward-scope deferral (repeated from src/format.pdx / STATUS.md for
+// this test file's own visibility)
+// ================================================================
+//
+// A real device-target smoke test against QEMU virtio disk needs, in
+// order, per `design/architecture.md` §11.6 (this repo):
+//   1. A `sys_cap_query`-equivalent syscall (planned at R13, never
+//      implemented) to validate a `cap:blkdev:0xNN` slot actually holds
+//      a `KIND_BLKDEV` capability before this repo trusts it.
+//   2. A real block-granularity write syscall (`sys_blkdev_write` or
+//      equivalent) -- does not exist at any sysno today.
+//   3. `mkfs.pdxfs` acquiring a real `KIND_ELEVATE_CHANNEL`
+//      broker-endpoint capability and a coordinated `KIND_BLKDEV`-write
+//      `target_cap_kind`/`target_cap_rights` value with osarch, so
+//      `src/elevate_wire.pdx`'s stub can be replaced with a real
+//      `elevate_client_acquire`/`elevate_client_require` sequence.
+// None of these three exist as of this M4 landing. This test file is
+// therefore the honest, buildable substitute for the QEMU-virtio smoke
+// issue #15 names: it proves the STUB's documented contract holds
+// (parses the slot for real, emits the stub record, returns the stub
+// exit code) so a future landing of all three substrate items above has
+// a driver already in place to extend into a real write-then-readback
+// smoke test, rather than writing one from scratch.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches this org's established M4-driver convention (see this repo's
+// own tests/README.md):
+//
+//   0 — `mkfs_format_run_device` returned `MKFS_EXIT_DEVICE_STUB` (4)
+//       verbatim -- the documented stub contract still holds.
+//   1 — it returned anything else. This is the signal a future landing
+//       of a real device-write body should expect to see once the
+//       three substrate items above land and this stub's caller (or
+//       this driver itself) is updated to exercise a real write-then-
+//       readback round trip instead of a sentinel check.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; the only comparison in this file is
+//     `cmp rax, 4`, well within the 0x7FFFFFFF cmp-imm bound -- no
+//     r10/r11 staging needed.
+//   - Cross-file call (`call mkfs_format_run_device;`) uses the bare
+//     unqualified symbol name, per this repo's established convention
+//     -- an unresolved-external reference in this file's own `.o`,
+//     resolved only once a future consumer links src/format.pdx
+//     alongside it.
+//   - No register survives across the one nested call in this file;
+//     no push/pop anywhere.
+//   - Reserved-label discipline (project non-negotiable): this file
+//     declares no branch label at all (a single straight-line body),
+//     so there is no `mkfs_test_`-prefixed label to enumerate.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.1 (paideia-os,
+// mkfs.pdxfs.M4-003); src/format.pdx (this repo, mkfs_format_run_device,
+// M3-001 #8); src/elevate_wire.pdx (this repo, the fail-closed elevate
+// stub M3-001's own dispatch depends on); design/architecture.md §11.1,
+// §11.6 (this repo, the full substrate-gap write-up); tests/README.md
+// (this repo, return-code convention).
+
+module TestDeviceTargetSmoke = structure {
+
+  // A syntactically valid device-cap URI (11-byte "cap:blkdev:" prefix
+  // + a hex slot number) -- never actually resolved against any real
+  // capability table by anything this driver calls (see module header:
+  // no sys_cap_query-equivalent exists to do so).
+  pub let mkfs_test_device_target : [u8; 16] = "cap:blkdev:0x05\0"
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Calls mkfs_format_run_device directly and asserts its documented
+  // stub return code. See module header for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M4-003 (#15): TestDeviceTargetSmoke::run entry point. rdi=&mkfs_test_device_target (target_ptr), rsi=0 (force_flag, unused by the stub body per src/format.pdx's own module header), rdx=1024 (journal_size_blocks, likewise unused), `call mkfs_format_run_device` (src/format.pdx, M3-001 #8) -- a real, wired call: internally parses the device-cap slot via Target::mkfs_dev_parse_slot and emits PdxFsFormatRecord@0.1 { result_code: DEVICE_TARGET_STUB } via src/pipe_wire.pdx's mkfs_sp_emit_result, performing no write of any kind. `cmp rax,4; jne mkfs_test_unexpected` (MKFS_EXIT_DEVICE_STUB -- the function's own u64 exit-status contract, a DIFFERENT layer/constant from the record's result_code field, see module header). Matching falls to `xor rax,rax; ret` (0: the stub contract holds). mkfs_test_unexpected: `mov rax,1; ret` (1: the stub's behaviour changed -- a signal a real device-write body has landed and this driver needs a real update). No register survives the one nested call, so no push/pop. No `add reg,[mem]`. No `test` mnemonic. No branch label needed beyond mkfs_test_unexpected.",
+      block: {
+        lea rdi, [rip + mkfs_test_device_target];
+        xor rsi, rsi;                        // force_flag (unused by the stub body)
+        mov rdx, 1024;                       // journal_size_blocks (unused by the stub body)
+        call mkfs_format_run_device;
+
+        cmp rax, 4;                          // MKFS_EXIT_DEVICE_STUB
+        jne mkfs_test_unexpected;
+
+        xor rax, rax;                        // 0: stub contract holds
+        ret;
+
+      mkfs_test_unexpected:
+        mov rax, 1;                          // 1: stub no longer returns MKFS_EXIT_DEVICE_STUB
+        ret;
+      }
+    }
+}

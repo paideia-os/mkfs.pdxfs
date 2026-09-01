@@ -27,10 +27,13 @@ upstream CLI spec this tool implements.
 
 ## Status
 
-**M2 landed** (real file-target write pipeline: superblock encode +
-write, zeroed inode table + root inode #1, zeroed allocator bitmap,
-zeroed journal ring, plus the non-blank refusal gate). See
-[`STATUS.md`](STATUS.md) for the per-issue checklist and
+**v1.0.0 — M1..M5 landed.** Real file-target write pipeline (superblock
+encode + sign + write, zeroed inode table + root inode #1, zeroed
+allocator bitmap, zeroed journal ring, non-blank refusal gate),
+device-target and `--upgrade` paths as documented stubs, a four-driver
+test suite, and a dual-signed-release scaffold. See
+[`STATUS.md`](STATUS.md) for the per-issue checklist,
+[`CHANGELOG.md`](CHANGELOG.md) for the release note, and
 `design/tooling/volume-tooling-ux.md` §9.1 in paideia-os for the full
 M1..M5 milestone breakdown (18 issues).
 
@@ -54,23 +57,28 @@ mkfs.pdxfs /tmp/foo.img
 ```
 
 prints `PdxFsFormatRecord@0.1 { target: /tmp/foo.img, result_code: OK }`
-and exits 0, having written a real PDXB v1 superblock, a zeroed inode
-table (with a real root-directory inode at slot 1), a zeroed allocator
-bitmap, and a zeroed journal ring. Re-running it against the same
-target without `--force` refuses (`result_code: REFUSED_ALREADY_PDXB`,
-exit 5). A `cap:blkdev:` target still prints
-`mkfs.pdxfs: not yet implemented` to stderr and exits 1 — the
-device-cap path (resolution, signing) lands at M3.
+and exits 0, having written a real, ML-DSA-65-signed PDXB v1
+superblock (`result_code: SIGNED_OK`), a zeroed inode table (with a
+real root-directory inode at slot 1), a zeroed allocator bitmap, and a
+zeroed journal ring. Re-running it against the same target without
+`--force` refuses (`result_code: REFUSED_ALREADY_PDXB`, exit 5); with
+`--force` it rewrites unconditionally. A `cap:blkdev:` target exits 6
+(`ELEVATION_DENIED`) — this repo holds no broker-endpoint capability
+to prove real elevation with (see `design/architecture.md` §11.5).
 
 ## Depends on
 
-- **`libpdx-volume`** (`paideia-os/libpdx-volume`) — M1-M3 landed. This
-  repo links its real superblock codec (`pdxb_encode_superblock`) as of
-  M2. Signing (`pdxb_sign_superblock`, real as of `libpdx-volume`
-  commit `052cbac`) is not yet called by this repo — that lands at
-  `mkfs.pdxfs.M3-002`. See `design/architecture.md` §9 for the
-  cross-repo call mechanism and §10 for what M3 still needs.
-- **paideia-as ≥ 0.21.0** (build toolchain).
+- **`libpdx-volume`** (`paideia-os/libpdx-volume`) — M1-M5 landed. This
+  repo links its real superblock codec (`pdxb_encode_superblock`) and
+  its real signer (`pdxb_sign_superblock`, called on every file-target
+  write with a placeholder all-zero seed — see `design/architecture.md`
+  §11.2). See `design/architecture.md` §9.6 for the cross-repo call
+  mechanism.
+- **`libpdx-audit`** (`paideia-os/libpdx-audit`, @0.2) — wraps every
+  `_start` dispatch branch in a real (though daemon-side-stubbed)
+  audit-journal open/commit pair (`src/audit_wire.pdx`).
+- **paideia-as ≥ 0.21.0** (build toolchain; ≥ 0.24.0-mldsa65-sign for
+  the signing intrinsic `libpdx-volume` calls transitively).
 
 ## Milestones
 
@@ -78,9 +86,9 @@ device-cap path (resolution, signing) lands at M3.
 |---|---|---|
 | M1 | Scaffold, caps.decl, argv surface, first runnable `--dry-run` | **Landed** |
 | M2 | Real superblock write, non-blank refusal gate, root inode | **Landed** |
-| M3 | Device-cap target, signing, semantic-pipe emit, audit, elevate | Pending |
-| M4 | Tests + smoke | Pending |
-| M5 | Signed release | Pending |
+| M3 | Device-cap target, signing, semantic-pipe emit, audit, elevate | **Landed** |
+| M4 | Tests + smoke | **Landed** |
+| M5 | Signed release | **Landed** |
 
 ## License
 

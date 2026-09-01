@@ -372,6 +372,19 @@ module FormatRecord = structure {
   pub let FR_RESULT_AUDIT_FAIL           : u64 = 7
   pub let FR_RESULT_SIGNED_OK            : u64 = 8
 
+  // --- mkfs.pdxfs.M4-004 (#16) new result code. -------------------------
+  //
+  //   FR_RESULT_UPGRADE_NOT_IMPLEMENTED -- src/upgrade.pdx's
+  //     mkfs_upgrade_run emits this when a `--upgrade` invocation is
+  //     attempted. Not reachable from src/main.pdx's own dispatch at
+  //     this landing (the flag is parsed by src/argv.pdx but not yet
+  //     consulted by _start -- see that file's own M4-004 module-header
+  //     note); reachable today only via a direct call to
+  //     mkfs_upgrade_run, which is exactly how tests/test_upgrade_stub.pdx
+  //     exercises it.
+  // -------------------------------------------------------------------------
+  pub let FR_RESULT_UPGRADE_NOT_IMPLEMENTED : u64 = 9
+
   // --- Literal chunks for format_record_emit_result. Lengths verified via
   //     `python3 -c "print(len(...))"` against each literal, same
   //     discipline as the M1 literals above. fr_lit_prefix (M1, above) is
@@ -413,6 +426,12 @@ module FormatRecord = structure {
 
   pub let fr_lit_signed_ok     : [u8; 13] = "SIGNED_OK }\n\0"
   pub let fr_lit_signed_ok_len : u64 = 12
+
+  // --- mkfs.pdxfs.M4-004 (#16) literal. Length verified via
+  //     `python3 -c "print(len(...))"`, same discipline as every literal
+  //     above. -------------------------------------------------------------
+  pub let fr_lit_upgrade_not_implemented     : [u8; 27] = "UPGRADE_NOT_IMPLEMENTED }\n\0"
+  pub let fr_lit_upgrade_not_implemented_len : u64 = 26
 
   // ==========================================================================
   // format_record_write_u64_dec(fd, value) -> ()
@@ -523,7 +542,7 @@ module FormatRecord = structure {
   pub let format_record_emit_result : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
     fn (target_ptr: u64) (result_code: u64) (errno: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mkfs.pdxfs.M2 (#5, #7) + M3 (#8, #9, #11, #12): format_record_emit_result entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=result_code, r13=errno. Segment 1: sys_write(1, fr_lit_prefix, 32) (reused M1 literal). Segment 2: call format_record_strlen(rbx) -> rax -> rdx; sys_write(1, rbx, rdx). Segment 3: sys_write(1, fr_lit_result_code, 15). Segment 4 dispatch, extended at M3 with four new codes: `cmp r12, 0; je mkfs_fr_er_ok` (FR_RESULT_OK); `cmp r12, 1; je mkfs_fr_er_fail` (FR_RESULT_FAIL); `cmp r12, 2; je mkfs_fr_er_pdxb` (FR_RESULT_REFUSED_ALREADY_PDXB); `cmp r12, 3; je mkfs_fr_er_pdxl` (FR_RESULT_REFUSED_ALREADY_PDXL); `cmp r12, 4; je mkfs_fr_er_non_blank` (FR_RESULT_REFUSED_NON_BLANK, now an explicit case rather than the unconditional fallthrough it was at M2); `cmp r12, 5; je mkfs_fr_er_device_stub` (FR_RESULT_DEVICE_TARGET_STUB); `cmp r12, 6; je mkfs_fr_er_elevation_denied` (FR_RESULT_ELEVATION_DENIED); `cmp r12, 7; je mkfs_fr_er_audit_fail` (FR_RESULT_AUDIT_FAIL); `cmp r12, 8; je mkfs_fr_er_signed_ok` (FR_RESULT_SIGNED_OK); unconditional `jmp mkfs_fr_er_non_blank` as a defensive default for any other value (unchanged posture from M2 -- no caller in this repo passes one). mkfs_fr_er_ok: sys_write(1, fr_lit_ok, 5); jmp done. mkfs_fr_er_fail: sys_write(1, fr_lit_fail_prefix, 13); call format_record_write_u64_dec(1, r13); sys_write(1, fr_lit_fail_suffix, 3); jmp done. mkfs_fr_er_pdxb: sys_write(1, fr_lit_refused_pdxb, 23); jmp done. mkfs_fr_er_pdxl: sys_write(1, fr_lit_refused_pdxl, 23); jmp done. mkfs_fr_er_non_blank: sys_write(1, fr_lit_refused_non_blank, 20); jmp done. mkfs_fr_er_device_stub: sys_write(1, fr_lit_device_stub, 21); jmp done. mkfs_fr_er_elevation_denied: sys_write(1, fr_lit_elevation_denied, 19); jmp done. mkfs_fr_er_audit_fail: sys_write(1, fr_lit_audit_fail, 13); jmp done. mkfs_fr_er_signed_ok: sys_write(1, fr_lit_signed_ok, 12). done: pop r13; pop r12; pop rbx; ret. No `add reg,[mem]`. No `test` -- every branch is `cmp reg,imm`. Labels prefixed mkfs_fr_er_.",
+      justification: "mkfs.pdxfs.M2 (#5, #7) + M3 (#8, #9, #11, #12): format_record_emit_result entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=result_code, r13=errno. Segment 1: sys_write(1, fr_lit_prefix, 32) (reused M1 literal). Segment 2: call format_record_strlen(rbx) -> rax -> rdx; sys_write(1, rbx, rdx). Segment 3: sys_write(1, fr_lit_result_code, 15). Segment 4 dispatch, extended at M3 with four new codes: `cmp r12, 0; je mkfs_fr_er_ok` (FR_RESULT_OK); `cmp r12, 1; je mkfs_fr_er_fail` (FR_RESULT_FAIL); `cmp r12, 2; je mkfs_fr_er_pdxb` (FR_RESULT_REFUSED_ALREADY_PDXB); `cmp r12, 3; je mkfs_fr_er_pdxl` (FR_RESULT_REFUSED_ALREADY_PDXL); `cmp r12, 4; je mkfs_fr_er_non_blank` (FR_RESULT_REFUSED_NON_BLANK, now an explicit case rather than the unconditional fallthrough it was at M2); `cmp r12, 5; je mkfs_fr_er_device_stub` (FR_RESULT_DEVICE_TARGET_STUB); `cmp r12, 6; je mkfs_fr_er_elevation_denied` (FR_RESULT_ELEVATION_DENIED); `cmp r12, 7; je mkfs_fr_er_audit_fail` (FR_RESULT_AUDIT_FAIL); `cmp r12, 8; je mkfs_fr_er_signed_ok` (FR_RESULT_SIGNED_OK); `cmp r12, 9; je mkfs_fr_er_upgrade_not_implemented` (FR_RESULT_UPGRADE_NOT_IMPLEMENTED, M4-004 #16); unconditional `jmp mkfs_fr_er_non_blank` as a defensive default for any other value (unchanged posture from M2 -- no caller in this repo passes one). mkfs_fr_er_ok: sys_write(1, fr_lit_ok, 5); jmp done. mkfs_fr_er_fail: sys_write(1, fr_lit_fail_prefix, 13); call format_record_write_u64_dec(1, r13); sys_write(1, fr_lit_fail_suffix, 3); jmp done. mkfs_fr_er_pdxb: sys_write(1, fr_lit_refused_pdxb, 23); jmp done. mkfs_fr_er_pdxl: sys_write(1, fr_lit_refused_pdxl, 23); jmp done. mkfs_fr_er_non_blank: sys_write(1, fr_lit_refused_non_blank, 20); jmp done. mkfs_fr_er_device_stub: sys_write(1, fr_lit_device_stub, 21); jmp done. mkfs_fr_er_elevation_denied: sys_write(1, fr_lit_elevation_denied, 19); jmp done. mkfs_fr_er_audit_fail: sys_write(1, fr_lit_audit_fail, 13); jmp done. mkfs_fr_er_signed_ok: sys_write(1, fr_lit_signed_ok, 12); jmp done. mkfs_fr_er_upgrade_not_implemented: sys_write(1, fr_lit_upgrade_not_implemented, 26). done: pop r13; pop r12; pop rbx; ret. No `add reg,[mem]`. No `test` -- every branch is `cmp reg,imm`. Labels prefixed mkfs_fr_er_.",
       block: {
         push rbx;
         push r12;
@@ -575,6 +594,8 @@ module FormatRecord = structure {
         je mkfs_fr_er_audit_fail;
         cmp r12, 8;
         je mkfs_fr_er_signed_ok;
+        cmp r12, 9;
+        je mkfs_fr_er_upgrade_not_implemented;
         jmp mkfs_fr_er_non_blank;
 
       mkfs_fr_er_ok:
@@ -655,6 +676,14 @@ module FormatRecord = structure {
         mov rdi, 1;
         lea rsi, [rip + fr_lit_signed_ok];
         mov rdx, 12;                        // fr_lit_signed_ok_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_upgrade_not_implemented:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_upgrade_not_implemented];
+        mov rdx, 26;                        // fr_lit_upgrade_not_implemented_len
         mov rax, 1;
         syscall;
 

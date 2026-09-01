@@ -1,8 +1,8 @@
 # mkfs.pdxfs — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M3 (device-target + signing + semantic-pipe + audit + elevate) — **landed**
-**Version:** unreleased (pre-1.0.0)
+**Current milestone:** M5 (dual-signed release) — **landed**
+**Version:** 1.0.0
 
 See `design/tooling/volume-tooling-ux.md` §9.1 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -159,24 +159,71 @@ full 18-issue breakdown this checklist mirrors.
       is real, wired code -- unreachable at this landing, live the
       moment a real broker cap exists.
 
-### M4 — Tests + smoke (pending)
+### M4 — Tests + smoke
 
-- [ ] **M4-001** — file-target happy path smoke.
-- [ ] **M4-002** — non-blank refusal matrix + `--force` override +
-      audit-trail assertion.
-- [ ] **M4-003** — device-target smoke against QEMU virtio disk.
-- [ ] **M4-004** — `--upgrade` path: PDXL → PDXB rewrite.
+- [x] **M4-001** (#13) — file-target happy path smoke:
+      `tests/test_file_target_happy.pdx`. Calls `mkfs_sp_emit_dry_run`
+      and `mkfs_format_run` directly against real scratch paths under
+      `/tmp` (unlike libpdx-volume's own M4 drivers, this repo issues
+      real syscalls -- no `KIND_PDXFS_FILE` cap exists to mock against
+      instead, see `caps.decl`). Four phases: dry-run leaves no file
+      behind, a fresh-target write returns `MKFS_EXIT_OK`, a repeat
+      without `--force` returns `MKFS_EXIT_REFUSED`, and a repeat with
+      `--force` returns `MKFS_EXIT_OK` again.
+- [x] **M4-002** (#14) — non-blank refusal matrix + `--force` override +
+      audit-trail wiring: `tests/test_refusal_matrix.pdx`. Writes real
+      4-byte fixture files (`"PDXB"`, `"PDXL"`, `"XYZQ"`) and calls
+      `mkfs_refuse_check` against each, plus a blank/nonexistent target
+      and a `--force` override against the PDXB fixture -- five
+      comparable phases -- then exercises (without a return-code
+      assertion, since neither call has one) `mkfs_audit_begin`/
+      `mkfs_audit_commit` once per `force_flag` value.
+- [x] **M4-003** (#15) — device-target smoke, **a documented STUB**:
+      `tests/test_device_target_smoke.pdx`. Calls
+      `mkfs_format_run_device` directly and asserts
+      `MKFS_EXIT_DEVICE_STUB`. NOT a real QEMU-virtio write-then-
+      readback smoke -- no `sys_cap_query`-equivalent syscall, no
+      block-granularity write syscall, and no real
+      `KIND_ELEVATE_CHANNEL` broker cap exist to build one against (see
+      `design/architecture.md` §11.1/§11.6 and the test file's own
+      module header).
+- [x] **M4-004** (#16) — `--upgrade` path, **a documented STUB**:
+      `src/argv.pdx` gained `PA_FLAG_UPGRADE` (0x40, exact-match
+      `--upgrade`); new `src/upgrade.pdx` (`Upgrade::mkfs_upgrade_run`)
+      emits `PdxFsFormatRecord@0.1 { result_code:
+      UPGRADE_NOT_IMPLEMENTED }` and returns
+      `MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED` (7); `src/format_record.pdx`
+      gained the matching `FR_RESULT_UPGRADE_NOT_IMPLEMENTED` (9) code
+      and literal. `tests/test_upgrade_stub.pdx` verifies both the argv
+      wiring and the stub return code. `src/main.pdx`'s own dispatch
+      does NOT branch on `PA_FLAG_UPGRADE` yet -- flagged for main in
+      `src/upgrade.pdx`'s own module header (no PDXL on-disk decoder
+      exists anywhere in `libpdx-volume` to rewrite from, and no design
+      decision has been made about where `--upgrade` should
+      short-circuit relative to the existing refusal gate).
 
-### M5 — Signed release (pending)
+### M5 — Signed release
 
-- [ ] **M5-001** — dual-signed `manifest.pdxsig` + CHANGELOG-1.0 +
-      `.pdxdoc` for `doc mkfs.pdxfs`.
-- [ ] **M5-002** — mirror push to `pkgs.paideia-os`.
+- [x] **M5** (#17, #18) — dual-signed `manifest.pdxsig` + CHANGELOG-1.0
+      + `.pdxdoc` for `doc mkfs.pdxfs`, plus distribution
+      documentation. `release/manifest.pdxsig.txt` (every hash and
+      signature slot a documented `SIGNATURE_PLACEHOLDER_PENDING_LIVE_
+      SIGN`/`<BLAKE3-*>` placeholder), `release/RELEASE-1.0.0.md`
+      (operator runbook + release note + §5 distribution section
+      documenting, but not performing, the `pkgs.paideia-os` mirror
+      push per #18's own scope), `doc/mkfs.pdxfs.pdxdoc` (source-form
+      user-facing doc), `CHANGELOG.md` (the `## 1.0.0` entry). Actual
+      dual-sign, link, and mirror push are all out of scope for this
+      milestone -- see `release/RELEASE-1.0.0.md` §3 for the four
+      substrate items still needed (toolchain, mirror endpoint, live
+      seed key, an actual link pass).
 
 ## Next milestone
 
-M4 (tests + smoke) opens once `mkfs.pdxfs.M3` closes. It inherits four
-concrete gaps M3 left open rather than closing silently:
+R53's own five-milestone mkfs.pdxfs scope (M1..M5) is now closed. What
+remains is substrate this repo cannot manufacture on its own -- see
+`release/RELEASE-1.0.0.md` §2/§3 for the full list. The concrete gaps
+M3 left open, still true at M5 close:
 
 1. **Device-target write path is fully stubbed** (§ M3-001, M3-005):
    no `sys_cap_query`/`cap_narrow`-equivalent primitive exists in this

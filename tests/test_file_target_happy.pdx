@@ -1,0 +1,203 @@
+// tests/test_file_target_happy.pdx — mkfs.pdxfs.M4-001 (#13)
+// TestFileTargetHappy: file-target happy-path smoke -- dry-run
+// structural check + real-write / refusal / --force-override round trip
+// against a scratch target.
+//
+// ================================================================
+// Why this is a real invocation, not a fuzzed/`.bss`-only fixture
+// ================================================================
+//
+// Unlike libpdx-volume's own M4 test drivers (that library issues ZERO
+// syscalls anywhere in its call graph, per its own tests/README.md),
+// mkfs.pdxfs is a standalone ring-3 ELF that performs REAL sys_open/
+// sys_read/sys_write/sys_close calls against a bare filesystem path
+// (src/format.pdx's own module header: no KIND_PDXFS_FILE cap is
+// minted or consumed anywhere in this repo's call graph -- see
+// caps.decl's own note). A "smoke test" of `mkfs_format_run` therefore
+// cannot be a pure `.bss`-fixture unit test the way libpdx-volume's
+// `pdxb_encode_superblock` round-trip driver is: it needs a REAL
+// scratch path on whatever filesystem this driver is linked and run
+// against (a real QEMU boot with a writable mount, per this repo's own
+// "consumer tool" precedent -- see tests/README.md). This driver is
+// therefore a structural exercise in the sense issue #13 describes
+// ("invoke mkfs_format_run ... with contrived arguments, capture the
+// resulting record's result_code, and assert it matches expectation for
+// each phase"), not a hermetic fuzz driver: it calls the SAME real,
+// non-stub entry points main.pdx's own _start calls
+// (mkfs_sp_emit_dry_run, mkfs_format_run), directly, bypassing
+// argv_parse and _start's own sys_exit-terminated dispatch (neither of
+// which returns to a caller -- _start never `ret`s).
+//
+// ================================================================
+// The four phases
+// ================================================================
+//
+//   Phase 1 (dry-run). Calls mkfs_sp_emit_dry_run against a scratch
+//     path this driver never writes to any other way, then confirms
+//     via a direct sys_open(O_RDONLY) that the path still does NOT
+//     exist -- the only externally observable proof "dry-run performed
+//     no write" available without a stdout-capture harness (dry-run's
+//     own body only ever calls sys_write(1, ...), never sys_open on the
+//     target at all -- see src/format_record.pdx's format_record_emit_
+//     dry_run). This stands in for the issue's own "dry-run -> DRY_RUN"
+//     expectation: there is no FR_RESULT_DRY_RUN code in this repo's
+//     PdxFsFormatRecord@0.1 vocabulary (dry-run's record shape is the
+//     four-field M1 slice, not the result_code-shaped M2+ record), so
+//     the strongest real assertion this driver can make is "no write
+//     occurred", which this phase verifies directly.
+//   Phase 2 (real write, fresh target). Calls mkfs_format_run against a
+//     SEPARATE scratch path, best-effort unlinked first (sys_unlink,
+//     SC+ ID 81) so a stale file from a prior run of this same driver
+//     cannot masquerade as "already formatted" and misclassify this
+//     phase. Expects MKFS_EXIT_OK (0).
+//   Phase 3 (refusal without --force). Calls mkfs_format_run again
+//     against the SAME now-formatted target with force_flag=0. Expects
+//     MKFS_EXIT_REFUSED (5) -- src/refusal.pdx's mkfs_refuse_check
+//     gate firing on the real "PDXB" magic phase 2 just wrote.
+//   Phase 4 (--force override). Calls mkfs_format_run a third time
+//     against the same target with force_flag=1. Expects MKFS_EXIT_OK
+//     (0) again -- --force bypasses the refusal gate entirely (src/
+//     refusal.pdx's own module header) and the write pipeline succeeds
+//     unconditionally against a target it is willing to open+truncate.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches this org's established M4-driver convention (see
+// libpdx-volume's tests/README.md and this repo's own tests/README.md):
+//
+//   0 — all four phases passed.
+//   1 — Phase 1 failed: the dry-run scratch path unexpectedly exists
+//       after mkfs_sp_emit_dry_run returned (a real write leak on the
+//       dry-run path).
+//   2 — Phase 2 failed: mkfs_format_run's first (fresh-target) call did
+//       not return MKFS_EXIT_OK.
+//   3 — Phase 3 failed: mkfs_format_run's second (already-formatted,
+//       force=0) call did not return MKFS_EXIT_REFUSED.
+//   4 — Phase 4 failed: mkfs_format_run's third (already-formatted,
+//       force=1) call did not return MKFS_EXIT_OK.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp reg, reg` or `cmp reg, imm`.
+//   - Every immediate compared here (0, 2, 3, 5, 81, 255, journal size
+//     4) is well within the 0x7FFFFFFF cmp-imm bound; no r10/r11
+//     staging needed for any cmp in this file.
+//   - Cross-file calls (`call mkfs_sp_emit_dry_run;`, `call
+//     mkfs_format_run;`) use the bare unqualified symbol name, per this
+//     repo's established convention (src/main.pdx already calls both
+//     the same way) -- tools/build.sh compiles this file standalone
+//     with no link step, so these are unresolved-external references
+//     in this file's own .o, resolved only once a future consumer links
+//     src/pipe_wire.pdx and src/format.pdx alongside it.
+//   - Register plan: no register needs to survive across a nested call
+//     in this file -- every phase reloads its scratch-path pointer via
+//     a fresh `lea` immediately before the call/syscall that needs it,
+//     and every phase's pass/fail check happens immediately after that
+//     call returns, before any other register is repurposed. No
+//     push/pop anywhere in this file.
+//   - Reserved-label discipline (project non-negotiable): every label
+//     in this file is prefixed `mkfs_test_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.1 (paideia-os,
+// mkfs.pdxfs.M4-001); src/format.pdx (this repo, mkfs_format_run);
+// src/pipe_wire.pdx (this repo, mkfs_sp_emit_dry_run); tests/README.md
+// (this repo, return-code convention); design/user/syscall-table.md
+// (paideia-os, sysno 81 = unlink).
+
+module TestFileTargetHappy = structure {
+
+  pub let mkfs_test_path_dryrun : [u8; 26] = "/tmp/mkfs_test_dryrun.img\0"
+  pub let mkfs_test_path_real   : [u8; 29] = "/tmp/mkfs_test_realwrite.img\0"
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Drives all four phases. See module header for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M4-001 (#13): TestFileTargetHappy::run entry point. Best-effort cleanup first: sys_unlink (SC+ ID 81, path_len_hint=255 per the walker-cap convention design/user/syscall-table.md documents) against both scratch paths, return value ignored on both -- ENOENT is the expected/common case, and a stale leftover from a prior run of this same driver must not bias Phase 2/3's REFUSED-vs-OK expectations. Phase 1: rdi=&mkfs_test_path_dryrun, rsi=0 (label_ptr unset), rdx=4 (journal_size blocks), `call mkfs_sp_emit_dry_run` (src/pipe_wire.pdx) -- this call only ever sys_writes to fd 1, never touches the target path. Immediately after, sys_open(rdi=&mkfs_test_path_dryrun, rsi=0 (O_RDONLY), rdx=0 (mode unused), rax=2); `cmp rax,0; jl mkfs_test_phase2` -- a negative return (ENOENT, the expected outcome) confirms no write occurred and proceeds to Phase 2. A non-negative return means the dry-run path unexpectedly exists: sys_close(rax) via SC+ ID 3, then `mov rax,1; ret` (Phase 1 failure). mkfs_test_phase2: rdi=&mkfs_test_path_real, rsi=0 (force_flag), rdx=4 (journal_size), `call mkfs_format_run` (src/format.pdx) against the freshly-unlinked target; `cmp rax,0; jne mkfs_test_fail_phase2` (expects MKFS_EXIT_OK). Phase 3: same target, same journal_size, force_flag still 0, `call mkfs_format_run` again -- the target now carries a real signed PDXB superblock from Phase 2, so src/refusal.pdx's mkfs_refuse_check gate fires; `cmp rax,5; jne mkfs_test_fail_phase3` (expects MKFS_EXIT_REFUSED). Phase 4: same target, force_flag=1 this time, `call mkfs_format_run` a third time -- --force bypasses the refusal gate entirely; `cmp rax,0; jne mkfs_test_fail_phase4` (expects MKFS_EXIT_OK again). All four phases passing falls through to `xor rax,rax; ret` (0). Each numbered fail label sets rax to its phase number and returns. No register survives across any nested call in this file -- every phase re-`lea`s its own pointer immediately before use and checks its own result immediately after the call returns, so no push/pop is needed anywhere. No `add reg,[mem]`. No `test` mnemonic; every branch is `cmp reg,imm`. Label prefix mkfs_test_ (project non-negotiable).",
+      block: {
+        // ---- Best-effort cleanup: unlink both scratch paths so a
+        // stale file from a prior run of this driver cannot bias any
+        // phase. SC+ ID 81 = unlink(path_ptr, path_len_hint). Return
+        // value ignored on both -- ENOENT is the expected/common case. ----
+        lea rdi, [rip + mkfs_test_path_dryrun];
+        mov rsi, 255;
+        mov rax, 81;
+        syscall;
+
+        lea rdi, [rip + mkfs_test_path_real];
+        mov rsi, 255;
+        mov rax, 81;
+        syscall;
+
+        // ---- Phase 1: dry-run, then confirm no write occurred. ----------
+        lea rdi, [rip + mkfs_test_path_dryrun];
+        xor rsi, rsi;                        // label_ptr = 0 (no --label)
+        mov rdx, 4;                          // journal_size (blocks)
+        call mkfs_sp_emit_dry_run;
+
+        lea rdi, [rip + mkfs_test_path_dryrun];
+        xor rsi, rsi;                        // O_RDONLY
+        xor rdx, rdx;                        // mode unused
+        mov rax, 2;                          // SC+ ID 2 = sys_open
+        syscall;
+        cmp rax, 0;
+        jl mkfs_test_phase2;                 // negative = ENOENT, as expected
+
+        // Unexpected: the dry-run path exists. Close the fd and fail.
+        mov rdi, rax;
+        mov rax, 3;                          // SC+ ID 3 = sys_close
+        syscall;
+        mov rax, 1;
+        ret;
+
+      mkfs_test_phase2:
+        // ---- Phase 2: real write against a fresh target. ----------------
+        lea rdi, [rip + mkfs_test_path_real];
+        xor rsi, rsi;                        // force_flag = 0
+        mov rdx, 4;                          // journal_size (blocks)
+        call mkfs_format_run;
+        cmp rax, 0;                          // MKFS_EXIT_OK
+        jne mkfs_test_fail_phase2;
+
+        // ---- Phase 3: refusal without --force. ---------------------------
+        lea rdi, [rip + mkfs_test_path_real];
+        xor rsi, rsi;                        // force_flag = 0
+        mov rdx, 4;
+        call mkfs_format_run;
+        cmp rax, 5;                          // MKFS_EXIT_REFUSED
+        jne mkfs_test_fail_phase3;
+
+        // ---- Phase 4: --force override rewrite. ---------------------------
+        lea rdi, [rip + mkfs_test_path_real];
+        mov rsi, 1;                          // force_flag = 1
+        mov rdx, 4;
+        call mkfs_format_run;
+        cmp rax, 0;                          // MKFS_EXIT_OK
+        jne mkfs_test_fail_phase4;
+
+        xor rax, rax;                        // 0: all four phases passed
+        ret;
+
+      mkfs_test_fail_phase2:
+        mov rax, 2;
+        ret;
+
+      mkfs_test_fail_phase3:
+        mov rax, 3;
+        ret;
+
+      mkfs_test_fail_phase4:
+        mov rax, 4;
+        ret;
+      }
+    }
+}

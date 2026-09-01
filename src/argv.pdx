@@ -59,8 +59,10 @@
 // Parsing strategy
 // ----------------------------------------------------------------------
 //
-// One pass over argv[1..argc). Each token is tested against six known
-// flag literals via one of two shared subroutines:
+// One pass over argv[1..argc). Each token is tested against seven known
+// flag literals (four exact-match, three value-prefix -- see
+// mkfs.pdxfs.M4-004 note below for the fourth exact-match addition) via
+// one of two shared subroutines:
 //
 //   argv_streq(a, b)              -- exact NUL-terminated equality.
 //                                    Used for --force / --dry-run / --verbose.
@@ -96,6 +98,29 @@
 // M2.
 //
 // ----------------------------------------------------------------------
+// mkfs.pdxfs.M4-004 (#16) — --upgrade flag, stub-wired only
+// ----------------------------------------------------------------------
+//
+// M1's argv surface has no `--upgrade` flag at all (design/tooling/
+// volume-tooling-ux.md §3.1's own CLI grammar does not list one either
+// -- a PDXL->PDXB rewrite path is this repo's own extrapolation from
+// mkfs.pdxfs.M2-004's refusal-gate note that a `REFUSE_ALREADY_PDXL`
+// hit should "eventually suggest --upgrade", never itself a frozen
+// upstream spec). Issue #16's own fallback instruction ("If wiring is
+// minimal-effort, add --upgrade to argv.pdx + a stub result_code") is
+// exactly what this landing does: an eighth boolean flag,
+// `PA_FLAG_UPGRADE` (0x40, the next free bit after `PA_FLAG_SIG_KEY_SET`
+// = 0x20), parsed via the same `argv_streq` exact-match path
+// `--force`/`--dry-run`/`--verbose` already use. Nothing downstream of
+// `argv_parse` reads this bit yet -- `src/main.pdx`'s dispatch is
+// UNCHANGED by this addition, and `src/upgrade.pdx` (new, M4-004) is a
+// documented, callable-but-unwired stub (`mkfs_upgrade_run`) a future
+// milestone's `main.pdx` change can gate on `flags & PA_FLAG_UPGRADE`
+// once a real PDXL->PDXB rewrite body exists. **Flagged for main**: no
+// caller in this repo currently branches on `PA_FLAG_UPGRADE` -- wiring
+// it into `_start`'s dispatch is a separate, not-yet-scoped change.
+//
+// ----------------------------------------------------------------------
 // Encoder-gap discipline (per project-wide non-negotiable)
 // ----------------------------------------------------------------------
 //
@@ -125,6 +150,7 @@ module Argv = structure {
   pub let PA_FLAG_LABEL_SET           : u64 = 0x8
   pub let PA_FLAG_JOURNAL_SIZE_SET    : u64 = 0x10
   pub let PA_FLAG_SIG_KEY_SET         : u64 = 0x20
+  pub let PA_FLAG_UPGRADE             : u64 = 0x40   // mkfs.pdxfs.M4-004 (#16): --upgrade, stub-wired only (see module header)
 
   // Default --journal-size when the flag is not given: 1024 blocks
   // (4 MiB at the frozen 4096-byte block size), per
@@ -146,6 +172,10 @@ module Argv = structure {
   pub let argv_lit_journal_size_len : u64 = 15
   pub let argv_lit_sig_key       : [u8; 10] = "--sig-key="
   pub let argv_lit_sig_key_len   : u64 = 10
+
+  // --- mkfs.pdxfs.M4-004 (#16): --upgrade literal (exact-match, no value). ---
+  pub let argv_lit_upgrade       : [u8; 10] = "--upgrade\0"
+  pub let argv_lit_upgrade_len   : u64 = 9
 
   // ==========================================================================
   // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
@@ -297,7 +327,7 @@ module Argv = structure {
   pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M1-002 (#2) + M1-003 (#3): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mkfs_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching the discipline libpdx-audit's audit_send_record follows via its own push r12/push r13 pair), unlike this file's three pure-leaf helpers (argv_streq / argv_prefix_match / argv_parse_u64_dec), which never touch a callee-save register and so need no push/pop. Zero-init pass writes out.flags=0 (+0), out.label_ptr=0 (+8), out.journal_size=ARGV_DEFAULT_JOURNAL_SIZE=1024 (+16), out.sig_key_ptr=0 (+24), out.target_ptr=0 (+32) before scanning, so every unset field has a well-defined value regardless of .bss zero-init happening to already hold zero for four of the five. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` / `call argv_prefix_match` / `call argv_parse_u64_dec` invocations below -- those three callees clobber only caller-save registers per their own justifications. Main loop (mkfs_argv_scan_loop): cmp r14, rbx; jge mkfs_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Six flag checks in a fixed order (boolean flags via argv_streq against the three exact literals, then value flags via argv_prefix_match against the three '='-terminated literals, each followed by a store into the matching out-struct slot plus its PA_FLAG_*_SET presence bit where applicable) -- --journal-size= additionally pipes its value pointer (r15 + argv_lit_journal_size_len) through argv_parse_u64_dec before storing the resulting u64. Every check that DOESN'T match falls through to the next; a token matching none of the six is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals -- see module header). After a match (or the positional fallthrough), jmp mkfs_argv_scan_next which increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+32]) == 0, jmp mkfs_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed mkfs_argv_.",
+      justification: "mkfs.pdxfs.M1-002 (#2) + M1-003 (#3): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mkfs_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching the discipline libpdx-audit's audit_send_record follows via its own push r12/push r13 pair), unlike this file's three pure-leaf helpers (argv_streq / argv_prefix_match / argv_parse_u64_dec), which never touch a callee-save register and so need no push/pop. Zero-init pass writes out.flags=0 (+0), out.label_ptr=0 (+8), out.journal_size=ARGV_DEFAULT_JOURNAL_SIZE=1024 (+16), out.sig_key_ptr=0 (+24), out.target_ptr=0 (+32) before scanning, so every unset field has a well-defined value regardless of .bss zero-init happening to already hold zero for four of the five. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` / `call argv_prefix_match` / `call argv_parse_u64_dec` invocations below -- those three callees clobber only caller-save registers per their own justifications. Main loop (mkfs_argv_scan_loop): cmp r14, rbx; jge mkfs_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Seven flag checks in a fixed order (four boolean flags via argv_streq against four exact literals -- --force/--dry-run/--verbose/--upgrade [mkfs.pdxfs.M4-004, #16, stub-wired only -- see module header], then three value flags via argv_prefix_match against the three '='-terminated literals, each followed by a store into the matching out-struct slot plus its PA_FLAG_*_SET presence bit where applicable) -- --journal-size= additionally pipes its value pointer (r15 + argv_lit_journal_size_len) through argv_parse_u64_dec before storing the resulting u64. Every check that DOESN'T match falls through to the next; a token matching none of the seven is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals -- see module header). After a match (or the positional fallthrough), jmp mkfs_argv_scan_next which increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+32]) == 0, jmp mkfs_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed mkfs_argv_.",
       block: {
         push rbx;
         push r12;
@@ -356,10 +386,23 @@ module Argv = structure {
         lea rsi, [rip + argv_lit_verbose];
         call argv_streq;
         cmp rax, 0;
-        je mkfs_argv_check_label;
+        je mkfs_argv_check_upgrade;
 
         mov rax, [r13 + 0];
         or rax, 0x4;                        // PA_FLAG_VERBOSE
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_upgrade:
+        // ---- mkfs.pdxfs.M4-004 (#16): --upgrade (exact, stub-wired only). --
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_upgrade];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_label;
+
+        mov rax, [r13 + 0];
+        or rax, 0x40;                       // PA_FLAG_UPGRADE
         mov [r13 + 0], rax;
         jmp mkfs_argv_scan_next;
 

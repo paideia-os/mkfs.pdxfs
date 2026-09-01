@@ -1,0 +1,93 @@
+// src/upgrade.pdx — mkfs.pdxfs.M4-004 (#16) — --upgrade (PDXL -> PDXB
+// rewrite) stub.
+//
+// ----------------------------------------------------------------------
+// Why this is a stub, and why it is not wired into main.pdx's dispatch
+// ----------------------------------------------------------------------
+//
+// design/tooling/volume-tooling-ux.md §3.1's own CLI grammar has no
+// `--upgrade` flag at all -- this repo's own src/refusal.pdx module
+// header is the only place a PDXL->PDXB rewrite is even mentioned, and
+// only as a forward-looking note ("REFUSE_ALREADY_PDXL -- an R25
+// lite-format superblock. Refuse and (eventually) suggest --upgrade
+// (mkfs.pdxfs.M4-004; not this issue)"). Issue #16's own fallback
+// instruction for this milestone is explicit: "If wiring is
+// minimal-effort, add --upgrade to argv.pdx + a stub result_code
+// UPGRADE_NOT_IMPLEMENTED" -- NOT "implement a real PDXL parser and
+// rewrite pipeline". A real rewrite body would need a PDXL on-disk
+// layout decoder that exists nowhere in this tree (`libpdx-volume` has
+// no `pdxl_*` module -- confirmed absent by the same kind of grep this
+// repo's other module headers document for `libpdx-argv`/`libpdx-key`),
+// so this landing does exactly the minimal-effort half: `src/argv.pdx`
+// gained a `PA_FLAG_UPGRADE` boolean flag (parsed, stored, never yet
+// read by any dispatch), and this file gives that flag a real, callable
+// (if unwired) target: `mkfs_upgrade_run`, which unconditionally emits
+// `PdxFsFormatRecord@0.1 { result_code: UPGRADE_NOT_IMPLEMENTED }` (via
+// `src/pipe_wire.pdx`'s wrapper, the same "one call site per terminal
+// record" discipline every other result-emitting function in this repo
+// follows) and returns `MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED` (7).
+//
+// **Flagged for main**: `src/main.pdx`'s `_start` does not call
+// `mkfs_upgrade_run` from any branch at this landing -- doing so would
+// mean deciding where in the existing TARGET_FILE/dry-run/real-write
+// dispatch an `--upgrade` invocation should short-circuit to (before or
+// after the refusal gate? does `--upgrade` on a target that is NOT
+// PDXL-magic-tagged still reach this stub, or fall through to the
+// normal write path?), which is a real design decision this issue's own
+// "minimal-effort" instruction does not settle. `mkfs_upgrade_run` is
+// therefore exercised today only by a direct call --
+// `tests/test_upgrade_stub.pdx` (M4-004's own test) -- not by any
+// argv-driven end-to-end invocation of the compiled tool.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `@no_frame` anywhere. No `add reg, [mem]` anywhere. No `test`
+// mnemonic. Reserved-label discipline: this file declares no branch
+// label at all (a single straight-line body), so there is no
+// `mkfs_upgrade_`-prefixed label to enumerate.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §3 (paideia-os, the CLI
+// spec this repo otherwise implements verbatim -- --upgrade is this
+// repo's own extrapolation, not an upstream-mandated flag);
+// src/refusal.pdx (this repo, the REFUSE_ALREADY_PDXL note that first
+// named this future flag); src/argv.pdx (this repo, M4-004's
+// PA_FLAG_UPGRADE addition); src/pipe_wire.pdx (this repo, the
+// mkfs_sp_emit_result wrapper this file's only nested call reaches).
+
+module Upgrade = structure {
+
+  // --- mkfs_upgrade_run exit-status contract. -----------------------------
+  pub let MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED : u64 = 7
+
+  // ==========================================================================
+  // mkfs_upgrade_run(target_ptr) -> u64 (always MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED)
+  //
+  //   rdi = target_ptr  (NUL-terminated <target> string; forwarded
+  //                       verbatim to mkfs_sp_emit_result as the
+  //                       terminal record's `target` field -- this
+  //                       stub's body otherwise never dereferences it)
+  //
+  // Pure passthrough to one nested call: no branch, no callee-save
+  // register repurposed (target_ptr is read out of rdi and handed
+  // straight to the nested call in the same register position
+  // mkfs_sp_emit_result expects it, so no push/pop or register shuffle
+  // is needed -- nothing this function holds needs to survive past the
+  // call, since the only thing left to do afterward is return a fixed
+  // constant).
+  // ==========================================================================
+  pub let mkfs_upgrade_run : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M4-004 (#16): mkfs_upgrade_run entry point. target_ptr arrives in rdi, already in the exact register position mkfs_sp_emit_result's own first argument expects -- no `mov`/push needed to preserve or relocate it. `mov rsi, 9` (FR_RESULT_UPGRADE_NOT_IMPLEMENTED, src/format_record.pdx, M4-004); `xor rdx, rdx` (errno unused, matching every other non-FAIL result-code call site in this repo, e.g. src/format.pdx's REFUSED_* emits). `call mkfs_sp_emit_result` (src/pipe_wire.pdx) -- prints the deferral header then the UPGRADE_NOT_IMPLEMENTED result-code line via src/format_record.pdx's format_record_emit_result, exactly the same path every other terminal PdxFsFormatRecord@0.1 in this repo goes through. `mov rax, 7` (MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED); `ret`. No callee-save register is repurposed (target_ptr needs no preservation past the call, since nothing after it reads target_ptr again), so no push/pop. No `add reg,[mem]`. No `test`. No branch, hence no label to prefix.",
+      block: {
+        mov rsi, 9;                          // FR_RESULT_UPGRADE_NOT_IMPLEMENTED
+        xor rdx, rdx;                        // errno unused
+        call mkfs_sp_emit_result;            // src/pipe_wire.pdx
+
+        mov rax, 7;                          // MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED
+        ret;
+      }
+    }
+}

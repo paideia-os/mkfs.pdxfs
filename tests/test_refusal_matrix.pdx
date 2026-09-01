@@ -1,0 +1,322 @@
+// tests/test_refusal_matrix.pdx — mkfs.pdxfs.M4-002 (#14)
+// TestRefusalMatrix: exercises src/refusal.pdx's mkfs_refuse_check
+// against all four content classes (PDXB / PDXL / other non-blank /
+// blank), the --force override, and wires (without asserting a return
+// code against) src/audit_wire.pdx's audit-trail calls.
+//
+// ================================================================
+// Real fixture files, not `.bss`-only mocks
+// ================================================================
+//
+// `mkfs_refuse_check` (src/refusal.pdx) reads a real target's first 4
+// bytes via a bare `sys_open`/`sys_read`/`sys_close` sequence on a
+// filesystem path -- there is no in-process "mock a file's content"
+// primitive this repo (or the kernel) exposes. This driver's own
+// `mkfs_test_write_fixture` helper therefore creates REAL scratch files
+// (`sys_open` with `O_CREAT|O_WRONLY|O_TRUNC`, a 4-byte `sys_write`,
+// `sys_close`) stamped with the exact leading bytes each refusal-gate
+// branch keys on, then calls `mkfs_refuse_check` against each one --
+// the "mock/scratch target" issue #14 itself anticipates ("exercise the
+// M2 refusal gate... with a mocked file-content byte").
+//
+// ================================================================
+// The six phases
+// ================================================================
+//
+//   Phase 1 — PDXB.  Fixture content = "PDXB" (the exact 4 ASCII bytes
+//     that, read as a little-endian u32, equal `PDXB_MAGIC`
+//     0x42584450 -- byte 0 = 'P' = 0x50 is the LSB, byte 3 = 'B' = 0x42
+//     is the MSB, matching src/refusal.pdx's own magic-compare
+//     precedent). Expects `REFUSE_ALREADY_PDXB` (2).
+//   Phase 2 — PDXL.  Fixture content = "PDXL" (little-endian u32 =
+//     `PDXL_MAGIC` 0x4C584450 by the identical byte-order argument, 'L'
+//     = 0x4C as the MSB). Expects `REFUSE_ALREADY_PDXL` (3).
+//   Phase 3 — other non-blank.  Fixture content = "XYZQ" -- four
+//     nonzero bytes that are neither magic. Expects `REFUSE_NON_BLANK`
+//     (4).
+//   Phase 4 — blank / nonexistent.  Target best-effort `sys_unlink`'d
+//     first (SC+ ID 81) so it is guaranteed absent, matching
+//     `mkfs_refuse_check`'s own "ENOENT folds into proceed" contract.
+//     Expects `REFUSE_OK` (0).
+//   Phase 5 — `--force` override.  Calls `mkfs_refuse_check` against
+//     the SAME PDXB-marked fixture from Phase 1, this time with
+//     `force_flag=1`. Expects `REFUSE_OK` (0) -- `--force` short-
+//     circuits the entire gate before any syscall, per that function's
+//     own Gate 0.
+//   Phase 6 — audit-trail wiring.  Calls `AuditWire::mkfs_audit_begin`
+//     / `mkfs_audit_commit` (src/audit_wire.pdx) once with
+//     `force_flag=0` and once with `force_flag=1`, exercising both
+//     `op_name` literal branches (`"mkfs.pdxfs.format"` /
+//     `"mkfs.pdxfs.format.force"`) that file's own header documents as
+//     the one real per-invocation signal this repo can wire against.
+//     **This phase has NO return-code assertion**: `mkfs_audit_begin`
+//     never examines its own return value (0 is a valid "did not
+//     audit" sentinel) and `mkfs_audit_commit` discards `audit_commit`'s
+//     return value entirely -- both by `audit_wire.pdx`'s own
+//     documented "forgiving posture", itself a direct consequence of
+//     `libpdx-audit`'s journal-broker dispatch being confirmed stubbed
+//     (`AJB_DISPATCH_STUB`, that library's own STATUS.md). There is
+//     therefore no value this driver could compare that would mean
+//     anything -- its pass signal is that the call sequence completes
+//     and control reaches the shared success path below, exercising
+//     the real code paths (not a placeholder) a future consumer with a
+//     live audit daemon can extend with a real assertion.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches this org's established M4-driver convention (see this repo's
+// own tests/README.md and libpdx-volume's tests/README.md):
+//
+//   0 — all six phases completed as expected.
+//   1 — Phase 1 (PDXB) result_code mismatch.
+//   2 — Phase 2 (PDXL) result_code mismatch.
+//   3 — Phase 3 (NON_BLANK) result_code mismatch.
+//   4 — Phase 4 (blank/nonexistent) result_code mismatch.
+//   5 — Phase 5 (--force override) result_code mismatch.
+//   9 — a fixture-file `sys_open`/`sys_write` failed (an ENVIRONMENT
+//       failure -- e.g. `/tmp` not writable in this run's sandbox --
+//       distinct from a real assertion failure, given its own code so
+//       a future consumer does not confuse "the disk is read-only" with
+//       "the refusal gate is broken").
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp reg, reg` or `cmp reg, imm`.
+//   - Every immediate compared here (0, 1..5, 9, 81, 255, 0xC1, 0x1A4)
+//     is well within the 0x7FFFFFFF cmp-imm bound; no r10/r11 staging
+//     needed anywhere in this file.
+//   - Cross-file calls (`call mkfs_refuse_check;`, `call
+//     mkfs_audit_begin;`, `call mkfs_audit_commit;`) use the bare
+//     unqualified symbol name, per this repo's established convention
+//     -- unresolved-external references in this file's own `.o`,
+//     resolved only once a future consumer links src/refusal.pdx and
+//     src/audit_wire.pdx alongside it.
+//   - Register plan: `run()` pushes r12 once at entry (the only
+//     register that must survive a nested call across ANOTHER nested
+//     call -- Phase 6's `mkfs_audit_begin` return value, held in r12,
+//     must survive the following `call mkfs_audit_commit`, matching
+//     the identical pattern src/main.pdx's own `_start` uses for the
+//     same pair of functions) and pops it before every `ret`. Every
+//     other phase reloads its own pointer via a fresh `lea` immediately
+//     before use, with no value needing to survive a call. The private
+//     helper `mkfs_test_write_fixture` pushes r12/r13 (content_ptr and
+//     fd respectively, both of which must survive the `sys_open`/
+//     `sys_write` syscall boundary -- the kernel's #743 info-leak
+//     hardening zeroes every CALLER-save register after every
+//     `sysret`, so a caller-save register cannot carry either value
+//     across it).
+//   - Reserved-label discipline (project non-negotiable): every label
+//     in this file is prefixed `mkfs_test_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.1 (paideia-os,
+// mkfs.pdxfs.M4-002); src/refusal.pdx (this repo, mkfs_refuse_check);
+// src/audit_wire.pdx (this repo, mkfs_audit_begin/mkfs_audit_commit);
+// tests/README.md (this repo, return-code convention);
+// design/user/syscall-table.md (paideia-os, sysno 81 = unlink).
+
+module TestRefusalMatrix = structure {
+
+  pub let mkfs_test_path_pdxb  : [u8; 31] = "/tmp/mkfs_test_refuse_pdxb.img\0"
+  pub let mkfs_test_path_pdxl  : [u8; 31] = "/tmp/mkfs_test_refuse_pdxl.img\0"
+  pub let mkfs_test_path_other : [u8; 32] = "/tmp/mkfs_test_refuse_other.img\0"
+  pub let mkfs_test_path_blank : [u8; 32] = "/tmp/mkfs_test_refuse_blank.img\0"
+
+  // --- Fixture content: exactly 4 bytes each, matching the byte-order
+  //     src/refusal.pdx's own PDXB_MAGIC/PDXL_MAGIC little-endian u32
+  //     compare expects (see module header). No trailing NUL -- these
+  //     are written by an exact-length sys_write, not read as C
+  //     strings. ---
+  pub let mkfs_test_content_pdxb  : [u8; 4] = "PDXB"
+  pub let mkfs_test_content_pdxl  : [u8; 4] = "PDXL"
+  pub let mkfs_test_content_other : [u8; 4] = "XYZQ"
+
+  // ==========================================================================
+  // mkfs_test_write_fixture(path_ptr, content_ptr) -> u64 (0 = ok, 1 = fail)
+  //
+  // Creates (or truncates) the file at `path_ptr` and writes exactly the
+  // 4 bytes at `content_ptr` to it. See module header for the register
+  // plan across the syscall boundary.
+  // ==========================================================================
+  pub let mkfs_test_write_fixture : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path_ptr: u64) (content_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M4-002 (#14): mkfs_test_write_fixture entry point. push r12; push r13 before repurposing either. r12 = content_ptr (staged from rsi -- must survive the open syscall's caller-save register zeroing per the kernel's #743 hardening, matching src/refusal.pdx's own r12-for-fd precedent). sys_open(rdi=path_ptr (already in position from the incoming argument, never reloaded), rsi=0xC1 (O_CREAT|O_WRONLY|O_TRUNC, matching src/format.pdx's MKFS_OPEN_FLAGS), rdx=0x1A4 (mode 0644, MKFS_OPEN_MODE), rax=2); `cmp rax,0; jl mkfs_test_wf_open_fail` (no fd exists yet on this path). r13 = fd. sys_write(rdi=r13, rsi=r12, rdx=4, rax=1); `cmp rax,0; jl mkfs_test_wf_write_fail`. On success: sys_close(rdi=r13, rax=3, return ignored); `xor rax,rax` (0 = fixture written); pop r13; pop r12; ret. mkfs_test_wf_write_fail: sys_close(r13) best-effort, then `mov rax,1; pop r13; pop r12; ret`. mkfs_test_wf_open_fail: `mov rax,1; pop r13; pop r12; ret` (no fd to close). No `add reg,[mem]`. No `test`. Label prefix mkfs_test_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rsi;                        // r12 = content_ptr
+
+        mov rsi, 0xC1;                        // O_CREAT|O_WRONLY|O_TRUNC
+        mov rdx, 0x1A4;                       // mode 0644
+        mov rax, 2;                           // SC+ ID 2 = sys_open
+        syscall;
+        cmp rax, 0;
+        jl mkfs_test_wf_open_fail;
+
+        mov r13, rax;                         // r13 = fd
+
+        mov rdi, r13;
+        mov rsi, r12;
+        mov rdx, 4;
+        mov rax, 1;                           // SC+ ID 1 = sys_write
+        syscall;
+        cmp rax, 0;
+        jl mkfs_test_wf_write_fail;
+
+        mov rdi, r13;
+        mov rax, 3;                           // SC+ ID 3 = sys_close
+        syscall;
+
+        xor rax, rax;                         // 0: fixture written
+        pop r13;
+        pop r12;
+        ret;
+
+      mkfs_test_wf_write_fail:
+        mov rdi, r13;
+        mov rax, 3;                           // best-effort close
+        syscall;
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        ret;
+
+      mkfs_test_wf_open_fail:
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Drives all six phases. See module header for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{fs, cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap, sched},
+      justification: "mkfs.pdxfs.M4-002 (#14): TestRefusalMatrix::run entry point. push r12 once at entry (the only register that must survive a nested call across another nested call -- Phase 6's audit_id). Phases 1-3 each: lea rdi/rsi to the phase's path/content pair, `call mkfs_test_write_fixture`; `cmp rax,0; jne mkfs_test_env_fail` (9, an environment failure distinct from a real assertion mismatch); then lea rdi to the same path, set rsi=force_flag (0), `call mkfs_refuse_check` (src/refusal.pdx); compare rax against that phase's expected REFUSE_* code (2/3/4 respectively), `jne mkfs_test_failN` on mismatch. Phase 4: best-effort sys_unlink (SC+ ID 81, path_len_hint=255) on the blank target, ignoring its return, then `call mkfs_refuse_check` with force_flag=0; expects REFUSE_OK (0), `jne mkfs_test_fail4`. Phase 5: `call mkfs_refuse_check` again against the Phase-1 PDXB-marked fixture, this time force_flag=1; expects REFUSE_OK (0) via Gate 0's short-circuit, `jne mkfs_test_fail5`. Phase 6: `call mkfs_audit_begin(path_pdxb, force_flag=0)` (src/audit_wire.pdx) -> rax; `mov r12,rax` (survives the next call); `call mkfs_audit_commit(r12, exit_code=0)`; then `call mkfs_audit_begin(path_pdxb, force_flag=1)` -> rax; `mov r12,rax`; `call mkfs_audit_commit(r12, exit_code=5)` -- no return-code assertion follows either call, per module header ('forgiving posture', libpdx-audit's stubbed daemon dispatch). Falls through to `xor rax,rax; pop r12; ret` (0: every phase completed as expected). Each numbered/environment fail label sets rax to its code and pops r12 before returning. No `add reg,[mem]`. No `test` mnemonic; every branch is `cmp reg,imm`. Label prefix mkfs_test_.",
+      block: {
+        push r12;
+
+        // ---- Phase 1: PDXB. ------------------------------------------------
+        lea rdi, [rip + mkfs_test_path_pdxb];
+        lea rsi, [rip + mkfs_test_content_pdxb];
+        call mkfs_test_write_fixture;
+        cmp rax, 0;
+        jne mkfs_test_env_fail;
+
+        lea rdi, [rip + mkfs_test_path_pdxb];
+        xor rsi, rsi;                        // force_flag = 0
+        call mkfs_refuse_check;
+        cmp rax, 2;                          // REFUSE_ALREADY_PDXB
+        jne mkfs_test_fail1;
+
+        // ---- Phase 2: PDXL. ------------------------------------------------
+        lea rdi, [rip + mkfs_test_path_pdxl];
+        lea rsi, [rip + mkfs_test_content_pdxl];
+        call mkfs_test_write_fixture;
+        cmp rax, 0;
+        jne mkfs_test_env_fail;
+
+        lea rdi, [rip + mkfs_test_path_pdxl];
+        xor rsi, rsi;
+        call mkfs_refuse_check;
+        cmp rax, 3;                          // REFUSE_ALREADY_PDXL
+        jne mkfs_test_fail2;
+
+        // ---- Phase 3: other non-blank content. ------------------------------
+        lea rdi, [rip + mkfs_test_path_other];
+        lea rsi, [rip + mkfs_test_content_other];
+        call mkfs_test_write_fixture;
+        cmp rax, 0;
+        jne mkfs_test_env_fail;
+
+        lea rdi, [rip + mkfs_test_path_other];
+        xor rsi, rsi;
+        call mkfs_refuse_check;
+        cmp rax, 4;                          // REFUSE_NON_BLANK
+        jne mkfs_test_fail3;
+
+        // ---- Phase 4: blank / nonexistent target. ---------------------------
+        lea rdi, [rip + mkfs_test_path_blank];
+        mov rsi, 255;
+        mov rax, 81;                          // SC+ ID 81 = unlink, best effort
+        syscall;
+
+        lea rdi, [rip + mkfs_test_path_blank];
+        xor rsi, rsi;
+        call mkfs_refuse_check;
+        cmp rax, 0;                          // REFUSE_OK
+        jne mkfs_test_fail4;
+
+        // ---- Phase 5: --force overrides the PDXB-marked fixture. ------------
+        lea rdi, [rip + mkfs_test_path_pdxb];
+        mov rsi, 1;                          // force_flag = 1
+        call mkfs_refuse_check;
+        cmp rax, 0;                          // REFUSE_OK
+        jne mkfs_test_fail5;
+
+        // ---- Phase 6: audit-trail wiring (no return-code assertion). -------
+        lea rdi, [rip + mkfs_test_path_pdxb];
+        xor rsi, rsi;                        // force_flag = 0
+        call mkfs_audit_begin;
+        mov r12, rax;                        // r12 = audit_id
+
+        mov rdi, r12;
+        xor rsi, rsi;                        // exit_code = 0
+        call mkfs_audit_commit;
+
+        lea rdi, [rip + mkfs_test_path_pdxb];
+        mov rsi, 1;                          // force_flag = 1
+        call mkfs_audit_begin;
+        mov r12, rax;
+
+        mov rdi, r12;
+        mov rsi, 5;                          // exit_code = 5 (MKFS_EXIT_REFUSED)
+        call mkfs_audit_commit;
+
+        xor rax, rax;                        // 0: every phase completed as expected
+        pop r12;
+        ret;
+
+      mkfs_test_env_fail:
+        mov rax, 9;
+        pop r12;
+        ret;
+
+      mkfs_test_fail1:
+        mov rax, 1;
+        pop r12;
+        ret;
+
+      mkfs_test_fail2:
+        mov rax, 2;
+        pop r12;
+        ret;
+
+      mkfs_test_fail3:
+        mov rax, 3;
+        pop r12;
+        ret;
+
+      mkfs_test_fail4:
+        mov rax, 4;
+        pop r12;
+        ret;
+
+      mkfs_test_fail5:
+        mov rax, 5;
+        pop r12;
+        ret;
+      }
+    }
+}

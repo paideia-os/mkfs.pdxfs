@@ -1,0 +1,144 @@
+// tests/test_upgrade_stub.pdx — mkfs.pdxfs.M4-004 (#16)
+// TestUpgradeStub: verifies src/argv.pdx's new `--upgrade` flag parses
+// into `PA_FLAG_UPGRADE`, and that src/upgrade.pdx's `mkfs_upgrade_run`
+// returns its documented stub exit code.
+//
+// ================================================================
+// Two phases, matching the two things M4-004 actually landed
+// ================================================================
+//
+// Issue #16's own fallback instruction ("If wiring is minimal-effort,
+// add --upgrade to argv.pdx + a stub result_code UPGRADE_NOT_
+// IMPLEMENTED") is exactly what src/argv.pdx and src/upgrade.pdx (both
+// new/changed at M4-004) implement -- and exactly what this driver
+// verifies, in two independent phases:
+//
+//   Phase 1 — argv wiring. Builds a real 3-element `char*[]` (argv0 =
+//     the program name, argv1 = "--upgrade", argv2 = a scratch target
+//     path) in this file's own `.bss`, calls `Argv::argv_parse` against
+//     it exactly the way `src/main.pdx`'s `_start` does, and asserts
+//     (a) `argv_parse` returned `ARGV_OK` (0 -- a target was supplied)
+//     and (b) `ParsedArgv.flags & PA_FLAG_UPGRADE` is nonzero.
+//   Phase 2 — stub call. Calls `Upgrade::mkfs_upgrade_run` directly
+//     (this repo's own `main.pdx` does NOT wire `PA_FLAG_UPGRADE` into
+//     any dispatch branch yet -- see `src/upgrade.pdx`'s own module
+//     header "Flagged for main" note) and asserts it returns
+//     `MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED` (7).
+//
+// Phase 2's call to `mkfs_upgrade_run` performs one real syscall
+// (`sys_write` to fd 1, via `src/pipe_wire.pdx`'s `mkfs_sp_emit_result`
+// wrapper it delegates to) -- unlike Phase 1, which is a pure `.bss`/
+// pointer exercise with no syscall at all (`Argv::argv_parse` issues
+// none).
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches this org's established M4-driver convention (see this repo's
+// own tests/README.md):
+//
+//   0 — both phases passed.
+//   1 — Phase 1 failed: argv_parse did not return ARGV_OK.
+//   2 — Phase 1 failed: PA_FLAG_UPGRADE was not set in the parsed flags.
+//   3 — Phase 2 failed: mkfs_upgrade_run did not return
+//       MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp reg, reg` or `cmp reg, imm`.
+//   - Every immediate compared here (0, 1, 2, 3, 7, 0x40) is well
+//     within the 0x7FFFFFFF cmp-imm bound; no r10/r11 staging needed.
+//   - Cross-file calls (`call argv_parse;`, `call mkfs_upgrade_run;`)
+//     use the bare unqualified symbol name, per this repo's established
+//     convention -- unresolved-external references in this file's own
+//     `.o`, resolved only once a future consumer links src/argv.pdx and
+//     src/upgrade.pdx alongside it.
+//   - No register survives across a nested call in this file -- every
+//     phase reloads its own pointer via a fresh `lea` immediately
+//     before use and checks its own result immediately after the call
+//     returns. No push/pop anywhere.
+//   - Reserved-label discipline (project non-negotiable): every label
+//     in this file is prefixed `mkfs_test_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.1 (paideia-os,
+// mkfs.pdxfs.M4-004); src/argv.pdx (this repo, PA_FLAG_UPGRADE);
+// src/upgrade.pdx (this repo, mkfs_upgrade_run); tests/README.md (this
+// repo, return-code convention).
+
+module TestUpgradeStub = structure {
+
+  // --- Synthetic argv strings, NUL-terminated. ----------------------------
+  pub let mkfs_test_argv0 : [u8; 11] = "mkfs.pdxfs\0"
+  pub let mkfs_test_argv1 : [u8; 10] = "--upgrade\0"
+  pub let mkfs_test_argv2 : [u8; 27] = "/tmp/mkfs_test_upgrade.img\0"
+
+  // --- .bss scratch: a real 3-slot char*[] and a ParsedArgv out-struct
+  //     (Argv::PA_STRUCT_BYTES = 40 bytes), populated at runtime since
+  //     this dialect has no relocatable-pointer static initializer. ------
+  pub let mut mkfs_test_argv_slots  : [u8; 24] = uninit @align(8)
+  pub let mut mkfs_test_parsed_argv : [u8; 40] = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Drives both phases. See module header for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M4-004 (#16): TestUpgradeStub::run entry point. Populates mkfs_test_argv_slots (3 x 8-byte pointer slots) via three lea+store pairs, one per synthetic argv string (argv0=program name, argv1='--upgrade', argv2=a scratch target path) -- re-lea'ing mkfs_test_argv_slots's own address before each store since this dialect has no multi-field struct-literal store shorthand. Phase 1: rdi=3 (argc), rsi=&mkfs_test_argv_slots (argv), rdx=&mkfs_test_parsed_argv (out_ptr), `call argv_parse` (src/argv.pdx); `cmp rax,0; jne mkfs_test_fail1` (expects ARGV_OK -- a target was supplied). Then r8=&mkfs_test_parsed_argv (re-lea'd fresh, argv_parse clobbers only caller-save registers per its own documented register plan so this could also reuse rdx, but a fresh lea is clearer); rax=[r8+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); `and rax,0x40` (PA_FLAG_UPGRADE); `cmp rax,0; je mkfs_test_fail2` (expects the bit set). Phase 2: rdi=&mkfs_test_argv2 (reusing the same scratch path string as target_ptr -- mkfs_upgrade_run never dereferences it as a real file per src/upgrade.pdx's own header), `call mkfs_upgrade_run` (src/upgrade.pdx, M4-004) -> rax; `cmp rax,7; jne mkfs_test_fail3` (expects MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED). Falls through to `xor rax,rax; ret` (0: both phases passed) on a full match. Each numbered fail label sets rax to its code and returns. No register survives across any nested call in this file -- every phase re-lea's its own pointer immediately before use. No `add reg,[mem]`. No `test` mnemonic. Label prefix mkfs_test_.",
+      block: {
+        // ---- Populate the synthetic argv[] pointer array. -------------------
+        lea rax, [rip + mkfs_test_argv0];
+        lea rcx, [rip + mkfs_test_argv_slots];
+        mov [rcx + 0], rax;
+
+        lea rax, [rip + mkfs_test_argv1];
+        lea rcx, [rip + mkfs_test_argv_slots];
+        mov [rcx + 8], rax;
+
+        lea rax, [rip + mkfs_test_argv2];
+        lea rcx, [rip + mkfs_test_argv_slots];
+        mov [rcx + 16], rax;
+
+        // ---- Phase 1: argv_parse wiring. ------------------------------------
+        mov rdi, 3;                          // argc
+        lea rsi, [rip + mkfs_test_argv_slots];
+        lea rdx, [rip + mkfs_test_parsed_argv];
+        call argv_parse;
+        cmp rax, 0;                          // ARGV_OK
+        jne mkfs_test_fail1;
+
+        lea r8, [rip + mkfs_test_parsed_argv];
+        mov rax, [r8 + 0];                   // ParsedArgv.flags
+        and rax, 0x40;                       // PA_FLAG_UPGRADE
+        cmp rax, 0;
+        je mkfs_test_fail2;
+
+        // ---- Phase 2: mkfs_upgrade_run stub call. ---------------------------
+        lea rdi, [rip + mkfs_test_argv2];    // target_ptr
+        call mkfs_upgrade_run;
+        cmp rax, 7;                          // MKFS_EXIT_UPGRADE_NOT_IMPLEMENTED
+        jne mkfs_test_fail3;
+
+        xor rax, rax;                        // 0: both phases passed
+        ret;
+
+      mkfs_test_fail1:
+        mov rax, 1;
+        ret;
+
+      mkfs_test_fail2:
+        mov rax, 2;
+        ret;
+
+      mkfs_test_fail3:
+        mov rax, 3;
+        ret;
+      }
+    }
+}
