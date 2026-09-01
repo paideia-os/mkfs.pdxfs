@@ -1,0 +1,195 @@
+// src/pipe_wire.pdx — mkfs.pdxfs.M3-003 (#10) — semantic-pipe schema bind
+// + emit, falling back to a documented line-based rendering.
+//
+// ----------------------------------------------------------------------
+// Why this is a fallback, not a real libpdx-semantic-pipe bind
+// ----------------------------------------------------------------------
+//
+// `libpdx-semantic-pipe` (github.com/paideia-os/libpdx-semantic-pipe) is a
+// real, released library (v1.0.0, wave R49, M1-M5 landed) with a working
+// `Send::send_record(fd, rec_ptr, rec_len)` entry point that frames a
+// record as `[8B R20b header | 32B schema hash | rec_len body]` over
+// `sys_ipc_send`. A caller binds a schema to an fd one of two ways:
+// `Binding::libpdx_semantic_pipe_bind(fd, schema_hash_ptr)` (a raw
+// 32-byte hash the caller already knows) or `Registry::bind_by_name(fd,
+// name_ptr, name_len)` (resolve a schema NAME like "PdxFsFormatRecord"
+// to its hash via `svc.schema-registry`).
+//
+// `Registry::bind_by_name` is confirmed INERT as of this landing: per
+// paideia-os#2000 ("R90-XREPO.006 Stand up libpdx-schema-registry
+// service"), the service broker only knows two hardcoded test names
+// (`svc.foo`/`svc.foobar`) and no `libpdx-schema-registry` service exists
+// anywhere in the org -- `bind_by_name` always returns 304 (LOOKUP_FAIL).
+// The one existing real adopter, `ls`, works around this by hand-
+// imprinting a placeholder schema hash (`0x01` + 31 zero bytes) via the
+// raw `libpdx_semantic_pipe_bind` path instead of `bind_by_name` -- but
+// that placeholder hash is only meaningful because `ls` is both the
+// sender and (via its own test harness) the only reader that needs to
+// agree on it. `mkfs.pdxfs` has no equivalent reader in this monorepo to
+// hand-imprint a hash in agreement with, and inventing one now would
+// produce a wire format two independently-built tools cannot actually
+// interoperate over (the exact problem #2000 exists to fix) -- worse than
+// not binding at all, since it would look real without being real.
+//
+// Per this issue's own fallback instruction, `mkfs.pdxfs` therefore does
+// NOT link `libpdx-semantic-pipe` at M3: every PdxFsFormatRecord@0.1 this
+// tool emits is the SAME line-based `sys_write(1, ...)` rendering M1/M2
+// already produce (`src/format_record.pdx`'s two emitters), now preceded
+// by one documented header line (`sp_lit_header` below) that tells a
+// human or script reading stdout exactly why: "semantic-pipe emit
+// deferred (svc.schema-registry not yet live)". The field values
+// themselves are unaffected -- "the behavior is otherwise correct;
+// parties can still parse the fields" (this issue's own acceptance
+// text). Once `libpdx-schema-registry` lands and #2000 closes, this
+// file's two wrappers are the ONLY call sites that need to change (to a
+// real `bind_by_name` + `send_record` pair) -- every other caller in this
+// repo (`src/main.pdx`, `src/format.pdx`) already goes through them
+// rather than calling `FormatRecord`'s emitters directly, so this is a
+// pure body swap with no ripple.
+//
+// ----------------------------------------------------------------------
+// Why the header is printed before every record rather than once
+// ----------------------------------------------------------------------
+//
+// Every code path in this repo emits at most one terminal
+// PdxFsFormatRecord@0.1 per process invocation (a dry-run preview, a
+// file-target write outcome, or a device-target stub/denial outcome --
+// never more than one of these per run). Printing the header
+// unconditionally immediately before that single record is therefore
+// already equivalent to "print once per process" in every reachable
+// call graph this repo has; adding a "have I already printed this"
+// latch (a `.bss` flag, checked and set on every call) would be
+// defensive complexity with no reachable case where it changes output.
+//
+// ----------------------------------------------------------------------
+// Register-preservation note: why the incoming arguments are staged into
+// callee-save registers, not caller-save scratch
+// ----------------------------------------------------------------------
+//
+// Both wrappers below issue one `sys_write` (for the header) BEFORE
+// delegating to a `FormatRecord` emitter that needs the original
+// incoming arguments. Per this repo's own established convention
+// (`design/architecture.md` §7, restated in `src/format_record.pdx`'s
+// own `format_record_emit_dry_run` justification): the kernel's #743
+// info-leak hardening zeroes every CALLER-save register
+// (`rdi`/`rsi`/`rdx`/`r8`/`r9`/`r10`) -- not just the usual `rcx`/`r11`
+// SYSCALL clobbers -- before every `sysret`. Staging the incoming
+// arguments into `r8`/`r9`/`r10` (or any other caller-save register)
+// across the header's `syscall` instruction would therefore silently
+// lose them. Both functions below instead push/stage into SysV
+// callee-save registers (`rbx`/`r12`/`r13`), matching
+// `format_record_emit_dry_run`'s and `format_record_emit_result`'s own
+// exact pattern, and pop them (reverse order) before their single `ret`.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic. Reserved-label
+// discipline: every branch label in this file is prefixed `mkfs_sp_`.
+//
+// Upstream: design/tooling/r49-r50-plan.md §3.2 (paideia-os, the
+// semantic-pipe design); github.com/paideia-os/libpdx-semantic-pipe
+// (the real, released library this file does not yet link); GitHub issue
+// paideia-os#2000 (the inert-registry blocker this file documents and
+// works around).
+
+module PipeWire = structure {
+
+  // --- Deferral header, printed to fd 1 immediately before every
+  //     PdxFsFormatRecord@0.1 line this repo emits. Length verified via
+  //     `python3 -c "print(len(...))"`. ------------------------------------
+  pub let sp_lit_header     : [u8; 134] = "# semantic-pipe emit deferred (svc.schema-registry not yet live, paideia-os#2000) -- PdxFsFormatRecord@0.1 line-based fallback below\n\0"
+  pub let sp_lit_header_len : u64 = 133
+
+  // ==========================================================================
+  // mkfs_sp_emit_dry_run(target_ptr, label_ptr, journal_size) -> ()
+  //
+  // Thin wrapper around FormatRecord::format_record_emit_dry_run (M1,
+  // src/format_record.pdx, UNCHANGED): prints sp_lit_header first, then
+  // delegates all three arguments unchanged. This is now main.pdx's ONLY
+  // call site for the dry-run preview line (see main.pdx's own header).
+  //
+  // Register plan: rbx=target_ptr, r12=label_ptr, r13=journal_size, all
+  // SysV callee-save, pushed on entry and popped before the single `ret`
+  // -- see module header's note on why a caller-save staging register
+  // would not survive the intervening header `syscall`.
+  // ==========================================================================
+  pub let mkfs_sp_emit_dry_run : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (label_ptr: u64) (journal_size: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M3-003 (#10): mkfs_sp_emit_dry_run entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=label_ptr, r13=journal_size. sys_write(1, sp_lit_header, 133) -- SC+ ID 1, rdi/rsi/rdx/rax all freshly loaded for this call (per module header, none of rbx/r12/r13 are touched by it or by the kernel's post-syscall caller-save zeroing). Then rdi=rbx, rsi=r12, rdx=r13, `call format_record_emit_dry_run` (src/format_record.pdx, M1, unchanged) -- delegates the real preview-line rendering verbatim. Pops r13/r12/rbx (reverse push order) and returns (no value; caller sys_exits itself, matching format_record_emit_dry_run's own contract). No `add reg,[mem]`. No `test`. Labels prefixed mkfs_sp_ (none needed -- this function has no branch).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r12, rsi;                       // r12 = label_ptr
+        mov r13, rdx;                       // r13 = journal_size
+
+        mov rdi, 1;
+        lea rsi, [rip + sp_lit_header];
+        mov rdx, 133;                        // sp_lit_header_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call format_record_emit_dry_run;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_sp_emit_result(target_ptr, result_code, errno) -> ()
+  //
+  // Thin wrapper around FormatRecord::format_record_emit_result (M2,
+  // src/format_record.pdx, extended at M3 with the four new result codes
+  // -- see that file's own header): prints sp_lit_header first, then
+  // delegates all three arguments unchanged. This is now the ONLY call
+  // site `src/format.pdx`'s `mkfs_format_run`/`mkfs_format_run_device`
+  // and `src/main.pdx`'s device-target dispatch use to emit a terminal
+  // result record -- none of them call `FormatRecord::format_record_
+  // emit_result` directly any more (see this repo's git history / M2
+  // landing for the prior direct-call sites this replaces).
+  //
+  // Register plan: rbx=target_ptr, r12=result_code, r13=errno -- same
+  // shape and same rationale as mkfs_sp_emit_dry_run above.
+  // ==========================================================================
+  pub let mkfs_sp_emit_result : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (result_code: u64) (errno: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.M3-003 (#10): mkfs_sp_emit_result entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=result_code, r13=errno. sys_write(1, sp_lit_header, 133) -- SC+ ID 1. Then rdi=rbx, rsi=r12, rdx=r13, `call format_record_emit_result` (src/format_record.pdx) -- delegates the real result-code rendering verbatim, now covering all nine FR_RESULT_* codes as of M3. Pops r13/r12/rbx (reverse push order) and returns. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_sp_ (none needed -- this function has no branch).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = target_ptr
+        mov r12, rsi;                       // r12 = result_code
+        mov r13, rdx;                       // r13 = errno
+
+        mov rdi, 1;
+        lea rsi, [rip + sp_lit_header];
+        mov rdx, 133;                        // sp_lit_header_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call format_record_emit_result;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

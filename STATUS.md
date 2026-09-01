@@ -1,7 +1,7 @@
 # mkfs.pdxfs — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M2 (core implementation) — **landed**
+**Current milestone:** M3 (device-target + signing + semantic-pipe + audit + elevate) — **landed**
 **Version:** unreleased (pre-1.0.0)
 
 See `design/tooling/volume-tooling-ux.md` §9.1 in the
@@ -94,19 +94,70 @@ full 18-issue breakdown this checklist mirrors.
       `result_code`-shaped record this gate (and every M2 write outcome)
       needs — the M1 `format_record_emit_dry_run` slice is untouched.
 
-### M3 — Device-target + signing + semantic-pipe + audit + elevate (pending)
+### M3 — Device-target + signing + semantic-pipe + audit + elevate
 
-- [ ] **M3-001** — device-cap target path + `KIND_BLOCK_DEVICE(write)`
-      narrowing.
-- [ ] **M3-002** — superblock signing via
-      `libpdx-volume.pdxb_sign_superblock` (mandatory on device
-      targets).
-- [ ] **M3-003** — semantic-pipe: `PdxFsFormatRecord@0.1` schema bind +
-      emit (full 14-field record, replacing M1's 4-field text line).
-- [ ] **M3-004** — `libpdx-audit`: pre-write journal record
-      (retain-forever `UEJ_KIND_VOL_FORMAT`).
-- [ ] **M3-005** — `libpdx-elevate`: `KIND_BLOCK_DEVICE(write, <dev>)`
-      request when invoker lacks it.
+- [x] **M3-001** (#8) — device-cap target path: `src/target.pdx` gains a
+      REAL `mkfs_dev_parse_slot` (hex-slot parser for `cap:blkdev:0xNN`,
+      with an optional `0x`/`0X` lead). `KIND_BLOCK_DEVICE(write)`
+      NARROWING and kind VALIDATION are documented STUBs -- confirmed
+      via grep that no `sys_cap_query`/`cap_narrow` (or equivalent)
+      primitive exists anywhere in this kernel (R13 planned
+      `sys_cap_query`, never implemented). `src/format.pdx`'s new
+      `mkfs_format_run_device` therefore parses the slot then emits
+      `PdxFsFormatRecord@0.1 { result_code: DEVICE_TARGET_STUB }`
+      without attempting any write (no block-granularity write syscall
+      exists either -- only the cap-minting `blkdev_cap_request`,
+      sysno 74). The `KIND_BLOCK_DEVICE`/`KIND_BLKDEV` naming gap M1/M2
+      flagged is RESOLVED: `design/hardware/nvme-ahci-tail-
+      milestones.md` §3.1 confirms `KIND_BLOCK_DEVICE` is a
+      doc-readability alias for the landed `KIND_BLKDEV = 0x42`.
+- [x] **M3-002** (#9) — superblock signing: `src/format.pdx`'s
+      `mkfs_format_run` now calls `libpdx-volume.pdxb_sign_superblock`
+      (real, landed at libpdx-volume commit `6f18957`) on EVERY
+      file-target write, before the superblock is written, signing
+      bytes `[0,696)` and overwriting `sb_ptr[696..696+3309)` with the
+      result. Seed strategy: a PLACEHOLDER all-zero 32-byte seed
+      (`mkfs_sign_seed_zero`) -- real seed-loading needs a `libpdx-key`
+      -equivalent that does not exist yet, so this signature is
+      well-FORMED but not verifiable against any real key. The
+      terminal success record is now `result_code: SIGNED_OK`
+      (`FormatRecord::FR_RESULT_SIGNED_OK`), replacing M2's `OK`.
+- [x] **M3-003** (#10) — semantic-pipe: `src/pipe_wire.pdx` (new).
+      `libpdx-semantic-pipe` v1.0.0 is real and released, but its
+      `Registry::bind_by_name` is confirmed INERT (GitHub
+      paideia-os#2000: the backing `svc.schema-registry` service does
+      not exist, `bind_by_name` always returns 304). Per this issue's
+      own fallback instruction, this repo does NOT link the library --
+      every `PdxFsFormatRecord@0.1` this repo emits stays the M1/M2
+      line-based `sys_write(1, ...)` rendering, now preceded by one
+      documented deferral header line. `src/main.pdx` and
+      `src/format.pdx` now call ONLY `pipe_wire.pdx`'s two wrappers,
+      never `FormatRecord`'s emitters directly.
+- [x] **M3-004** (#11) — `libpdx-audit` (@0.2, commit `bfc63a5`):
+      `src/audit_wire.pdx` (new) wraps EVERY `_start` dispatch branch
+      (file dry-run, file real-write, device-target grant/deny, and
+      "not yet implemented") in a real `AuditClient::audit_begin` /
+      `audit_commit` pair. No retain-forever `UEJ_KIND` exists in
+      libpdx-audit @0.2 (grepped, confirmed absent) -- `audit_begin`
+      has no caller-selectable "kind" parameter at all, only a fixed
+      internal mapping to `UEJ_KIND_TOOL_INVOKE`; flagged for main.
+      The audit-journal daemon dispatch is confirmed stubbed
+      (libpdx-audit's own STATUS.md: `AJB_DISPATCH_STUB`), matching
+      this issue's own forgiving-posture instruction -- every outcome
+      is treated as non-fatal.
+- [x] **M3-005** (#12) — `libpdx-elevate` (4844 LOC, mature):
+      `src/elevate_wire.pdx` (new). This issue's assumed API shape
+      (`elevate_client_require(RESOURCE_KIND=..., action=WRITE,
+      target=<slot>)`) does not exist in the real library -- its actual
+      model is a capability-bitmask `row_id` handle requiring a
+      `parent_ep_slot` broker-endpoint cap this repo does not hold
+      (`KIND_ELEVATE_CHANNEL` is still the M1 placeholder). Rather than
+      fabricate a plausible-looking call against fields this repo
+      cannot honestly populate, `mkfs_elev_require_device_write` is a
+      documented, fail-closed stub that always returns DENY. The GRANT
+      arm of `src/main.pdx`'s dispatch (and `mkfs_format_run_device`)
+      is real, wired code -- unreachable at this landing, live the
+      moment a real broker cap exists.
 
 ### M4 — Tests + smoke (pending)
 
@@ -124,17 +175,37 @@ full 18-issue breakdown this checklist mirrors.
 
 ## Next milestone
 
-M3 opens once `mkfs.pdxfs.M2` closes. It needs: (1) the
-`KIND_BLOCK_DEVICE` naming gap (`caps.decl`, `design/architecture.md`
-§6) resolved with osarch before `M3-001` mints against either candidate
-kind; (2) `libpdx-volume.pdxb_sign_superblock` (landed at
-`libpdx-volume` commit `052cbac` per M3 there, ML-DSA-65-based) for
-`M3-002` — mkfs.pdxfs.M2 deliberately leaves every superblock unsigned
-(the `sig` region stays zeroed), matching the design doc's "file-backed
-target, no `--sig-key`" discipline; (3) `libpdx-audit` linked for
-`M3-004`'s pre-write journal record, which will also need to backfill
-the `REFUSED_OVERRIDDEN` audit sub-record `M2-004`'s `--force` bypass
-currently has no trace of at all.
+M4 (tests + smoke) opens once `mkfs.pdxfs.M3` closes. It inherits four
+concrete gaps M3 left open rather than closing silently:
+
+1. **Device-target write path is fully stubbed** (§ M3-001, M3-005):
+   no `sys_cap_query`/`cap_narrow`-equivalent primitive exists in this
+   kernel, and no block-granularity write syscall exists either (only
+   the cap-minting `blkdev_cap_request`). A `cap:blkdev:` target always
+   produces `ELEVATION_DENIED` (fail-closed, since `libpdx-elevate`
+   needs a broker-endpoint cap this repo does not hold) before ever
+   reaching the `DEVICE_TARGET_STUB` write attempt. M4-003's own
+   "device-target smoke against QEMU virtio disk" needs at minimum a
+   real `KIND_ELEVATE_CHANNEL` broker cap for mkfs.pdxfs to acquire
+   from, plus a real block-write syscall, before it can exercise
+   anything beyond the DENY path.
+2. **Signing uses a placeholder all-zero seed** (§ M3-002): every
+   signature this landing produces is well-formed but verifies against
+   no real key. A `libpdx-key`-equivalent (or an inline `--sig-key`
+   loader) is needed before signed superblocks are meaningfully
+   verifiable.
+3. **No retain-forever `UEJ_KIND`** exists in `libpdx-audit` @0.2 (§
+   M3-004) -- if volume-formatting operations specifically need
+   retain-forever semantics, that is a `libpdx-audit` feature request,
+   not something this repo can wire against today. Also still open
+   from M2: the `REFUSED_OVERRIDDEN` audit sub-record for a `--force`
+   bypass has no dedicated wire shape in libpdx-audit's real API
+   (`audit_begin`'s two-string `op_name`/`op_args` distinguishes a
+   forced invocation only informally, via `mkfs.pdxfs.format.force` as
+   `op_name`).
+4. **`libpdx-semantic-pipe` linking is deferred** (§ M3-003) until
+   GitHub paideia-os#2000 (`svc.schema-registry`) lands and
+   `Registry::bind_by_name` stops being inert.
 
 ## Upstream design
 

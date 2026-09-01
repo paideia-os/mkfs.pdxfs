@@ -325,6 +325,53 @@ module FormatRecord = structure {
   pub let FR_RESULT_REFUSED_ALREADY_PDXL : u64 = 3
   pub let FR_RESULT_REFUSED_NON_BLANK    : u64 = 4
 
+  // --- mkfs.pdxfs.M3 (#8, #9, #11, #12) new result codes. -----------------
+  //
+  //   FR_RESULT_DEVICE_TARGET_STUB -- a `cap:blkdev:` target was classified
+  //     and its slot number parsed (src/target.pdx's mkfs_dev_parse_slot),
+  //     but the real block-granularity write path does not exist yet (no
+  //     KIND_BLOCK_DEVICE open/write/flush op, no cap-narrow primitive --
+  //     see design/architecture.md §11). src/format.pdx's
+  //     mkfs_format_run_device emits this instead of performing any write.
+  //     In THIS landing it is reachable only in the (currently dead)
+  //     GRANT arm of main.pdx's device dispatch, since
+  //     mkfs_elev_require_device_write (src/elevate_wire.pdx) always
+  //     returns DENY -- see that file's header and FR_RESULT_ELEVATION_
+  //     DENIED below.
+  //   FR_RESULT_ELEVATION_DENIED -- src/elevate_wire.pdx's
+  //     mkfs_elev_require_device_write returned DENY for a device target.
+  //     At M3 this is the code that ALWAYS fires for a `cap:blkdev:`
+  //     target (fail-closed: mkfs.pdxfs holds no KIND_ELEVATE_CHANNEL
+  //     broker endpoint cap, so no real elevate_client_acquire call can be
+  //     constructed at all -- "cannot prove GRANT" is treated the same as
+  //     an explicit broker DENY, per this repo's own fail-closed posture,
+  //     not a fabricated denial of a request that was never actually
+  //     sent). See src/elevate_wire.pdx's module header.
+  //   FR_RESULT_AUDIT_FAIL -- reserved for a hard audit failure. Per
+  //     mkfs.pdxfs.M3-004's own task text ("the audit_client call may
+  //     return quickly with a documented no-op -- that's fine, just log
+  //     it and continue"), src/audit_wire.pdx treats every
+  //     AuditClient::audit_begin/audit_commit outcome (including 0,
+  //     libpdx-audit's own "failed" sentinel) as non-fatal -- this repo's
+  //     M3 landing never actually emits FR_RESULT_AUDIT_FAIL as a
+  //     terminal record. The constant exists so a future stricter
+  //     "--require-audit" mode (or main, if the forgiving posture above
+  //     turns out to be wrong) has a result code to emit without another
+  //     format_record.pdx change.
+  //   FR_RESULT_SIGNED_OK -- the file-target write pipeline
+  //     (src/format.pdx's mkfs_format_run) completed AND
+  //     libpdx-volume.pdxb_sign_superblock signed the on-disk superblock
+  //     (with a placeholder all-zero seed at this landing -- see that
+  //     file's module header). Replaces FR_RESULT_OK as the file-target
+  //     success code as of M3, since every file-target write is now
+  //     signed unconditionally (FR_RESULT_OK=0 is kept, unused by any
+  //     current call site, for a hypothetical future unsigned-write mode).
+  // -------------------------------------------------------------------------
+  pub let FR_RESULT_DEVICE_TARGET_STUB   : u64 = 5
+  pub let FR_RESULT_ELEVATION_DENIED     : u64 = 6
+  pub let FR_RESULT_AUDIT_FAIL           : u64 = 7
+  pub let FR_RESULT_SIGNED_OK            : u64 = 8
+
   // --- Literal chunks for format_record_emit_result. Lengths verified via
   //     `python3 -c "print(len(...))"` against each literal, same
   //     discipline as the M1 literals above. fr_lit_prefix (M1, above) is
@@ -351,6 +398,21 @@ module FormatRecord = structure {
 
   pub let fr_lit_refused_non_blank     : [u8; 21] = "REFUSED_NON_BLANK }\n\0"
   pub let fr_lit_refused_non_blank_len : u64 = 20
+
+  // --- mkfs.pdxfs.M3 (#8, #9, #11, #12) result-code literals. Lengths
+  //     verified via `python3 -c "print(len(...))"` against each literal,
+  //     same discipline as every literal above. ---------------------------
+  pub let fr_lit_device_stub     : [u8; 22] = "DEVICE_TARGET_STUB }\n\0"
+  pub let fr_lit_device_stub_len : u64 = 21
+
+  pub let fr_lit_elevation_denied     : [u8; 20] = "ELEVATION_DENIED }\n\0"
+  pub let fr_lit_elevation_denied_len : u64 = 19
+
+  pub let fr_lit_audit_fail     : [u8; 14] = "AUDIT_FAIL }\n\0"
+  pub let fr_lit_audit_fail_len : u64 = 13
+
+  pub let fr_lit_signed_ok     : [u8; 13] = "SIGNED_OK }\n\0"
+  pub let fr_lit_signed_ok_len : u64 = 12
 
   // ==========================================================================
   // format_record_write_u64_dec(fd, value) -> ()
@@ -461,7 +523,7 @@ module FormatRecord = structure {
   pub let format_record_emit_result : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
     fn (target_ptr: u64) (result_code: u64) (errno: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mkfs.pdxfs.M2 (#5, #7): format_record_emit_result entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=result_code, r13=errno. Segment 1: sys_write(1, fr_lit_prefix, 32) (reused M1 literal). Segment 2: call format_record_strlen(rbx) -> rax -> rdx; sys_write(1, rbx, rdx). Segment 3: sys_write(1, fr_lit_result_code, 15). Segment 4 dispatch: `cmp r12, 0; je mkfs_fr_er_ok` (FR_RESULT_OK); `cmp r12, 1; je mkfs_fr_er_fail` (FR_RESULT_FAIL); `cmp r12, 2; je mkfs_fr_er_pdxb` (FR_RESULT_REFUSED_ALREADY_PDXB); `cmp r12, 3; je mkfs_fr_er_pdxl` (FR_RESULT_REFUSED_ALREADY_PDXL); unconditional `jmp mkfs_fr_er_non_blank` for FR_RESULT_REFUSED_NON_BLANK (4) and as a defensive default (see module comment above). mkfs_fr_er_ok: sys_write(1, fr_lit_ok, 5); jmp done. mkfs_fr_er_fail: sys_write(1, fr_lit_fail_prefix, 13); call format_record_write_u64_dec(1, r13); sys_write(1, fr_lit_fail_suffix, 3); jmp done. mkfs_fr_er_pdxb: sys_write(1, fr_lit_refused_pdxb, 23); jmp done. mkfs_fr_er_pdxl: sys_write(1, fr_lit_refused_pdxl, 23); jmp done. mkfs_fr_er_non_blank: sys_write(1, fr_lit_refused_non_blank, 20). done: pop r13; pop r12; pop rbx; ret. No `add reg,[mem]`. No `test` -- every branch is `cmp reg,imm`. Labels prefixed mkfs_fr_er_.",
+      justification: "mkfs.pdxfs.M2 (#5, #7) + M3 (#8, #9, #11, #12): format_record_emit_result entry point. push rbx; push r12; push r13 before repurposing any. rbx=target_ptr, r12=result_code, r13=errno. Segment 1: sys_write(1, fr_lit_prefix, 32) (reused M1 literal). Segment 2: call format_record_strlen(rbx) -> rax -> rdx; sys_write(1, rbx, rdx). Segment 3: sys_write(1, fr_lit_result_code, 15). Segment 4 dispatch, extended at M3 with four new codes: `cmp r12, 0; je mkfs_fr_er_ok` (FR_RESULT_OK); `cmp r12, 1; je mkfs_fr_er_fail` (FR_RESULT_FAIL); `cmp r12, 2; je mkfs_fr_er_pdxb` (FR_RESULT_REFUSED_ALREADY_PDXB); `cmp r12, 3; je mkfs_fr_er_pdxl` (FR_RESULT_REFUSED_ALREADY_PDXL); `cmp r12, 4; je mkfs_fr_er_non_blank` (FR_RESULT_REFUSED_NON_BLANK, now an explicit case rather than the unconditional fallthrough it was at M2); `cmp r12, 5; je mkfs_fr_er_device_stub` (FR_RESULT_DEVICE_TARGET_STUB); `cmp r12, 6; je mkfs_fr_er_elevation_denied` (FR_RESULT_ELEVATION_DENIED); `cmp r12, 7; je mkfs_fr_er_audit_fail` (FR_RESULT_AUDIT_FAIL); `cmp r12, 8; je mkfs_fr_er_signed_ok` (FR_RESULT_SIGNED_OK); unconditional `jmp mkfs_fr_er_non_blank` as a defensive default for any other value (unchanged posture from M2 -- no caller in this repo passes one). mkfs_fr_er_ok: sys_write(1, fr_lit_ok, 5); jmp done. mkfs_fr_er_fail: sys_write(1, fr_lit_fail_prefix, 13); call format_record_write_u64_dec(1, r13); sys_write(1, fr_lit_fail_suffix, 3); jmp done. mkfs_fr_er_pdxb: sys_write(1, fr_lit_refused_pdxb, 23); jmp done. mkfs_fr_er_pdxl: sys_write(1, fr_lit_refused_pdxl, 23); jmp done. mkfs_fr_er_non_blank: sys_write(1, fr_lit_refused_non_blank, 20); jmp done. mkfs_fr_er_device_stub: sys_write(1, fr_lit_device_stub, 21); jmp done. mkfs_fr_er_elevation_denied: sys_write(1, fr_lit_elevation_denied, 19); jmp done. mkfs_fr_er_audit_fail: sys_write(1, fr_lit_audit_fail, 13); jmp done. mkfs_fr_er_signed_ok: sys_write(1, fr_lit_signed_ok, 12). done: pop r13; pop r12; pop rbx; ret. No `add reg,[mem]`. No `test` -- every branch is `cmp reg,imm`. Labels prefixed mkfs_fr_er_.",
       block: {
         push rbx;
         push r12;
@@ -503,6 +565,16 @@ module FormatRecord = structure {
         je mkfs_fr_er_pdxb;
         cmp r12, 3;
         je mkfs_fr_er_pdxl;
+        cmp r12, 4;
+        je mkfs_fr_er_non_blank;
+        cmp r12, 5;
+        je mkfs_fr_er_device_stub;
+        cmp r12, 6;
+        je mkfs_fr_er_elevation_denied;
+        cmp r12, 7;
+        je mkfs_fr_er_audit_fail;
+        cmp r12, 8;
+        je mkfs_fr_er_signed_ok;
         jmp mkfs_fr_er_non_blank;
 
       mkfs_fr_er_ok:
@@ -551,6 +623,38 @@ module FormatRecord = structure {
         mov rdi, 1;
         lea rsi, [rip + fr_lit_refused_non_blank];
         mov rdx, 20;                        // fr_lit_refused_non_blank_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_device_stub:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_device_stub];
+        mov rdx, 21;                        // fr_lit_device_stub_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_elevation_denied:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_elevation_denied];
+        mov rdx, 19;                        // fr_lit_elevation_denied_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_audit_fail:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_audit_fail];
+        mov rdx, 13;                        // fr_lit_audit_fail_len
+        mov rax, 1;
+        syscall;
+        jmp mkfs_fr_er_done;
+
+      mkfs_fr_er_signed_ok:
+        mov rdi, 1;
+        lea rsi, [rip + fr_lit_signed_ok];
+        mov rdx, 12;                        // fr_lit_signed_ok_len
         mov rax, 1;
         syscall;
 

@@ -9,49 +9,76 @@
 //   pointers -- no walker or syscall needed to dereference argv[i]),
 //   rdx = envp (unused by this tool), rsp % 16 == 0 at entry.
 //
-// M2 flow (mkfs.pdxfs.M2-001, issue #4 -- supersedes the M1-003 flow
+// M3 flow (mkfs.pdxfs.M3, issues #8-#12 -- supersedes the M2-001 flow
 // this header previously described; see git history / STATUS.md for
-// the M1 shape):
+// the M1/M2 shape):
 //
 //   1. Parse argv via Argv::argv_parse (src/argv.pdx, #2). On
 //      ARGV_ERR_MISSING_TARGET, print a usage diagnostic to fd 2 and
-//      exit 2 (matches design/tooling/volume-tooling-ux.md §3.2's
-//      "Any other prefix is a parse error (exit 2, invalid argument)"
-//      convention -- a missing positional is the same class of misuse).
-//   2. Classify the target via Target::target_classify (src/target.pdx).
-//      A non-TARGET_FILE result (device-cap or invalid prefix) falls
-//      straight through to the "not yet implemented" diagnostic + exit
-//      1, REGARDLESS of --dry-run -- the device-cap path is
-//      mkfs.pdxfs.M3-001, still not implemented (see target.pdx's own
-//      header for why this is unchanged from M1).
-//   3. TARGET_FILE + --dry-run set: unchanged M1 behavior -- call
-//      FormatRecord::format_record_emit_dry_run (src/format_record.pdx,
-//      #3) to print the M1 four-field PdxFsFormatRecord@0.1 preview
-//      line, then exit 0. No write of any kind happens on this path.
-//   4. TARGET_FILE + --dry-run NOT set: the NEW M2 real-write path.
-//      Call Format::mkfs_format_run (src/format.pdx, #5/#6/#7) with
-//      (target_ptr, force_flag, journal_size) -- it runs the non-blank
-//      refusal gate, then (if not refused) the real superblock/inode-
-//      table/bitmap/journal write pipeline, emitting the terminal
-//      PdxFsFormatRecord@0.1 (OK / a REFUSED_* variant / FAIL) itself.
-//      Its u64 return value IS the process exit status (0, 3, or 5 per
-//      design/tooling/volume-tooling-ux.md's exit-code contract) --
-//      passed to sys_exit unchanged, no further branching needed here.
+//      exit 2 -- UNCHANGED from M1/M2. No audit record is opened for
+//      this path (the target string itself is unknown, so there is
+//      nothing meaningful to audit yet).
+//   2. NEW at M3 (#11): call AuditWire::mkfs_audit_begin(target_ptr,
+//      force_flag) (src/audit_wire.pdx) and hold its return value
+//      (an audit_id, or 0 -- see that file's own "forgiving posture"
+//      note) in r12 for the rest of _start. This happens BEFORE target
+//      classification, so every classification outcome (file, device,
+//      invalid) gets the same audit wrapping.
+//   3. Classify the target via Target::target_classify (src/target.pdx,
+//      UNCHANGED at M3).
+//   4. TARGET_FILE + --dry-run set: call PipeWire::mkfs_sp_emit_dry_run
+//      (src/pipe_wire.pdx, M3 #10 -- replaces the M1/M2 direct call to
+//      FormatRecord::format_record_emit_dry_run) to print the preview
+//      line, commit the audit record (exit_status=0), then exit 0. No
+//      write of any kind happens on this path.
+//   5. TARGET_FILE + --dry-run NOT set: call Format::mkfs_format_run
+//      (src/format.pdx, M2 #5/#6/#7, extended at M3 #9 to sign every
+//      superblock) with (target_ptr, force_flag, journal_size). Its u64
+//      return value IS the process exit status; commit the audit record
+//      with that value, then sys_exit it unchanged.
+//   6. NEW at M3 (#8, #12): TARGET_DEVICE_CAP no longer falls straight to
+//      "not yet implemented". Instead: call
+//      ElevateWire::mkfs_elev_require_device_write(target_ptr, dev_slot)
+//      (src/elevate_wire.pdx) -- dev_slot comes from
+//      Target::mkfs_dev_parse_slot (src/target.pdx). On MKFS_ELEV_DENY
+//      (the ONLY value this landing's elevate_wire body can ever
+//      produce -- see that file's own header): emit
+//      PdxFsFormatRecord@0.1 { result_code: ELEVATION_DENIED } via
+//      PipeWire::mkfs_sp_emit_result, commit the audit record with
+//      MKFS_EXIT_ELEVATION_DENIED (6), and exit non-zero. On
+//      MKFS_ELEV_GRANT (real, wired, but unreachable at this landing):
+//      call Format::mkfs_format_run_device (src/format.pdx, M3 #8 --
+//      itself a documented stub emitting DEVICE_TARGET_STUB), commit,
+//      and exit its return value.
+//   7. TARGET_INVALID: unchanged "not yet implemented" diagnostic, now
+//      ALSO wrapped in an audit commit (exit_status=1) before exiting.
 //
 // ----------------------------------------------------------------------
 // Register plan
 // ----------------------------------------------------------------------
 //
 // All callee-save (SysV rbx/r12-r15), so they survive every nested
-// `call` (argv_parse, target_classify, format_record_emit_dry_run,
-// mkfs_format_run) without any push/pop -- each callee clobbers only
-// caller-save registers, or explicitly preserves callee-save registers
-// itself via its own push/pop (mkfs_format_run does, per
-// design/architecture.md §7), and SYSCALL preserves callee-save
-// registers by the amd64 fast-syscall convention:
+// `call` without any push/pop -- each callee clobbers only caller-save
+// registers, or explicitly preserves callee-save registers itself via
+// its own push/pop (design/architecture.md §7), and SYSCALL preserves
+// callee-save registers by the amd64 fast-syscall convention:
 //
-//   r12 = argc (saved immediately from rdi, before any call)
-//   r13 = argv (saved immediately from rsi)
+//   r12 = argc, THEN (M3, from mkfs_main_argv_ok onward) reused to hold
+//         the audit_id returned by AuditWire::mkfs_audit_begin -- argc
+//         is dead after Phase 1's `call argv_parse`, so this reuse is
+//         safe and needs no extra register. r12 is never overwritten
+//         again after that single assignment -- every branch reads it
+//         once, right before its own `call mkfs_audit_commit`.
+//   r13 = argv, THEN (M3, device-target branch only) reused first to
+//         hold the parsed device-cap slot number (Target::
+//         mkfs_dev_parse_slot's return value) and then, in that same
+//         branch, the process exit status -- both uses are dead by the
+//         time the next write to r13 happens, so this is a plain
+//         scratch-variable reuse, not concurrent aliasing. The
+//         file-target branch also stashes its own exit status
+//         (Format::mkfs_format_run's return value) in r13 for the same
+//         reason (it must survive past the `call mkfs_audit_commit`
+//         that needs it a second time for `sys_exit`).
 //   r14 = &mkfs_argv_out (the ParsedArgv scratch struct, lea'd once)
 //   rbx = ParsedArgv.flags (loaded once after argv_parse succeeds)
 //   r15 = ParsedArgv.target_ptr (loaded once after argv_parse succeeds)
@@ -96,7 +123,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001 (#4): mkfs.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mkfs_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to mkfs_main_missing_target: sys_write(2, mkfs_msg_missing_target, 27), sys_exit(2) -- exit code 2 matches design/tooling/volume-tooling-ux.md §3.2's 'parse error (exit 2, invalid argument)' convention for a malformed invocation, extended here to cover a missing positional as the same misuse class. Phase 2 (on ARGV_OK): r14 = &mkfs_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); r15 = [r14+32] (ParsedArgv.target_ptr, Argv::PA_OFF_TARGET_PTR). Gate 1 (M2, unconditional on --dry-run): rdi=r15; call target_classify (src/target.pdx); cmp rax,0 (Target::TARGET_FILE); jne mkfs_main_not_implemented -- a device-cap or invalid target falls straight to 'not yet implemented' + exit 1 regardless of --dry-run (mkfs.pdxfs.M3-001 still owns the device-cap path; see target.pdx's own header). Gate 2 (only reached for TARGET_FILE): rax = rbx & 0x2 (Argv::PA_FLAG_DRY_RUN); cmp rax,0; je mkfs_main_file_real when --dry-run was NOT given -- branches into the NEW M2 real-write path. When --dry-run WAS given: rdi=r15 (target_ptr), rsi=[r14+8] (label_ptr), rdx=[r14+16] (journal_size); call format_record_emit_dry_run (src/format_record.pdx, #3, UNCHANGED from M1) -- prints the M1 four-field preview line to fd 1; sys_exit(0). mkfs_main_file_real (the M2-001/#4 real-write path): rdi=r15 (target_ptr); rax=rbx & 0x1 (Argv::PA_FLAG_FORCE), rsi=rax (force_flag, reduced to a single 0/1 bit); rdx=[r14+16] (journal_size, already in BLOCKS per argv_parse's own documented default); call mkfs_format_run (src/format.pdx, #5/#6/#7) -- runs the refusal gate then (if not refused) the real write pipeline, emitting its own terminal PdxFsFormatRecord@0.1 and returning the process exit status (0 OK / 3 SYSCALL_ERROR / 5 REFUSED) directly in rax; mov rdi,rax; sys_exit(rdi) -- no further branching needed, mkfs_format_run's return value IS the exit status verbatim. mkfs_main_not_implemented: sys_write(2, mkfs_msg_not_implemented, 32), sys_exit(1) -- now reached only for a device-cap or invalid target (mkfs.pdxfs.M3-001), independent of --dry-run. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree. target_classify, format_record_emit_dry_run are pure/self-preserving per their own justifications; mkfs_format_run explicitly preserves every callee-save register it touches (design/architecture.md §7) -- so rbx/r14/r15 all survive every call in this function transparently, needing no push/pop here. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mkfs_main_.",
+      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001 (#4) + M3 (#8, #9, #10, #11, #12): mkfs.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mkfs_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to the missing-target path: sys_write(2, mkfs_msg_missing_target, 27), sys_exit(2) -- UNCHANGED from M1/M2; no audit record is opened for this path (see module header). Phase 2 (on ARGV_OK, mkfs_main_argv_ok): r14 = &mkfs_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags); r15 = [r14+32] (ParsedArgv.target_ptr). NEW at M3 (#11): rdi=r15 (target_ptr), rax=rbx&0x1 (PA_FLAG_FORCE) moved into rsi (force_flag), `call mkfs_audit_begin` (src/audit_wire.pdx) -> rax=audit_id; `mov r12, rax` (r12 reused from the now-dead argc, see module header's register plan). Gate 1 (classify): rdi=r15; call target_classify (src/target.pdx, UNCHANGED); `cmp rax,0; je mkfs_main_target_file` (Target::TARGET_FILE); `cmp rax,1; je mkfs_main_target_device` (Target::TARGET_DEVICE_CAP, NEW at M3 -- no longer falls straight through); any other value (Target::TARGET_INVALID) falls through to `jmp mkfs_main_not_implemented`. mkfs_main_target_file: Gate 2, rax=rbx&0x2 (PA_FLAG_DRY_RUN); `cmp rax,0; je mkfs_main_file_real` when NOT given. When --dry-run WAS given: rdi=r15, rsi=[r14+8] (label_ptr), rdx=[r14+16] (journal_size); `call mkfs_sp_emit_dry_run` (src/pipe_wire.pdx, M3 #10 -- replaces the M1/M2 direct call to format_record_emit_dry_run) -- prints the deferred-header line then the M1 four-field preview line; rdi=r12 (audit_id), xor rsi,rsi (exit_status=0), `call mkfs_audit_commit` (src/audit_wire.pdx); xor rdi,rdi; sys_exit(0). mkfs_main_file_real: rdi=r15, rax=rbx&0x1 (force_flag), rdx=[r14+16] (journal_size); `call mkfs_format_run` (src/format.pdx, M2 #5/#6/#7, extended M3 #9 to sign) -> rax=exit_status; `mov r13, rax` (stashed -- r13, argv, is dead by this point, see module header); rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(r13). mkfs_main_target_device (NEW at M3, #8/#12): rdi=r15, `call mkfs_dev_parse_slot` (src/target.pdx) -> rax=dev_slot; `mov r13, rax` (stashed). rdi=r15, rsi=r13, `call mkfs_elev_require_device_write` (src/elevate_wire.pdx) -> rax in {MKFS_ELEV_DENY=0, MKFS_ELEV_GRANT=1}; `cmp rax,1; je mkfs_main_device_grant`. DENY (the only value this landing's elevate_wire body can ever produce -- see that file's own header): rdi=r15, mov rsi,6 (FR_RESULT_ELEVATION_DENIED), xor rdx,rdx, `call mkfs_sp_emit_result` (src/pipe_wire.pdx); `mov r13, 6` (MKFS_EXIT_ELEVATION_DENIED, r13's dev_slot value is dead by this point -- reused as a plain scratch slot, see module header); rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(6). mkfs_main_device_grant (real, wired, unreachable at this landing): rdi=r15, rax=rbx&0x1 (force_flag), rdx=[r14+16] (journal_size); `call mkfs_format_run_device` (src/format.pdx, M3 #8, a documented stub) -> rax=exit_status; `mov r13, rax`; rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(r13). mkfs_main_not_implemented: sys_write(2, mkfs_msg_not_implemented, 32); rdi=r12, mov rsi,1, `call mkfs_audit_commit` (NEW at M3 -- this path is now also audit-wrapped, since audit_begin already ran unconditionally in Phase 2); sys_exit(1). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders, matching every other _start in the paideia-os monorepo's src/user/ tree. target_classify/mkfs_dev_parse_slot/mkfs_elev_require_device_write are pure/self-preserving per their own justifications; mkfs_format_run/mkfs_format_run_device/mkfs_sp_emit_dry_run/mkfs_sp_emit_result/mkfs_audit_begin/mkfs_audit_commit all either touch only caller-save registers or explicitly preserve every callee-save register they repurpose (design/architecture.md §7) -- so rbx/r14/r15 (and r12/r13 once assigned their M3 roles) all survive every call in this function transparently, needing no push/pop here. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mkfs_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -128,25 +155,39 @@ module Main = structure {
         mov rbx, [r14 + 0];                  // rbx = flags (Argv::PA_OFF_FLAGS)
         mov r15, [r14 + 32];                 // r15 = target_ptr (Argv::PA_OFF_TARGET_PTR)
 
-        // ---- Gate 1: target classifies as TARGET_FILE (0)? Unconditional
-        //      on --dry-run -- a device-cap/invalid target is "not yet
-        //      implemented" either way (mkfs.pdxfs.M3-001). --------------
+        // ---- M3 (#11): open the audit record before any dispatch. --------
+        mov rdi, r15;                        // target_ptr
+        mov rax, rbx;
+        and rax, 0x1;                        // Argv::PA_FLAG_FORCE
+        mov rsi, rax;                        // force_flag
+        call mkfs_audit_begin;
+        mov r12, rax;                        // r12 = audit_id (argc is dead; see module header)
+
+        // ---- Gate 1: classify target. -------------------------------------
         mov rdi, r15;
         call target_classify;
         cmp rax, 0;                          // Target::TARGET_FILE
-        jne mkfs_main_not_implemented;
+        je mkfs_main_target_file;
+        cmp rax, 1;                          // Target::TARGET_DEVICE_CAP
+        je mkfs_main_target_device;
+        jmp mkfs_main_not_implemented;        // Target::TARGET_INVALID
 
+      mkfs_main_target_file:
         // ---- Gate 2: --dry-run set? (Argv::PA_FLAG_DRY_RUN = 0x2) ---------
         mov rax, rbx;
         and rax, 0x2;
         cmp rax, 0;
         je mkfs_main_file_real;
 
-        // ---- --dry-run + TARGET_FILE: unchanged M1 preview path. ----------
+        // ---- --dry-run + TARGET_FILE: preview path, via pipe_wire. --------
         mov rdi, r15;                        // target_ptr
         mov rsi, [r14 + 8];                  // label_ptr (Argv::PA_OFF_LABEL_PTR)
         mov rdx, [r14 + 16];                 // journal_size (Argv::PA_OFF_JOURNAL_SIZE)
-        call format_record_emit_dry_run;
+        call mkfs_sp_emit_dry_run;            // src/pipe_wire.pdx (M3, #10)
+
+        mov rdi, r12;                        // audit_id
+        xor rsi, rsi;                        // exit_status = 0
+        call mkfs_audit_commit;
 
         xor rdi, rdi;                        // status = 0 (OK)
         mov rax, 60;                          // SC+ ID 60 = sys_exit
@@ -154,7 +195,7 @@ module Main = structure {
         hlt;
 
       mkfs_main_file_real:
-        // ---- M2 (#4/#5/#6/#7): the real write pipeline. -------------------
+        // ---- M2 (#4/#5/#6/#7), extended M3 (#9) to sign: real write path. -
         mov rdi, r15;                        // target_ptr
         mov rax, rbx;
         and rax, 0x1;                        // Argv::PA_FLAG_FORCE
@@ -162,7 +203,60 @@ module Main = structure {
         mov rdx, [r14 + 16];                 // journal_size (blocks)
         call mkfs_format_run;
 
-        mov rdi, rax;                        // exit status returned verbatim
+        mov r13, rax;                        // exit_status (argv is dead; see module header)
+        mov rdi, r12;                        // audit_id
+        mov rsi, r13;
+        call mkfs_audit_commit;
+
+        mov rdi, r13;
+        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      mkfs_main_target_device:
+        // ---- M3 (#8, #12): device-cap target path. ------------------------
+        mov rdi, r15;                        // target_ptr
+        call mkfs_dev_parse_slot;             // src/target.pdx
+        mov r13, rax;                        // r13 = dev_slot
+
+        mov rdi, r15;                        // target_ptr
+        mov rsi, r13;                        // dev_slot
+        call mkfs_elev_require_device_write;  // src/elevate_wire.pdx
+        cmp rax, 1;                          // MKFS_ELEV_GRANT
+        je mkfs_main_device_grant;
+
+        // ---- MKFS_ELEV_DENY (the only value reachable at this landing). --
+        mov rdi, r15;                        // target_ptr
+        mov rsi, 6;                          // FR_RESULT_ELEVATION_DENIED
+        xor rdx, rdx;
+        call mkfs_sp_emit_result;             // src/pipe_wire.pdx
+
+        mov r13, 6;                          // MKFS_EXIT_ELEVATION_DENIED (dev_slot now dead)
+        mov rdi, r12;                        // audit_id
+        mov rsi, r13;
+        call mkfs_audit_commit;
+
+        mov rdi, r13;
+        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      mkfs_main_device_grant:
+        // ---- Real, wired, unreachable at this landing -- see
+        //      src/elevate_wire.pdx's module header. ------------------------
+        mov rdi, r15;                        // target_ptr
+        mov rax, rbx;
+        and rax, 0x1;                        // Argv::PA_FLAG_FORCE
+        mov rsi, rax;                        // force_flag
+        mov rdx, [r14 + 16];                 // journal_size (blocks)
+        call mkfs_format_run_device;          // src/format.pdx (M3, #8)
+
+        mov r13, rax;                        // exit_status
+        mov rdi, r12;                        // audit_id
+        mov rsi, r13;
+        call mkfs_audit_commit;
+
+        mov rdi, r13;
         mov rax, 60;                          // SC+ ID 60 = sys_exit
         syscall;
         hlt;
@@ -173,6 +267,10 @@ module Main = structure {
         mov rdx, 32;                         // mkfs_msg_not_implemented_len
         mov rax, 1;                          // SC+ ID 1 = sys_write
         syscall;
+
+        mov rdi, r12;                        // audit_id (M3: this path is now audit-wrapped too)
+        mov rsi, 1;                          // exit_status
+        call mkfs_audit_commit;
 
         mov rdi, 1;                          // status = 1
         mov rax, 60;                          // SC+ ID 60 = sys_exit

@@ -1,0 +1,188 @@
+// src/audit_wire.pdx — mkfs.pdxfs.M3-004 (#11) — libpdx-audit pre-write
+// journal record.
+//
+// ----------------------------------------------------------------------
+// libpdx-audit @0.2 API this file wires against
+// ----------------------------------------------------------------------
+//
+// `libpdx-audit` (paideia-satellites/libpdx-audit, @0.2, commit
+// bfc63a5) exposes a `module AuditClient` with, among others:
+//
+//   audit_begin(op_name_ptr, op_args_ptr) -> u64
+//     rdi = op_name_ptr  (NUL-terminated, copied into a 32-byte wire
+//                         field -- longer strings are truncated by the
+//                         library's own marshalling helper, not by this
+//                         file)
+//     rsi = op_args_ptr  (NUL-terminated, copied into a 128-byte wire
+//                         field, same truncation contract)
+//     returns a wire audit_id ((pid<<32)|local_id) on success, or 0 on
+//     failure (a state gate or a send failure -- disambiguated via
+//     AuditClient::audit_last_error(), not consulted by this file; see
+//     "forgiving posture" below)
+//
+//   audit_commit(audit_id, exit_code) -> u64
+//     rdi = audit_id     (the value audit_begin returned)
+//     rsi = exit_code
+//     returns AUDIT_OK (0) or an AUDIT_ERR_* code -- this file's own
+//     mkfs_audit_commit ignores the return value (see below)
+//
+// Both are cross-repo bare-label calls (`call audit_begin;`,
+// `call audit_commit;`), the identical mechanism `src/format.pdx`
+// already uses for `pdxb_encode_superblock` -- see that file's module
+// header §"Cross-repo call" for why no `extern`/import syntax is needed.
+//
+// ----------------------------------------------------------------------
+// No retain-forever UEJ_KIND exists -- this issue's own wording adjusted
+// ----------------------------------------------------------------------
+//
+// This issue's task text asks for "a retain-forever UEJ_KIND indicating
+// 'mkfs.pdxfs formatting <target> with <flags>'". A full grep of
+// `libpdx-audit`'s tree for "retain" (and for any `UEJ_KIND_*` constant
+// resembling "forever"/"permanent"/"vol_format") finds NOTHING: the only
+// `UEJ_KIND_*` constants that exist are `UEJ_KIND_TOOL_INVOKE = 130`,
+// `UEJ_KIND_TOOL_OUTPUT = 132`, `UEJ_KIND_TOOL_EXIT = 133`
+// (`src/audit_record.pdx`), none of them caller-selectable per call --
+// `AuditClient::audit_begin`/`audit_record_output`/`audit_commit` do not
+// take a "kind" parameter at all; the record kind is fixed internally by
+// which of those three entry points is called, not chosen by the caller.
+// There is therefore no "retain-forever" flag or kind this file can pass
+// -- if retention-forever semantics exist at all, they are a property of
+// the audit-journal DAEMON's own policy for `UEJ_KIND_TOOL_INVOKE`
+// records (unverifiable from this repo, since that daemon's dispatch is
+// itself stubbed -- see below), not something a client selects.
+// **Flagged for main**: if a real retain-forever kind is needed
+// specifically for volume-formatting operations, that is a
+// `libpdx-audit` feature request, not something `mkfs.pdxfs` can wire
+// against today.
+//
+// This file instead calls `audit_begin` once per invocation (which maps
+// to `UEJ_KIND_TOOL_INVOKE` internally, per libpdx-audit's own fixed
+// entry-point-to-kind mapping) with:
+//   op_name = "mkfs.pdxfs.format" or "mkfs.pdxfs.format.force" (the
+//     latter chosen when `--force` was given, so the audit trail
+//     distinguishes a bypassed-refusal invocation from a normal one --
+//     this is a REAL signal, not a placeholder, and partially closes the
+//     `REFUSED_OVERRIDDEN` audit-trail gap `src/refusal.pdx`'s own
+//     module header and `design/architecture.md` §9.5 flag, though not
+//     with that exact sub-record shape since `audit_begin` has no
+//     "refused, overridden" vocabulary of its own)
+//   op_args = the caller's actual <target> string (the real argv value,
+//     truncated to 128 bytes by libpdx-audit's own marshalling helper if
+//     longer -- not this file's concern)
+//
+// and calls `audit_commit(audit_id, exit_code)` once the format pipeline
+// (or device-target stub/denial path) has produced its real exit status.
+//
+// ----------------------------------------------------------------------
+// Forgiving posture: every outcome is non-fatal
+// ----------------------------------------------------------------------
+//
+// Per this issue's own instruction ("the audit_client call may return
+// quickly with a documented no-op -- that's fine, just log it and
+// continue"): `mkfs_audit_begin` returns whatever `audit_begin` returns,
+// including 0 on failure, with NO error branch of its own -- a 0
+// audit_id is a valid "auditing did not happen" sentinel the caller
+// (src/main.pdx) threads through unexamined. `mkfs_audit_commit` treats
+// audit_id == 0 as "nothing was opened, nothing to commit" and skips the
+// call entirely (calling `audit_commit(0, ...)` would hit
+// `AUDIT_ERR_ID_MISMATCH` inside libpdx-audit for no benefit); for a
+// non-zero audit_id, `audit_commit`'s return value is discarded --
+// this repo defines `FormatRecord::FR_RESULT_AUDIT_FAIL` for a future
+// stricter mode but does not emit it from this M3 landing (see that
+// constant's own module-header note in src/format_record.pdx). This
+// matches STATUS.md's own note (libpdx-audit STATUS.md:69-70) that "the
+// kernel-side broker dispatch is still stubbed
+// (`audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`)" --
+// calling into a stubbed daemon and getting back a quick no-op is an
+// EXPECTED outcome at this landing, not an error condition to surface.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic. Reserved-label
+// discipline: every branch label in this file is prefixed `mkfs_audit_`.
+//
+// Upstream: paideia-satellites/libpdx-audit @0.2 (commit bfc63a5),
+// src/audit_client.pdx (AuditClient::audit_begin/audit_commit),
+// src/audit_record.pdx (UEJ_KIND_*/AUDIT_* constants); paideia-os#1997
+// (audit-journal daemon dispatch stub, referenced by this issue's own
+// task text).
+
+module AuditWire = structure {
+
+  // --- op_name literals (see module header for why two, and why they
+  //     are the real per-invocation signal rather than a placeholder).
+  //     Lengths verified via `python3 -c "print(len(...))"`. -------------
+  pub let mkfs_audit_lit_op_name       : [u8; 18] = "mkfs.pdxfs.format\0"
+  pub let mkfs_audit_lit_op_name_force : [u8; 24] = "mkfs.pdxfs.format.force\0"
+
+  // ==========================================================================
+  // mkfs_audit_begin(target_ptr, force_flag) -> u64
+  //   (the wire audit_id AuditClient::audit_begin returned, or 0 -- see
+  //   module header's "forgiving posture" note; never examined by any
+  //   branch in this function)
+  //
+  //   rdi = target_ptr  (NUL-terminated <target> string, passed through
+  //                       verbatim as audit_begin's op_args)
+  //   rsi = force_flag  (0 or 1 -- selects which op_name literal to use)
+  //
+  // No push/pop needed: the only value that must survive past a
+  // register-clobbering event is target_ptr, and the one `call
+  // audit_begin` below is a plain SysV `call` (not a `syscall` trap --
+  // the kernel's #743 caller-save-zeroing hardening this repo's other
+  // files work around applies only to the `syscall` instruction, not to
+  // an ordinary cross-repo `call`), so staging target_ptr in the
+  // caller-save `rax` register across the branch below (before the
+  // call, not across it) is safe.
+  // ==========================================================================
+  pub let mkfs_audit_begin : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (target_ptr: u64) (force_flag: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mkfs.pdxfs.M3-004 (#11): mkfs_audit_begin entry point. rax = target_ptr (staged from rdi before rdi is repurposed for the op_name literal pointer below -- safe, no syscall trap intervenes). `cmp rsi, 0; je mkfs_audit_begin_no_force` selects mkfs_audit_lit_op_name_force when --force was set, else mkfs_audit_lit_op_name; each arm does `lea rdi, [rip + <literal>]` then falls into mkfs_audit_begin_have_name. `mov rsi, rax` (op_args = target_ptr, restored from staging). `call audit_begin` (libpdx-audit, cross-repo bare-label call -- same mechanism as src/format.pdx's `call pdxb_encode_superblock`). Its return value (rax) IS this function's return value verbatim -- no examination, per module header's forgiving posture. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_audit_.",
+      block: {
+        mov rax, rdi;                       // stage target_ptr
+
+        cmp rsi, 0;
+        je mkfs_audit_begin_no_force;
+
+        lea rdi, [rip + mkfs_audit_lit_op_name_force];
+        jmp mkfs_audit_begin_have_name;
+
+      mkfs_audit_begin_no_force:
+        lea rdi, [rip + mkfs_audit_lit_op_name];
+
+      mkfs_audit_begin_have_name:
+        mov rsi, rax;                       // op_args = target_ptr
+        call audit_begin;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_audit_commit(audit_id, exit_code) -> ()
+  //
+  //   rdi = audit_id    (mkfs_audit_begin's return value -- 0 means "no
+  //                       audit record was opened", see below)
+  //   rsi = exit_code   (the real process exit status this invocation is
+  //                       about to return)
+  //
+  // audit_id == 0 short-circuits to a no-op (nothing to commit); a
+  // non-zero audit_id calls AuditClient::audit_commit and discards its
+  // return value entirely, per module header's forgiving posture.
+  // ==========================================================================
+  pub let mkfs_audit_commit : (u64, u64) -> () !{mem, sysreg} @{cap, sched} =
+    fn (audit_id: u64) (exit_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mkfs.pdxfs.M3-004 (#11): mkfs_audit_commit entry point. `cmp rdi, 0; je mkfs_audit_commit_skip` -- a zero audit_id (mkfs_audit_begin's own failure/no-op sentinel) means nothing was opened, so there is nothing to commit; calling AuditClient::audit_commit(0, ...) would only produce a meaningless AUDIT_ERR_ID_MISMATCH inside libpdx-audit. Otherwise `call audit_commit` with rdi/rsi already in the correct (audit_id, exit_code) position from this function's own incoming arguments -- no register shuffling needed. Return value discarded (no `mov`, the call's rax is simply never read) per module header's forgiving posture. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_audit_.",
+      block: {
+        cmp rdi, 0;
+        je mkfs_audit_commit_skip;
+
+        call audit_commit;
+
+      mkfs_audit_commit_skip:
+        ret;
+      }
+    }
+}

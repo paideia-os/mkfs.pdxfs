@@ -48,6 +48,71 @@
 // label discipline: every branch label in this file is prefixed
 // `mkfs_target_`.
 //
+// ----------------------------------------------------------------------
+// mkfs.pdxfs.M3-001 (#8) — device-cap slot parsing, and why validation +
+// narrowing are STUBs
+// ----------------------------------------------------------------------
+//
+// This issue asks for three things once a target classifies
+// TARGET_DEVICE_CAP: (1) parse the cap slot number out of
+// "cap:blkdev:0xNN", (2) validate that slot references a
+// KIND_BLOCK_DEVICE (or KIND_BLKDEV) cap, (3) narrow the caller's cap to
+// write-only. Only (1) is implementable today:
+//
+//   (1) REAL: `mkfs_dev_parse_slot` below parses the hex digits after
+//       the "cap:blkdev:" prefix (with an optional "0x"/"0X" lead)
+//       into a u64. This is a genuine, tested-shape hex parser -- not a
+//       placeholder -- following the same "malformed input silently
+//       yields a partial/zero result" contract src/argv.pdx's
+//       `argv_parse_u64_dec` already documents for its own decimal
+//       parser.
+//
+//   (2) STUB: a repo-tree grep for a cap-introspection primitive
+//       (`cap_query`, `cap_info`, `sys_cap_kind_of`, or the historically
+//       planned `sys_cap_query`) finds no landed implementation
+//       anywhere in the paideia-os kernel as of this landing --
+//       `design/audit/entries/r13-m5-003-syscall-table.md` and
+//       `design/milestones/r13-preflight.md` both show `sys_cap_query`
+//       planned at R13 but never implemented ("no cap_query symbol;
+//       R13-m2 milestone-gated", still true today per a fresh grep of
+//       `design/user/syscall-table.md`, refreshed through sysno 95,
+//       which has no `cap_query`/`cap_info` entry at any number). There
+//       is therefore no syscall this repo could call to ask "what kind
+//       does slot N hold" -- `mkfs_dev_parse_slot`'s output is used by
+//       `src/format.pdx`'s device pipeline WITHOUT this validation step,
+//       which is flagged here (and in design/architecture.md §11) as an
+//       open gap for main/osarch, not silently skipped.
+//
+//   (3) STUB: no `cap_narrow`/`sys_cap_narrow`/`cap_restrict` primitive
+//       exists anywhere in `src/kernel/` either (confirmed by the same
+//       grep). The closest real mechanism this kernel has is MINT-TIME
+//       rights reduction (e.g. `blkdev_cap_mint(controller_idx, nsid,
+//       rights)`, `src/kernel/core/cap/blkdev_cap.pdx`) -- narrowing an
+//       ALREADY-HELD cap in place is not a thing this kernel supports;
+//       `design/tooling/volume-lifecycle-mechanism.md`'s own wording
+//       calls minting a new, more-restricted child cap "the standard
+//       cap-narrowing discipline, no new mechanism". This repo does not
+//       hold a bus/devfn pair to mint a fresh `blkdev_cap` against (the
+//       `cap:blkdev:0xNN` URI's `NN` is a SLOT number in the invoker's
+//       own cap table, per this design doc's own §3.2 wording -- not a
+//       bus/devfn pair sys_cap_request-style minting needs), so even
+//       the mint-a-narrower-child-cap path is not constructible from
+//       what this file has. `src/format.pdx`'s device pipeline therefore
+//       does not attempt any narrowing call at all -- it is a documented
+//       STUB, not a call to an invented primitive.
+//
+// Also confirmed via `design/hardware/nvme-ahci-tail-milestones.md`
+// §3.1 (superseding this repo's own M1 caps.decl note): the
+// `KIND_BLOCK_DEVICE` name this design doc and this repo's caps.decl use
+// is purely a doc-readability alias for the REAL, already-landed
+// `KIND_BLKDEV = 0x42` (`src/kernel/core/cap/kind_blkdev.pdx`) -- there
+// is no separate kind at the previously-flagged 0x198..0x19F band. The
+// "naming gap" this repo's M1 caps.decl and design/architecture.md §6
+// flagged as needing osarch confirmation is RESOLVED: `KIND_BLOCK_DEVICE`
+// and `KIND_BLKDEV` name the same kind, `0x42`. What remains unresolved
+// (see (2)/(3) above) is not the NAME but the ABSENCE of any
+// query/narrow primitive to act on a cap of that kind from ring-3.
+//
 // Upstream: design/tooling/volume-tooling-ux.md §3.2 (paideia-os).
 
 module Target = structure {
@@ -177,6 +242,86 @@ module Target = structure {
 
       mkfs_target_invalid:
         mov rax, 2;                         // TARGET_INVALID
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_dev_parse_slot(target_ptr) -> u64
+  //
+  // Parses the cap slot number out of a target already classified
+  // TARGET_DEVICE_CAP (target_ptr's first 11 bytes are "cap:blkdev:" --
+  // this function trusts that and does not re-check it). Skips an
+  // optional "0x"/"0X" lead, then accumulates hex digits (0-9, A-F, a-f)
+  // via shl-by-4 (compile-time-constant multiply by 16, this codebase's
+  // established shl-decomposition convention -- no `imul`/`mul`) until
+  // the first non-hex-digit byte (including a trailing NUL), matching
+  // `argv_parse_u64_dec`'s own "malformed input silently yields a
+  // partial/zero result" contract. See module header (M3-001, #8) for
+  // why this is the one REAL piece of device-cap target resolution this
+  // landing implements, and why kind-validation + narrowing are STUBs.
+  //
+  // Pure leaf: rax/rcx/rdi are all SysV caller-save, no push/pop.
+  // ==========================================================================
+  pub let mkfs_dev_parse_slot : (u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.M3-001 (#8): mkfs_dev_parse_slot entry point. target_ptr in rdi. `add rdi, 11` (target_lit_cap_blkdev_len) skips the trusted 'cap:blkdev:' prefix. Optional '0x'/'0X' lead: xor+mov_b loads [rdi] into rax; `cmp rax, 0x30; jne mkfs_dev_ps_hexloop_init` (not '0', no lead to skip); else xor+mov_b loads [rdi+1] into rcx; `cmp rcx, 0x78; je mkfs_dev_ps_skip_prefix` ('x'); `cmp rcx, 0x58; je mkfs_dev_ps_skip_prefix` ('X'); else falls through to mkfs_dev_ps_hexloop_init (a bare '0' with no x/X after it is itself a valid leading hex digit, correctly left for the loop to consume). mkfs_dev_ps_skip_prefix: `add rdi, 2`. mkfs_dev_ps_hexloop_init: `xor rax, rax` (accumulator, reusing the register the prefix check already used -- safe, that value is dead). Loop (mkfs_dev_ps_hexloop): xor+mov_b loads [rdi] into rcx. Three disjoint ranges, each ending in a `sub rcx, <base>` mapping the ASCII byte to its 0..15 value: '0'..'9' (`cmp rcx,0x30; jl done`; `cmp rcx,0x39; jg check_upper`; `sub rcx,0x30`); 'A'..'F' (`cmp rcx,0x41; jl done`; `cmp rcx,0x46; jg check_lower`; `sub rcx,0x37`, since 0x41-10=0x37); 'a'..'f' (`cmp rcx,0x61; jl done`; `cmp rcx,0x66; jg done`; `sub rcx,0x57`, since 0x61-10=0x57) -- any byte outside all three ranges (including NUL) falls to mkfs_dev_ps_done. On a matched digit: `shl rax, 4; add rax, rcx; add rdi, 1; jmp mkfs_dev_ps_hexloop`. mkfs_dev_ps_done: `ret` with rax holding the accumulated value. Pure leaf -- rax/rcx/rdi all SysV caller-save, no push/pop. No `add reg,[mem]` (every store target is a register). No `test` -- every check is `cmp reg,imm`. Labels prefixed mkfs_dev_ps_.",
+      block: {
+        add rdi, 11;                        // skip "cap:blkdev:" (target_lit_cap_blkdev_len)
+
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0x30;                       // '0'
+        jne mkfs_dev_ps_hexloop_init;
+
+        xor rcx, rcx;
+        mov_b rcx, [rdi + 1];
+        cmp rcx, 0x78;                       // 'x'
+        je mkfs_dev_ps_skip_prefix;
+        cmp rcx, 0x58;                       // 'X'
+        je mkfs_dev_ps_skip_prefix;
+        jmp mkfs_dev_ps_hexloop_init;
+
+      mkfs_dev_ps_skip_prefix:
+        add rdi, 2;
+
+      mkfs_dev_ps_hexloop_init:
+        xor rax, rax;                        // accumulator
+
+      mkfs_dev_ps_hexloop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+
+        cmp rcx, 0x30;                       // '0'
+        jl mkfs_dev_ps_done;
+        cmp rcx, 0x39;                       // '9'
+        jg mkfs_dev_ps_check_upper;
+        sub rcx, 0x30;
+        jmp mkfs_dev_ps_have_digit;
+
+      mkfs_dev_ps_check_upper:
+        cmp rcx, 0x41;                       // 'A'
+        jl mkfs_dev_ps_done;
+        cmp rcx, 0x46;                       // 'F'
+        jg mkfs_dev_ps_check_lower;
+        sub rcx, 0x37;                       // 'A' - 10
+        jmp mkfs_dev_ps_have_digit;
+
+      mkfs_dev_ps_check_lower:
+        cmp rcx, 0x61;                       // 'a'
+        jl mkfs_dev_ps_done;
+        cmp rcx, 0x66;                       // 'f'
+        jg mkfs_dev_ps_done;
+        sub rcx, 0x57;                       // 'a' - 10
+
+      mkfs_dev_ps_have_digit:
+        shl rax, 4;
+        add rax, rcx;
+        add rdi, 1;
+        jmp mkfs_dev_ps_hexloop;
+
+      mkfs_dev_ps_done:
         ret;
       }
     }

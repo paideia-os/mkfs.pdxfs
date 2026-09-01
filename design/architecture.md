@@ -21,11 +21,15 @@ substrate, R53 = user-facing path to format/mount/unmount).
 performs its own syscalls directly (self-contained inlined-syscall
 pattern), matching the `src/user/true.pdx` / `cat.pdx` / `mkdir.pdx`
 convention in the paideia-os monorepo, rather than delegating every
-kernel touch to a linked library. The one library it links,
-`libpdx-volume`, supplies the PDXB wire-format codec (`src/format.pdx`'s
-`mkfs_format_run` calls its `pdxb_encode_superblock` directly as of
-M2 — see §9) and, from M3 onward, the signing helper — not process
-lifecycle, argv, or output.
+kernel touch to a linked library. As of M3 it links four satellite
+libraries by bare cross-repo `call` (§9.6's mechanism): `libpdx-volume`
+(PDXB wire-format codec + ML-DSA-65 superblock signing, both real) and
+`libpdx-audit` (real journal-record open/commit calls, though the
+daemon dispatch behind them is stubbed). Two more are DELIBERATELY NOT
+linked despite being available: `libpdx-semantic-pipe` (real, released,
+but its schema-name resolution is inert — §11.3) and `libpdx-elevate`
+(real, mature, but this repo has no broker-endpoint cap to call its
+real API with — §11.5). See §11 for the full M3 write-up.
 
 `mkfs.pdxfs` writes a fresh PDXB v1 superblock + empty allocator bitmap
 + empty journal ring + a single root-inode entry onto a target, per
@@ -35,9 +39,9 @@ workflow).
 
 ## 2. Module split
 
-Six source files as of M2, one per major concern (matches
+Ten source files as of M3, one per major concern (matches
 `libpdx-volume`'s and `libpdx-audit`'s own "one module per
-public-entry-point family" granularity):
+public-entry-point family" granularity). The six from M1/M2:
 
 - **`src/main.pdx`** (`Main`) — `_start`. Wires argv parsing → target
   classification → (on `--dry-run`) the M1 preview emit path, OR (on a
@@ -74,13 +78,32 @@ public-entry-point family" granularity):
   decimal-errno printer.
 
 Kept as separate files rather than a `main.pdx` monolith because each
-has a distinct, independently-testable contract. `target.pdx` still
-grows a real cap-resolution body at M3-001 (device-cap path);
-`format_record.pdx` still grows the full 14-field semantic-pipe emit at
-M3-003 (both of `format_record.pdx`'s current emitters are line-based
-text, not a schema-bound record); `argv.pdx` potentially gets replaced
-wholesale by a `libpdx-argv`-backed rewrite — none of which should
-require touching the other files.
+has a distinct, independently-testable contract. `argv.pdx` potentially
+gets replaced wholesale by a `libpdx-argv`-backed rewrite — which
+should not require touching the other files.
+
+Four new files at M3 (see §11 for the full write-up of each):
+
+- **`src/pipe_wire.pdx`** (`PipeWire`, #10) — `mkfs_sp_emit_dry_run` /
+  `mkfs_sp_emit_result`, thin wrappers around `FormatRecord`'s two
+  emitters that print a documented deferral header first (see §11.3
+  for why `libpdx-semantic-pipe` is not linked). `main.pdx` and
+  `format.pdx` now call ONLY these wrappers, never `FormatRecord`
+  directly.
+- **`src/audit_wire.pdx`** (`AuditWire`, #11) — `mkfs_audit_begin` /
+  `mkfs_audit_commit`, wrapping `libpdx-audit`'s real
+  `AuditClient::audit_begin`/`audit_commit` in a forgiving, non-fatal
+  posture. `main.pdx`'s `_start` calls these around every dispatch
+  branch.
+- **`src/elevate_wire.pdx`** (`ElevateWire`, #12) — `mkfs_elev_require_
+  device_write`, a documented fail-closed stub (always DENY) for the
+  device-target elevation gate — see §11.5 for why a real call cannot
+  be honestly constructed yet.
+- `target.pdx` gains `mkfs_dev_parse_slot` (#8, a real hex-slot parser)
+  and `format.pdx` gains `mkfs_format_run_device` (#8, a documented
+  stub) and superblock signing inside `mkfs_format_run` (#9) — these
+  are extensions of existing files, not new ones, since each was
+  already the natural owner of that concern.
 
 ## 3. `libpdx-argv` availability — confirmed absent, minimal parser shipped instead
 
@@ -191,23 +214,24 @@ already satisfies it exactly. **Flagged for main**: if the narrower
 `/`-only reading was intentional, `target_classify`'s two extra branches
 (`~`, `.`) should be removed in a follow-up; this landing keeps them.
 
-## 6. `KIND_BLOCK_DEVICE` naming gap (flagged for main)
+## 6. `KIND_BLOCK_DEVICE` naming gap — RESOLVED at M3
 
 `caps.decl` documents this in full; summarized here for visibility.
 `design/tooling/volume-tooling-ux.md` names the device-cap kind
 `KIND_BLOCK_DEVICE` at a `0x198..0x19F` ordinal band "per §12
-coordination point 1 (osarch, R51)" — i.e. a kind that has not yet
-landed kernel-side under that name. The kernel tree as of this landing
-already has a **different**, already-landed kind at
-`src/kernel/core/cap/kind_blkdev.pdx`: `KIND_BLKDEV = 0x42`. This
-repo's `caps.decl` declares the design doc's own placeholder name
-(`KIND_BLOCK_DEVICE`) rather than silently substituting the existing
-`KIND_BLKDEV`, since the two kinds' tail shapes and rights bands have
-not been audited against each other and may not be interchangeable.
-**Confirm with osarch before `mkfs.pdxfs.M3-001`** (device-cap target
-path) implements a real mint/narrow call against either kind — this
-mirrors the exact shape of the `KIND_PDXFS_MOUNT_TABLE` discrepancy
-`libpdx-volume`'s own `design/architecture.md` §4 flags for main.
+coordination point 1 (osarch, R51)". At M1/M2 this repo flagged that as
+possibly a *different* kind from the already-landed
+`src/kernel/core/cap/kind_blkdev.pdx`'s `KIND_BLKDEV = 0x42`, needing
+osarch confirmation before minting/narrowing against either.
+
+**Resolved at M3** (§11.1 has the full write-up): `design/hardware/
+nvme-ahci-tail-milestones.md` §3.1 (paideia-os) confirms `KIND_BLOCK_
+DEVICE` is purely a doc-readability alias for `KIND_BLKDEV = 0x42` —
+there is no separate kind at the `0x198..0x19F` band; `design/tooling/
+volume-tooling-ux.md`'s own `0x198..0x19F` wording is superseded and
+stale. What remains unresolved is NOT the name but the absence of any
+cap-introspection or cap-narrowing primitive to act on a `KIND_BLKDEV`
+cap from ring-3 — see §11.1.
 
 ## 7. Register-preservation discipline (a correctness note, not upstream-sourced)
 
@@ -438,42 +462,208 @@ define," resolved by whatever final link step assembles the runnable
 image. No new build-system work was needed to make this call; `format.pdx`
 simply relies on the same mechanism `main.pdx` already exercised at M1.
 
-## 10. What M3 needs before it can open
+## 10. What M3 needed before it opened (historical — M3 has now landed)
 
-- `mkfs.pdxfs.M3-001` (device-cap target) needs the `KIND_BLOCK_DEVICE`
-  naming gap (§6) resolved with osarch.
-- `mkfs.pdxfs.M3-002` (signing) needs the paideia-as `mldsa65_sign`
-  intrinsic reachable through `libpdx-volume` — landed at
-  `libpdx-volume` commit `052cbac` (M3 there): `pdxb_sign_superblock`
-  is real as of that commit. `mkfs.pdxfs.M2` deliberately does not call
-  it — every superblock this M2 landing writes is unsigned (the `sig`
-  region stays zeroed, matching §3.4's "file-backed target, no
-  `--sig-key`" discipline) — so `M3-002` is a clean, additive wiring
-  task: call `pdxb_sign_superblock` after `pdxb_encode_superblock`
-  when `--sig-key` is given, with no M2 code to unwind first.
-- `mkfs.pdxfs.M3-003` (semantic-pipe emit) needs to replace/extend BOTH
-  of `format_record.pdx`'s current text-line emitters
-  (`format_record_emit_dry_run` from M1, `format_record_emit_result`
-  from M2) with the full 14-field schema-bound record — see §9.6's
-  sibling note in §4 above.
-- `mkfs.pdxfs.M3-004` (audit) needs to backfill the `REFUSED_OVERRIDDEN`
-  sub-record §9.5 flags — `--force` currently overrides `refusal.pdx`'s
-  gate with zero audit trace, which the upstream design doc's own §3.3
-  text says should never happen.
-- `mkfs.pdxfs.M3-005` (elevate) needs a `libpdx-elevate` implementation
-  to exist — as of this landing, `libpdx-elevate` has the same
-  "design-doc-mentioned, not yet bootstrapped" status `libpdx-argv` had
-  per §3 above; confirm before M3-005 opens whether it should also ship
-  a minimal inline fallback.
-- Separately from M3 proper: §9.1 flags that a `--size=`-equivalent
-  flag and real `data_lba`/`data_bcount` computation are needed before
-  any volume this tool formats has a usable data region — worth
-  scoping into either M3 or a dedicated follow-up issue.
-- Also separate from M3 proper (flagged in `caps.decl`): M2's write
-  pipeline and refusal gate open/read/write/close the target via BARE
-  syscalls on the raw path string, never through a minted
-  `KIND_PDXFS_FILE` cap — that KIND is declared in `caps.decl` but
-  touched by no code path in this repo. Whether `mkfs.pdxfs` (which
-  runs pre-mount, against a target that is not yet a valid PdxFS
-  volume) should route through a cap here at all is unresolved;
-  confirm with osarch.
+This section originally listed M3's prerequisites; kept for history.
+All five sub-issues landed (see §11 for the full write-up of each):
+`libpdx-elevate` turned out to exist (contrary to this section's guess
+that it might not) but with an API shape too different from this
+issue's assumption to call for real (§11.5); `libpdx-semantic-pipe`
+also exists and is released, but its schema-registry dependency is
+inert (§11.3); `libpdx-volume`'s `pdxb_sign_superblock` landed exactly
+as this section anticipated and is now wired for real (§11.2). Two
+items this section flagged as "separate from M3 proper" remain OPEN
+after M3 (see §11.6 for the current status of both): the `--size=`
+data-region gap, and the bare-syscall-vs-`KIND_PDXFS_FILE`-cap
+question.
+
+## 11. M3 landing (#8-#12) — device target, signing, semantic-pipe,
+audit, elevate
+
+### 11.1 `mkfs.pdxfs.M3-001` (#8) — device-cap target: one real piece,
+two confirmed-absent primitives
+
+The naming gap §6 flagged is resolved (`KIND_BLOCK_DEVICE` = `KIND_
+BLKDEV` = `0x42`, per `design/hardware/nvme-ahci-tail-milestones.md`
+§3.1). What blocks a full device-target implementation is not the name
+but two primitives a fresh grep confirms do not exist anywhere in this
+kernel:
+
+- **Cap introspection.** `sys_cap_query` was PLANNED at R13 (`design/
+  milestones/r13-preflight.md`, `design/audit/entries/r13-m5-003-
+  syscall-table.md`: "no cap_query symbol; R13-m2 milestone-gated") but
+  never implemented — `design/user/syscall-table.md` (refreshed
+  through sysno 95) has no `cap_query`/`cap_info` entry at any number.
+  There is no syscall this repo could call to validate that a
+  `cap:blkdev:0xNN` slot actually holds a `KIND_BLKDEV` cap.
+- **Cap narrowing.** No `cap_narrow`/`sys_cap_narrow`/`cap_restrict`
+  primitive exists in `src/kernel/` either. The closest real mechanism
+  is MINT-TIME rights reduction (e.g. `blkdev_cap_mint(controller_idx,
+  nsid, rights)`) — `design/tooling/volume-lifecycle-mechanism.md`
+  calls this "the standard cap-narrowing discipline, no new
+  mechanism". But minting a fresh, narrower `blkdev_cap` needs a
+  `(controller_idx, nsid)` or `(bus, devfn)` pair, not the SLOT number
+  a `cap:blkdev:0xNN` URI names (per `volume-tooling-ux.md` §3.2, `NN`
+  is a slot in the invoker's own cap table) — even the mint-a-
+  narrower-child-cap path is not constructible from what this repo has.
+
+`src/target.pdx`'s new `mkfs_dev_parse_slot` is therefore the one REAL
+piece of this issue: a working hex-slot parser (with an optional
+`0x`/`0X` lead), following the same "malformed input silently yields a
+partial/zero result" contract `argv_parse_u64_dec` already established.
+`src/format.pdx`'s new `mkfs_format_run_device` calls it, then
+immediately emits `PdxFsFormatRecord@0.1 { result_code:
+DEVICE_TARGET_STUB }` — no write of any kind is attempted, since (per
+this issue's own fallback instruction) a grep of `design/user/syscall-
+table.md` finds only `blkdev_cap_request` (sysno 74, cap-MINTING) and
+no block-granularity `sys_blkdev_write`/`sys_blkdev_read`-shaped
+syscall at all.
+
+### 11.2 `mkfs.pdxfs.M3-002` (#9) — superblock signing, real call +
+placeholder seed
+
+`libpdx-volume`'s M3 landing (commit `6f18957`) ships a real
+`pdxb_sign_superblock(sb_ptr, seed_ptr, out_sig_ptr, out_sig_len) ->
+u64`. Two things this repo's own M2-era anticipation got slightly
+wrong, both now corrected in `src/format.pdx`'s module header:
+
+- The signing argument is `seed_ptr` (a raw 32-byte-seed pointer), NOT
+  `sig_key_slot` (a `KIND_SIG_KEY` cap slot) — `libpdx-volume`'s own
+  module header explains the rename: `KIND_SIG_KEY` as landed is a
+  PUBLIC-key handle, and no kernel capability kind anywhere holds a
+  private ML-DSA-65 signing seed. `mkfs.pdxfs` therefore never
+  dereferences `KIND_SIG_KEY` (still an untouched M1 placeholder).
+- The call signs bytes `[0,696)` of the FULL 4096-byte encoded
+  superblock (not the 176-byte `PdxbSuperblockSummary`) and writes its
+  3309-byte output wherever `out_sig_ptr` points — `mkfs_format_run`
+  passes `&mkfs_format_sb_encoded + 696` so the signature lands exactly
+  at this issue's own instruction, `sb_ptr[696..696+3309)`, in place,
+  before the buffer is written to the target.
+
+**Seed-key strategy**: every superblock is signed with a PLACEHOLDER
+all-zero 32-byte seed (`mkfs_sign_seed_zero`), regardless of whether
+`--sig-key` was given — real seed-loading needs a `libpdx-key`-
+equivalent library that does not exist anywhere in
+`paideia-satellites/` as of this landing (the same "design-doc-
+mentioned, not yet bootstrapped" status `libpdx-argv` had at M1). This
+produces a well-FORMED ML-DSA-65 signature (real intrinsic, real
+696-byte message) that will NOT verify against any real public key —
+cryptographically inert, not merely absent. **Flagged for main**: this
+is loud and deliberate per this issue's own acceptance text ("use a
+placeholder seed... and document"), not a silent regression; the fix
+is a real seed-loading path landing in a future library. Every
+file-target success record now reads `result_code: SIGNED_OK`
+(`FR_RESULT_SIGNED_OK = 8`) rather than M2's `OK = 0`.
+
+### 11.3 `mkfs.pdxfs.M3-003` (#10) — semantic-pipe: real library, inert
+registry, documented fallback
+
+`libpdx-semantic-pipe` (github.com/paideia-os/libpdx-semantic-pipe) is
+real and released (v1.0.0, wave R49, M1-M5 landed) with a working
+`Send::send_record(fd, rec_ptr, rec_len)` framing entry point. But
+schema-NAME resolution — `Registry::bind_by_name(fd, name_ptr,
+name_len)`, the piece this repo would need to bind
+`"PdxFsFormatRecord"` to a hash two independently-built tools can agree
+on — is confirmed INERT via GitHub issue **paideia-os#2000** ("R90-
+XREPO.006 Stand up libpdx-schema-registry service"): the backing
+`svc.schema-registry` service does not exist, so `bind_by_name` always
+returns 304 (LOOKUP_FAIL). The one real adopter, `ls`, works around
+this by hand-imprinting a placeholder hash meaningful only to itself —
+a pattern this repo's `src/pipe_wire.pdx` module header explicitly
+declines to copy, since `mkfs.pdxfs` has no reader in this monorepo to
+agree on such a hash with, and doing so would look real without being
+real.
+
+Per this issue's own fallback instruction, `mkfs.pdxfs` does not link
+`libpdx-semantic-pipe` at M3. `src/pipe_wire.pdx`'s two wrappers
+(`mkfs_sp_emit_dry_run`, `mkfs_sp_emit_result`) print one documented
+deferral header line ("semantic-pipe emit deferred
+(svc.schema-registry not yet live, paideia-os#2000)...") immediately
+before delegating, unchanged, to `FormatRecord`'s existing line-based
+emitters. `src/main.pdx` and `src/format.pdx` now call ONLY these
+wrappers — the only call sites that will need to change once
+`libpdx-schema-registry` lands and #2000 closes.
+
+### 11.4 `mkfs.pdxfs.M3-004` (#11) — `libpdx-audit`: real calls, no
+retain-forever kind, forgiving posture
+
+`src/audit_wire.pdx` wraps `libpdx-audit`'s (@0.2, commit `bfc63a5`)
+real `AuditClient::audit_begin`/`audit_commit` around EVERY `_start`
+dispatch branch — file dry-run, file real-write, device-target
+grant/deny, and "not yet implemented" all now open and commit an audit
+record.
+
+This issue's own task text asked for "a retain-forever `UEJ_KIND`" —
+a full grep of `libpdx-audit`'s tree for "retain" (and for any kind
+resembling "forever"/"permanent"/"vol_format") finds NOTHING. The only
+`UEJ_KIND_*` constants that exist are `UEJ_KIND_TOOL_INVOKE = 130`,
+`UEJ_KIND_TOOL_OUTPUT = 132`, `UEJ_KIND_TOOL_EXIT = 133` — none
+caller-selectable; `audit_begin` takes only `(op_name_ptr,
+op_args_ptr)`, no kind parameter at all. **Flagged for main**: if
+retain-forever semantics matter specifically for volume-formatting
+audit records, that is a `libpdx-audit` feature request. This repo
+instead encodes the one real signal it can — `op_name` is
+`"mkfs.pdxfs.format"` or `"mkfs.pdxfs.format.force"` depending on
+`--force` — and `op_args` is the real `<target>` string.
+
+Every outcome is treated as non-fatal, per this issue's own
+instruction: `mkfs_audit_begin` never examines `audit_begin`'s return
+value (0 on failure is a valid "did not audit" sentinel threaded
+through unexamined); `mkfs_audit_commit` skips the call entirely when
+`audit_id == 0` and discards `audit_commit`'s return value otherwise.
+This matches libpdx-audit's own STATUS.md, which confirms the
+audit-journal daemon's broker dispatch is still stubbed
+(`audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`) — a
+real call getting back a quick no-op is expected, not an error.
+`FormatRecord::FR_RESULT_AUDIT_FAIL` is defined for a future stricter
+mode but is unreachable from this landing's forgiving posture.
+
+### 11.5 `mkfs.pdxfs.M3-005` (#12) — `libpdx-elevate`: real library,
+wrong assumed API, fail-closed stub
+
+This issue's assumed API — `elevate_client_require(RESOURCE_KIND=
+KIND_BLOCK_DEVICE, action=WRITE, target=<dev_slot>)` — does not exist
+anywhere in `libpdx-elevate`'s real (4844 LOC, mature) source. Its
+actual model is a capability-BITMASK `row_id` handle:
+`elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf,
+mint_ctx_buf) -> row_id`, which REQUIRES the caller to already hold a
+`KIND_IPC_ENDPOINT` cap over the elevate broker at a `parent_ep_slot`
+— a prerequisite `libpdx-elevate`'s own README calls "declared by
+whatever the caller links this library into, not by libpdx-elevate."
+`mkfs.pdxfs`'s own `caps.decl` still carries `KIND_ELEVATE_CHANNEL =
+0x191` as the M1 PLACEHOLDER it always was — no osarch coordination
+has minted this repo a real broker-endpoint cap, and this M3 landing
+does not change that.
+
+Rather than fabricate a plausible-looking `elevate_client_acquire`/
+`elevate_client_require` sequence against fields this repo cannot
+honestly populate (`target_cap_kind`/`target_cap_rights` are opaque to
+`libpdx-elevate` itself — no coordinated `KIND_BLKDEV`-write value
+exists to pass), `src/elevate_wire.pdx`'s `mkfs_elev_require_device_
+write` always returns `MKFS_ELEV_DENY`. This is deliberately
+fail-closed, not a fabricated denial of a request that was never sent:
+"cannot prove GRANT" and "DENY" are the same externally observable
+outcome given the missing prerequisite. `src/main.pdx`'s
+`mkfs_main_device_grant` arm (and `src/format.pdx`'s
+`mkfs_format_run_device`) are real, wired code kept for the day a
+broker-endpoint cap and a resolved `target_cap_kind`/`target_cap_rights`
+pair exist — at which point only `mkfs_elev_require_device_write`'s
+body needs to change, not any caller.
+
+### 11.6 What remains open after M3
+
+- The `--size=`-equivalent flag and real `data_lba`/`data_bcount`
+  computation §9.1 flagged are STILL open — M3's five issues did not
+  touch this.
+- The bare-syscall-vs-`KIND_PDXFS_FILE`-cap question (`caps.decl`) is
+  STILL open for the same reason.
+- Device-target support end-to-end needs, in order: (1) a
+  `sys_cap_query`-equivalent (§11.1), (2) a real block-granularity
+  write syscall (§11.1), (3) `mkfs.pdxfs` acquiring a real
+  `KIND_ELEVATE_CHANNEL` broker-endpoint cap and a coordinated
+  `KIND_BLKDEV`-write `target_cap_kind`/`target_cap_rights` value with
+  osarch (§11.5) — none of which is close to landing as of this M3.
+- Real seed-key loading for signing (§11.2) needs a `libpdx-key`-
+  equivalent library.
+- `libpdx-schema-registry` (GitHub paideia-os#2000) needs to land
+  before `src/pipe_wire.pdx` can bind a real schema by name (§11.3).

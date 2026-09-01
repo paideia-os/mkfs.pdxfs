@@ -127,3 +127,66 @@
 # against, not yet touched" posture above is unchanged for every KIND
 # except KIND_USER, which M2 also does not touch (invoker attribution
 # is still mkfs.pdxfs.M3-004, audit integration).
+#
+# M3 landing status (see STATUS.md, design/architecture.md §11): four
+# new satellite-library links, one KIND naming resolution, no new
+# syscalls of this repo's own.
+#
+# consumed_satellite_libs (all cross-repo bare-label `call`s, the same
+# mechanism M2's `pdxb_encode_superblock` call already used -- see
+# design/architecture.md §9.6):
+#
+#   libpdx-volume (@ commit 6f18957, M3) -- `pdxb_sign_superblock`
+#     (src/format.pdx's mkfs_format_run, #9). REAL: signs every
+#     file-target superblock in place with a PLACEHOLDER all-zero
+#     32-byte seed (real seed-loading needs a `libpdx-key`-equivalent
+#     that does not exist yet -- see src/format.pdx's own module
+#     header). Does NOT touch KIND_SIG_KEY (0x1A3, still a placeholder
+#     per M1 -- confirmed by libpdx-volume's own architecture.md §8.2
+#     that KIND_SIG_KEY is a public-key handle, not a private seed;
+#     `pdxb_sign_superblock`'s `seed_ptr` argument is a raw pointer, not
+#     a cap slot).
+#
+#   libpdx-audit (@0.2, commit bfc63a5) -- `AuditClient::audit_begin`,
+#     `AuditClient::audit_commit` (src/audit_wire.pdx, #11). REAL calls
+#     (real IPC send attempts), but the daemon-side dispatch is
+#     confirmed STUBBED (libpdx-audit's own STATUS.md:69-70:
+#     `audit_journal_broker_dispatch` returns `AJB_DISPATCH_STUB`) --
+#     every call in this landing may therefore no-op at the daemon, per
+#     this issue's own forgiving-posture instruction. No retain-forever
+#     UEJ_KIND exists in libpdx-audit @0.2 (grepped, confirmed absent) --
+#     src/audit_wire.pdx's own module header flags this for main.
+#
+#   libpdx-elevate (4844 LOC, mature) -- NOT actually called for a real
+#     elevation decision (src/elevate_wire.pdx, #12): this library's
+#     real API (`elevate_client_acquire`/`elevate_client_require`) needs
+#     a `parent_ep_slot` broker-endpoint cap this repo does not hold
+#     (KIND_ELEVATE_CHANNEL = 0x191, still the M1 placeholder, unchanged
+#     by this landing -- no code path in this repo mints or acquires
+#     one). `mkfs_elev_require_device_write` is therefore a fail-closed
+#     stub returning DENY unconditionally -- see that file's own module
+#     header for the full mismatch between this issue's assumed API
+#     shape and libpdx-elevate's real one.
+#
+#   libpdx-semantic-pipe (v1.0.0, real + released) -- NOT linked
+#     (src/pipe_wire.pdx, #10): confirmed via GitHub issue
+#     paideia-os#2000 that `Registry::bind_by_name` is inert (the
+#     backing `svc.schema-registry` service does not exist yet, so
+#     `bind_by_name` always returns 304/LOOKUP_FAIL). Per this issue's
+#     own fallback instruction, every PdxFsFormatRecord@0.1 this repo
+#     emits remains the M1/M2 line-based `sys_write(1, ...)` rendering,
+#     now preceded by one documented deferral header line.
+#
+# KIND_BLOCK_DEVICE naming gap RESOLVED (src/target.pdx's own module
+# header has the full write-up): `design/hardware/nvme-ahci-tail-
+# milestones.md` §3.1 (paideia-os) confirms `KIND_BLOCK_DEVICE` is
+# purely a doc-readability alias for the already-landed
+# `KIND_BLKDEV = 0x42` -- there is no separate kind at the previously
+# flagged 0x198..0x19F band. What remains unresolved is the ABSENCE of
+# any cap-introspection (`sys_cap_query`, planned at R13, never
+# implemented) or cap-narrowing (`cap_narrow`/`sys_cap_narrow`, does not
+# exist anywhere in this kernel) primitive -- `src/target.pdx`'s
+# `mkfs_dev_parse_slot` (#8) parses a device-cap slot number for real,
+# but validating that slot's kind and narrowing it to write-only both
+# remain documented STUBs for exactly this reason, not because the
+# KIND name itself is still ambiguous.
