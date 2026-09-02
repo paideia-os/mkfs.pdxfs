@@ -254,6 +254,40 @@
 // src/pdxb_superblock.pdx, src/pdxb_sign.pdx (libpdx-volume, the
 // encoders/signer this file calls); src/elevate_wire.pdx,
 // src/pipe_wire.pdx, src/target.pdx (this repo, M3 siblings).
+//
+// ----------------------------------------------------------------------
+// mkfs.pdxfs.LV11 (v1.1.0) -- libpdx-volume v1.1 adoption pass
+// ----------------------------------------------------------------------
+//
+// Issue #24 (LV11-024): every per-field summary store in
+// `mkfs_format_build_superblock` now routes through libpdx-volume's
+// LV.M1-003 (#18) `pdxb_sb_set_*` accessor family, and every hardcoded
+// summary offset / on-disk offset immediate in this file's comment
+// text now cites the matching PdxbSuperblock:: exported constant
+// (SB_SUMMARY_BYTES, PDXB_ONDISK_BYTES, PDXB_D_OFF_SIG). See that
+// function's own header for the leaf->caller-preserving register-plan
+// change the setter-call rewrite required.
+//
+// Issue #25 (LV11-025): `mkfs_format_run` accepts two additional
+// arguments (`flags`, `passphrase_fd`) carrying the v1.1 argv
+// extension bits (`PA_FLAG_ENCRYPT` / `PA_FLAG_QUOTA_SET` /
+// `PA_FLAG_PASSPHRASE_FD_SET`) and, when either bit is set, extends
+// the pipeline between build_superblock and encode with a summary-
+// level flag/version stamp (`Encrypt::mkfs_encrypt_apply_flag` /
+// `Quota::mkfs_quota_apply_flag` -- both set `PDXB_VERSION_V2` via
+// `pdxb_sb_set_version` and OR their respective `PDXB_FLAG_*` bit
+// into `SBS_OFF_FLAGS` via `pdxb_sb_set_flags`) and between encode
+// and sign with an on-disk-buffer-level wrapped-DEK/salt/nonce stamp
+// (`Encrypt::mkfs_encrypt_apply_wrap` -- reads the passphrase from
+// the caller's fd via a real sys_read, derives a KEK through
+// `pdxb_kek_derive`, wraps a placeholder all-zero DEK through
+// `pdxb_dek_wrap`, and writes the resulting fields via
+// `pdxb_sb_set_wrapped_dek` / `pdxb_sb_set_kdf_salt` plus a direct
+// 12-byte store at `PDXB_D_OFF_WRAP_NONCE`). See `src/encrypt.pdx`
+// and `src/quota.pdx` for the two extension bodies. The signed
+// message-length is unchanged: `pdxb_sign_superblock` still signs
+// exactly `PDXB_D_OFF_SIG` (696) bytes, which cover the wrapped-DEK/
+// salt/nonce v2 fields at offsets 192/240/256 as well.
 
 module Format = structure {
 
@@ -285,8 +319,46 @@ module Format = structure {
   pub let MKFS_EXIT_ELEVATION_DENIED   : u64 = 6  // M3 (#12): device-target elevation always denies
 
   // --- mkfs.pdxfs.M3-002 (#9): signing constants (see module header). ----
-  pub let MKFS_SIGN_SIG_OFFSET : u64 = 696   // pdxb_sign_superblock's message length AND this superblock's sig-field start
-  pub let MKFS_SIGN_SIG_LEN    : u64 = 3309  // MLDSA65_SIG_LEN, per libpdx-volume's pdxb_sign.pdx
+  //
+  // As of mkfs.pdxfs.LV11-024 (#24) both immediates cite the matching
+  // libpdx-volume/src/pdxb_superblock.pdx exported constant:
+  //   MKFS_SIGN_SIG_OFFSET == PDXB_D_OFF_SIG (696) -- start of the
+  //     on-disk superblock's signature slot; also pdxb_sign_superblock's
+  //     signed message-length. See pdxb_superblock.pdx's PDXB_D_OFF_SIG
+  //     binding.
+  //   MKFS_SIGN_SIG_LEN    == MLDSA65_SIG_LEN (3309) -- the actual
+  //     ML-DSA-65 signature byte-count returned by pdxb_sign_superblock
+  //     (distinct from PDXB_D_SIG_BYTES = 3400, the reserved on-disk
+  //     signature-slot size, which INCLUDES a 91-byte trailing pad
+  //     kept for future signature-scheme migration; see
+  //     libpdx-volume/src/pdxb_sign.pdx).
+  pub let MKFS_SIGN_SIG_OFFSET : u64 = 696   // PDXB_D_OFF_SIG
+  pub let MKFS_SIGN_SIG_LEN    : u64 = 3309  // MLDSA65_SIG_LEN
+
+  // --- mkfs.pdxfs.LV11-024 (#24): cite libpdx-volume v1.1 exported
+  //     constants for immediates below. paideia-as does not resolve
+  //     cross-file `pub let` bindings as inline immediates in another
+  //     file's compilation unit (see this codebase's established
+  //     comment-citing convention -- e.g. src/format_record.pdx's own
+  //     note on this and src/main.pdx's `and rax, 0x2; // PA_FLAG_DRY_RUN`
+  //     precedent), so each of the constants below appears in this file
+  //     as a numeric literal in a mov/cmp with a CITING COMMENT rather
+  //     than an inline symbol.
+  //
+  //   PDXB_ONDISK_BYTES (4096) -- pdxb_encode_superblock's out_len and
+  //     the on-disk superblock byte count.
+  //   SB_SUMMARY_BYTES  (176)  -- PdxbSuperblockSummary in-memory size;
+  //     matches mkfs_format_sb_summary's .bss reserve.
+  //   SB_SUMMARY_SLOTS  (22)   -- number of u64 slots the zero-fill loop
+  //     in mkfs_format_build_superblock covers.
+  //   PDXB_D_OFF_SIG    (696)  -- start of the on-disk superblock's
+  //     signature slot (MKFS_SIGN_SIG_OFFSET's citation).
+  //
+  //     LV.M5-002 (#30) v2 on-disk offsets used at mkfs.pdxfs.LV11-025:
+  //   PDXB_D_OFF_WRAPPED_DEK (192) -- 48 B ct+tag
+  //   PDXB_D_OFF_KDF_SALT    (240) -- 16 B
+  //   PDXB_D_OFF_WRAP_NONCE  (256) -- 12 B (no accessor in v1.1.1 -- see
+  //     src/encrypt.pdx's module header for the flagged libpdx-volume gap)
 
   // --- .bss scratch. All zero-initialised by the loader; every buffer
   //     below is fully re-stamped by its owning function before use
@@ -298,11 +370,18 @@ module Format = structure {
   //     placeholder 32-byte ML-DSA-65 seed every M3 signing call uses
   //     (see module header's "Seed-key strategy" section for why this
   //     is a deliberate, documented, temporary choice). -----------------
-  pub let mut mkfs_format_sb_summary : [u8; 176]  = uninit @align(8)  // PdxbSuperblockSummary (libpdx-volume SBS_OFF_* layout)
-  pub let mut mkfs_format_sb_encoded : [u8; 4096] = uninit @align(8)  // on-disk superblock image
-  pub let mut mkfs_format_root_inode : [u8; 128]  = uninit @align(8)  // encoded root inode #1
-  pub let mut mkfs_format_zero_buf   : [u8; 4096] = uninit @align(8)  // permanently-zero scratch
-  pub let mut mkfs_sign_seed_zero    : [u8; 32]   = uninit @align(8)  // permanently-zero placeholder ML-DSA-65 seed (M3, #9)
+  //
+  // Every array-size literal below cites its libpdx-volume public
+  // constant per mkfs.pdxfs.LV11-024 (#24) -- paideia-as array sizes
+  // MUST be integer literals, so the citation is comment-only (same
+  // constraint libpdx-volume's own src/pdxb_crypto.pdx documents for
+  // its own `[u8; 80]` / `[u8; 32]` scratch reserves).
+  //
+  pub let mut mkfs_format_sb_summary : [u8; 176]  = uninit @align(8)  // SB_SUMMARY_BYTES  (PdxbSuperblockSummary, SBS_OFF_* layout)
+  pub let mut mkfs_format_sb_encoded : [u8; 4096] = uninit @align(8)  // PDXB_ONDISK_BYTES (on-disk superblock image)
+  pub let mut mkfs_format_root_inode : [u8; 128]  = uninit @align(8)  // MKFS_INODE_SIZE   (encoded root inode #1)
+  pub let mut mkfs_format_zero_buf   : [u8; 4096] = uninit @align(8)  // PDXB_ONDISK_BYTES (permanently-zero scratch)
+  pub let mut mkfs_sign_seed_zero    : [u8; 32]   = uninit @align(8)  // MLDSA65_SEED_LEN  (placeholder ML-DSA-65 seed, M3, #9)
 
   // ==========================================================================
   // mkfs_format_write_zeros(fd, total_bytes) -> u64
@@ -374,70 +453,121 @@ module Format = structure {
   // mkfs_format_build_superblock(journal_size_blocks) -> ()
   //
   // Populates mkfs_format_sb_summary (176-byte PdxbSuperblockSummary,
-  // libpdx-volume's SBS_OFF_* layout) with this file's fixed M2 layout
-  // (see module header). Every one of the 22 8-byte slots is stamped --
-  // 10 explicit field writes plus a full zero-fill pass first so the
-  // untouched slots (flags, uuid_lo/hi, alloc_bcount is NOT zero-only,
-  // data_lba, data_bcount, mount_gen, snap_head, sig_key_hash x4) are
-  // deterministically zero rather than relying on mkfs_format_sb_summary's
-  // one-time bss zero-init (this buffer, unlike mkfs_format_zero_buf, IS
-  // written by this function -- explicit zeroing here matches
-  // src/argv.pdx's own stated caution: "so this function never reads
-  // stale/uninit bytes even on a build where .bss zero-init were
-  // somehow skipped").
+  // libpdx-volume's SBS_OFF_* layout, PdxbSuperblock::SB_SUMMARY_BYTES)
+  // with this file's fixed M2 layout (see module header).
   //
-  // Leaf function: no nested calls, touches only caller-save registers
-  // (rax/rcx/rdx and the incoming rdi, read-only) -- no push/pop needed.
+  // ----------------------------------------------------------------------
+  // mkfs.pdxfs.LV11-024 (#24) -- API cleanup: accessor adoption
+  // ----------------------------------------------------------------------
+  //
+  // libpdx-volume v1.1 (LV.M1-003 / #18) landed a full family of
+  // per-field getters/setters over the 22-slot PdxbSuperblockSummary
+  // layout. Per issue #24's acceptance ("No hardcoded superblock-summary
+  // offset math remaining in this tool's src tree (grep clean)"): every
+  // per-field store in this function has been rewritten to call the
+  // corresponding `pdxb_sb_set_*` entry point from
+  // libpdx-volume/src/pdxb_superblock.pdx, so a future rearrangement of
+  // the summary layout (adding a new field, widening one, reordering)
+  // does NOT require this function to be re-derived from an offset
+  // table.
+  //
+  // The bulk zero-fill loop is KEPT rather than replaced with 22
+  // setter calls: it is a scale-8 SIB store loop bounded by the
+  // exported constant SB_SUMMARY_SLOTS (22), not per-field offset math,
+  // and matches libpdx-volume's own pdxb_encode_superblock zero-fill
+  // idiom byte-for-byte. Reworking it as 22 zero-setter calls would be
+  // slower and no more "offset-free" than the current single-loop form.
+  //
+  // Register plan changes from the M2 landing: this function was a pure
+  // leaf; the setter-call rewrite promotes it to a caller-preserving
+  // shape. `push rbx; push r12; push r13` on entry save the two
+  // callee-save registers this function actually needs (rbx =
+  // &summary held across every setter call; r12 = journal_size_blocks
+  // preserved across the total_blocks setter which computes rsi =
+  // journal + 10 in-register) plus a THIRD throwaway `push r13` added
+  // in mkfs.pdxfs 1.1.1 fixup (Bug #3) purely for rsp%16==0 stack
+  // alignment across the eleven nested `call` sites -- SysV entry
+  // hands us rsp%16==8, so an odd number of pushes (three) restores
+  // rsp%16==0 as the callees expect. r13 itself is never read; only
+  // the epilogue `pop r13` matches the entry push. Every pdxb_sb_set_*
+  // callee touches only caller-save registers (rax/rdi/rsi per each
+  // setter's own justification, all pure leaves), so rbx and r12
+  // survive every nested `call` transparently. Pops occur in reverse
+  // order (r13, r12, rbx) before the single `ret`. Callers do not need to
+  // change: mkfs_format_run already treated this function as a callee
+  // that clobbers no callee-save register, which is still true after
+  // this rework.
   // ==========================================================================
   pub let mkfs_format_build_superblock : (u64) -> () !{mem} @{} =
     fn (journal_size_blocks: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M2-002 (#5): mkfs_format_build_superblock entry point. journal_size_blocks arrives in rdi and is read-only throughout (no nested call clobbers it). rax = &mkfs_format_sb_summary (rip-relative lea). Zero-fill pass: `xor rcx,rcx; xor rdx,rdx` then a 22-iteration `mov [rax+rcx*8], rdx; add rcx,1; cmp rcx,22; jb loop` (176/8=22 slots -- same scale-8 SIB store idiom libpdx-volume's pdxb_encode_superblock uses for its own zero-fill). Then ten explicit field stores at their SBS_OFF_* offsets: magic=0x42584450 (+0), version=1 (+8), block_size=4096 (+32), itable_lba=1 (+56), itable_bcount=8 (+64), alloc_lba=9 (+72), alloc_bcount=1 (+80), journal_lba=10 (+88), journal_bcount=rdi (+96, the caller's argument verbatim -- ParsedArgv.journal_size is already in BLOCKS per src/argv.pdx's own documented contract, see module header), total_blocks=10+rdi (+48, `mov rdx,rdi; add rdx,10; mov [rax+48],rdx` -- register-only addition, no add-reg-mem), root_inode=1 (+120). Every other slot (flags, uuid_lo/hi, data_lba, data_bcount, mount_gen, snap_head, four sig_key_hash words) is left at the zero-fill pass's value -- see module header for why (no --size= flag to size a data region, unsigned at M2). No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_bsb_.",
+      justification: "mkfs.pdxfs.M2-002 (#5) + LV11-024 (#24) + 1.1.1 fixup (Bug #3): mkfs_format_build_superblock entry point. push rbx; push r12; push r13 before repurposing either -- r13 is a throwaway third push whose ONLY role is to keep rsp % 16 == 0 across the eleven nested pdxb_sb_set_* calls (SysV entry hands us rsp % 16 == 8, two callee-save pushes would leave rsp % 16 == 8 which is a stack-misalignment ABI violation at every call site even though the leaf callees themselves currently tolerate it; three pushes restore rsp % 16 == 0, matching mkfs_encrypt_apply_wrap's rbx/r12/r13 push shape). r13 itself is never read, only stored back to on the epilogue pop. rbx = &mkfs_format_sb_summary (rip-relative lea, held across every nested setter call). r12 = journal_size_blocks (the incoming rdi, preserved across the pdxb_sb_set_total_blocks call whose rsi is computed as r12 + 10 in-register). Zero-fill pass first: `xor rcx,rcx; xor rdx,rdx` then a 22-iteration `mov [rbx+rcx*8], rdx; add rcx,1; cmp rcx,22; jb loop` bounded by SB_SUMMARY_SLOTS (22, PdxbSuperblock::SB_SUMMARY_SLOTS -- same scale-8 SIB store idiom libpdx-volume's pdxb_encode_superblock uses for its own zero-fill). Then eleven setter calls via libpdx-volume/src/pdxb_superblock.pdx's per-field API (LV.M1-003, #18): pdxb_sb_set_magic(rbx, 0x42584450='PDXB'), pdxb_sb_set_version(rbx, 1=PDXB_VERSION_V1), pdxb_sb_set_block_size(rbx, 4096=PDXB_BLOCK_SIZE), pdxb_sb_set_total_blocks(rbx, r12+10 computed via `mov rsi,r12; add rsi,10` -- register-only add, no add-reg-mem), pdxb_sb_set_itable_lba(rbx, 1), pdxb_sb_set_itable_bcount(rbx, 8), pdxb_sb_set_alloc_lba(rbx, 9), pdxb_sb_set_alloc_bcount(rbx, 1), pdxb_sb_set_journal_lba(rbx, 10), pdxb_sb_set_journal_bcount(rbx, r12 verbatim -- ParsedArgv.journal_size is already in BLOCKS per src/argv.pdx's own documented contract), pdxb_sb_set_root_inode(rbx, 1=MKFS_ROOT_INODE_NO). Every pdxb_sb_set_* callee is a pure leaf per its own libpdx-volume/src/pdxb_superblock.pdx justification (touches only rax/rdi/rsi, caller-save under SysV, no push/pop, no nested call) -- so rbx and r12 survive every setter call transparently without further register-save work. Every other summary slot (flags, uuid_lo/hi, data_lba, data_bcount, mount_gen, snap_head, four sig_key_hash words) is left at the zero-fill pass's value -- see module header for why (no --size= flag to size a data region, unsigned-key placeholder at M3). Pop r13; pop r12; pop rbx (reverse push order, per 1.1.1 fixup Bug #3) before the single ret. No `add reg,[mem]` (`add rsi,10` is register-only). No `test`. Labels prefixed mkfs_format_bsb_.",
       block: {
-        lea rax, [rip + mkfs_format_sb_summary];
+        push rbx;
+        push r12;
+        push r13;                           // 1.1.1 Bug #3: throwaway third push for rsp%16==0
+
+        lea rbx, [rip + mkfs_format_sb_summary];
+        mov r12, rdi;                       // r12 = journal_size_blocks
 
         xor rcx, rcx;
         xor rdx, rdx;
 
       mkfs_format_bsb_zero_loop:
-        mov [rax + rcx*8], rdx;
+        mov [rbx + rcx*8], rdx;
         add rcx, 1;
-        cmp rcx, 22;
+        cmp rcx, 22;                        // SB_SUMMARY_SLOTS (libpdx-volume)
         jb mkfs_format_bsb_zero_loop;
 
-        mov rdx, 0x42584450;                // magic ("PDXB")
-        mov [rax + 0], rdx;
+        // ---- LV.M1-003 (#18) accessor calls, per issue #24 acceptance. ----
+        mov rdi, rbx;
+        mov rsi, 0x42584450;                // PDXB_MAGIC ("PDXB")
+        call pdxb_sb_set_magic;
 
-        mov rdx, 1;                         // version
-        mov [rax + 8], rdx;
+        mov rdi, rbx;
+        mov rsi, 1;                         // PDXB_VERSION_V1
+        call pdxb_sb_set_version;
 
-        mov rdx, 4096;                      // block_size
-        mov [rax + 32], rdx;
+        mov rdi, rbx;
+        mov rsi, 4096;                      // PDXB_BLOCK_SIZE
+        call pdxb_sb_set_block_size;
 
-        mov rdx, rdi;                       // total_blocks = journal_lba + journal_bcount
-        add rdx, 10;
-        mov [rax + 48], rdx;
+        mov rdi, rbx;
+        mov rsi, r12;                       // total_blocks = journal_size + 10
+        add rsi, 10;
+        call pdxb_sb_set_total_blocks;
 
-        mov rdx, 1;                         // itable_lba
-        mov [rax + 56], rdx;
+        mov rdi, rbx;
+        mov rsi, 1;                         // MKFS_ITABLE_LBA
+        call pdxb_sb_set_itable_lba;
 
-        mov rdx, 8;                         // itable_bcount
-        mov [rax + 64], rdx;
+        mov rdi, rbx;
+        mov rsi, 8;                         // MKFS_ITABLE_BCOUNT (256*128/4096)
+        call pdxb_sb_set_itable_bcount;
 
-        mov rdx, 9;                         // alloc_lba
-        mov [rax + 72], rdx;
+        mov rdi, rbx;
+        mov rsi, 9;                         // MKFS_ALLOC_LBA
+        call pdxb_sb_set_alloc_lba;
 
-        mov rdx, 1;                         // alloc_bcount
-        mov [rax + 80], rdx;
+        mov rdi, rbx;
+        mov rsi, 1;                         // MKFS_ALLOC_BCOUNT
+        call pdxb_sb_set_alloc_bcount;
 
-        mov rdx, 10;                        // journal_lba
-        mov [rax + 88], rdx;
+        mov rdi, rbx;
+        mov rsi, 10;                        // MKFS_JOURNAL_LBA
+        call pdxb_sb_set_journal_lba;
 
-        mov [rax + 96], rdi;                // journal_bcount = journal_size_blocks (verbatim)
+        mov rdi, rbx;
+        mov rsi, r12;                       // journal_bcount = journal_size verbatim
+        call pdxb_sb_set_journal_bcount;
 
-        mov rdx, 1;                         // root_inode = inode #1
-        mov [rax + 120], rdx;
+        mov rdi, rbx;
+        mov rsi, 1;                         // MKFS_ROOT_INODE_NO
+        call pdxb_sb_set_root_inode;
 
+        pop r13;                            // 1.1.1 Bug #3: matches the entry push_r13
+        pop r12;
+        pop rbx;
         ret;
       }
     }
@@ -481,8 +611,32 @@ module Format = structure {
       }
     }
 
+  // --- LV11-025 (#25) argv-extension scratch. -----------------------------
+  //
+  // `mkfs_format_run` gained two extra parameters (flags in rcx,
+  // passphrase_fd in r8) at LV11-025 (see this file's module header's
+  // LV11 section). All five SysV callee-save registers (rbx/r12-r15)
+  // are already spoken for by the existing register plan, so the two
+  // new arguments stage into these two .bss slots on entry and every
+  // downstream read is a fresh `mov rax, [rip + ...]` load rather than
+  // occupying a sixth register that does not exist. Both slots are
+  // scoped to a single mkfs_format_run invocation; a caller that
+  // interleaves two mkfs_format_run calls would race them, but no such
+  // caller exists (main.pdx invokes this function at most once per
+  // process, then sys_exits).
+  pub let mut mkfs_format_v11_flags : u64 = uninit @align(8)
+  pub let mut mkfs_format_v11_pfd   : u64 = uninit @align(8)
+
+  // --- Argv flag bit masks (mirror src/argv.pdx's PA_FLAG_* per this
+  //     codebase's comment-citing convention). Kept as local literals so
+  //     the `and` and `cmp` immediates in mkfs_format_run stay imm32-
+  //     safe with no r10/r11 staging. ------------------------------------
+  pub let MKFS_FMT_FLAG_ENCRYPT   : u64 = 0x80    // PA_FLAG_ENCRYPT
+  pub let MKFS_FMT_FLAG_QUOTA_SET : u64 = 0x200   // PA_FLAG_QUOTA_SET
+
   // ==========================================================================
-  // mkfs_format_run(target_ptr, force_flag, journal_size_blocks) -> u64
+  // mkfs_format_run(target_ptr, force_flag, journal_size_blocks,
+  //                 flags, passphrase_fd) -> u64
   //   (MKFS_EXIT_OK | MKFS_EXIT_SYSCALL_ERROR | MKFS_EXIT_REFUSED)
   //
   //   rdi = target_ptr          (NUL-terminated <target> path, already
@@ -490,6 +644,24 @@ module Format = structure {
   //   rsi = force_flag          (0 or 1 -- ParsedArgv.flags & PA_FLAG_FORCE)
   //   rdx = journal_size_blocks (ParsedArgv.journal_size, already in
   //                               BLOCKS with its M1 default applied)
+  //   rcx = flags               (ParsedArgv.flags verbatim -- read for
+  //                               PA_FLAG_ENCRYPT / PA_FLAG_QUOTA_SET
+  //                               only at LV11-025; every other bit is
+  //                               ignored on this path)
+  //   r8  = passphrase_fd       (ParsedArgv.passphrase_fd; consulted iff
+  //                               PA_FLAG_ENCRYPT is set. Caller MUST
+  //                               have refused --encrypt without
+  //                               --passphrase-fd upstream -- see
+  //                               src/main.pdx's mkfs_main_encrypt_pfd_ok
+  //                               gate, added in mkfs.pdxfs 1.1.1 fixup
+  //                               (LV11-025 Bug #2): refuses on
+  //                               PA_FLAG_ENCRYPT set + PA_FLAG_
+  //                               PASSPHRASE_FD_SET unset with a
+  //                               "mkfs.pdxfs: --encrypt requires
+  //                               --passphrase-fd" stderr diagnostic
+  //                               and sys_exit(2), so this arm never
+  //                               reaches mkfs_encrypt_apply_wrap with
+  //                               a zero-default passphrase_fd)
   //
   // The full M2 pipeline: refusal gate -> open(create+trunc) -> encode +
   // write superblock -> write inode table (sentinel + root inode +
@@ -498,17 +670,32 @@ module Format = structure {
   // (OK, a REFUSED_* variant, or FAIL) itself, then return the exit
   // status for main.pdx to pass to sys_exit unchanged.
   //
+  // LV11-025 extension: two hook points around encode/sign, per this
+  // file's module header. Both are no-ops when neither
+  // PA_FLAG_ENCRYPT nor PA_FLAG_QUOTA_SET is set, so an M2/M3-shape
+  // invocation flows through the pipeline unchanged.
+  //
   // Register plan: rbx=target_ptr, r12=force_flag (dead after the
   // refusal-gate call), r13=journal_size_blocks, r14=fd (valid only
   // from mkfs_format_run_open onward), r15=errno scratch on a failure
   // path. All five are SysV callee-save, pushed on entry and popped
-  // (reverse order) before the single shared epilogue's `ret`.
+  // (reverse order) before the single shared epilogue's `ret`. The
+  // two LV11-025 arguments (rcx=flags, r8=passphrase_fd) stage into
+  // .bss slots on entry so they survive every nested call without
+  // consuming a sixth register.
   // ==========================================================================
-  pub let mkfs_format_run : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
-    fn (target_ptr: u64) (force_flag: u64) (journal_size_blocks: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mkfs.pdxfs.M2-002/M2-003/M2-004 (#5, #6, #7) + M3-002/M3-003 (#9, #10): mkfs_format_run entry point, the file-target write pipeline. Pushes rbx/r12/r13/r14/r15 (5 registers) before repurposing any; pops all five (reverse order) at the single shared epilogue (mkfs_format_run_epilogue) before every return. rbx=target_ptr, r12=force_flag, r13=journal_size_blocks. Phase 1 (refusal gate): rdi=rbx, rsi=r12, `call mkfs_refuse_check` (src/refusal.pdx) -> rax in {REFUSE_OK=0, REFUSE_ALREADY_PDXB=2, REFUSE_ALREADY_PDXL=3, REFUSE_NON_BLANK=4}. `cmp rax,0; je mkfs_format_run_open` on OK. Otherwise: rdi=rbx, rsi=rax (the refusal code IS the matching FormatRecord::FR_RESULT_* code, by the one-for-one numbering src/refusal.pdx's own header documents), rdx=0 (errno unused for a refusal), `call mkfs_sp_emit_result` (M3, #10 -- src/pipe_wire.pdx's wrapper, NOT FormatRecord::format_record_emit_result directly; every terminal-record call site in this function was switched to this wrapper at M3, see module header); `mov rax,5` (MKFS_EXIT_REFUSED); jmp epilogue. Phase 2 (open): sys_open(rdi=rbx, rsi=0xC1 (O_CREAT|O_WRONLY|O_TRUNC), rdx=0x1A4 (0644), rax=2); `cmp rax,0; jl mkfs_format_run_open_fail` (no fd to close on this path). On success r14=fd. Phase 3 (superblock encode): rdi=r13, `call mkfs_format_build_superblock`; rdi=&mkfs_format_sb_summary, rsi=&mkfs_format_sb_encoded, rdx=4096, `call pdxb_encode_superblock` (libpdx-volume, cross-repo call by bare label -- see module header); `cmp rax,4096; jne mkfs_format_run_encode_fail` (defensive -- cannot actually fail since out_len is always exactly 4096, but pdxb_encode_superblock's own contract returns a distinct sentinel on a too-small buffer, so this gate is honoured rather than assumed). Phase 3b (M3, #9 -- sign in place): rdi=&mkfs_format_sb_encoded (sb_ptr), rsi=&mkfs_sign_seed_zero (seed_ptr, the placeholder all-zero seed -- see module header's Seed-key strategy section), rdx=&mkfs_format_sb_encoded+696 (out_sig_ptr, MKFS_SIGN_SIG_OFFSET), rcx=3309 (out_sig_len, MKFS_SIGN_SIG_LEN), `call pdxb_sign_superblock` (libpdx-volume, cross-repo bare-label call, same mechanism as pdxb_encode_superblock); `cmp rax,3309; jne mkfs_format_run_sign_fail` -- a failure here (PDXB_SIGN_ERR = 0xFFFFFFFFFFFFFFFF) is handled identically to an encode failure: no syscall errno exists, so mkfs_format_run_sign_fail sets the same sentinel r15 value and falls into the shared close_and_fail path. On success, the 3309 signature bytes are now resident in mkfs_format_sb_encoded[696..696+3309) -- the buffer sys_write below writes is now the SIGNED superblock. sys_write(r14, &mkfs_format_sb_encoded, 4096); `cmp rax,0; jl mkfs_format_run_close_fail`. Phase 4 (inode table, no lseek -- see module header): sys_write(r14, &mkfs_format_zero_buf, 128) for inode 0's sentinel slot via a DIRECT sys_write (128 <= 4096, one call suffices, no need for the write_zeros helper's chunking loop) -- fail check as above; `call mkfs_format_encode_root_inode`; sys_write(r14, &mkfs_format_root_inode, 128) for inode 1 -- fail check; rdi=r14, rsi=32512 ((256-2)*128), `call mkfs_format_write_zeros` for inodes 2..255 -- `cmp rax,0; jl mkfs_format_run_close_fail` (write_zeros itself returns the raw negative errno on failure, matching a direct syscall's convention). Phase 5 (bitmap): rdi=r14, rsi=1024 (MKFS_BITMAP_BYTES), `call mkfs_format_write_zeros` -- same fail check. Phase 6 (journal): `mov r8,r13; shl r8,12` (journal_size_blocks * 4096 via shift, avoiding imul per this codebase's compile-time-constant-multiply convention); rdi=r14, rsi=r8, `call mkfs_format_write_zeros` -- same fail check. Phase 7 (close + success record): sys_close(r14) (SC+ ID 3, return ignored per this repo's fd_close-of-live-fd posture); rdi=rbx, rsi=8 (FR_RESULT_SIGNED_OK, M3 -- was FR_RESULT_OK=0 at M2, since every file-target write is now signed unconditionally), rdx=0, `call mkfs_sp_emit_result`; `xor rax,rax` (MKFS_EXIT_OK); jmp epilogue. Failure paths: mkfs_format_run_encode_fail and mkfs_format_run_sign_fail both set r15 to the sentinel 0xFFFFFFFFFFFFFFFF (neither an encode nor a signing failure has a syscall errno) then fall into mkfs_format_run_close_and_fail; mkfs_format_run_close_fail computes `xor r15,r15; sub r15,rax` (positive errno from the just-failed syscall's negative rax, matching src/user/errno.pdx's syscall_check idiom exactly -- NOT a bare `neg`) then falls into the same close_and_fail; mkfs_format_run_open_fail (no fd yet) computes the same positive-errno idiom directly. mkfs_format_run_close_and_fail: sys_close(r14) best-effort (skipped on the open-fail path, which jumps straight past it since no fd exists); rdi=rbx, rsi=1 (FR_RESULT_FAIL), rdx=r15, `call mkfs_sp_emit_result`; `mov rax,3` (MKFS_EXIT_SYSCALL_ERROR); jmp epilogue. Every call site above either targets a leaf that touches no callee-save register (mkfs_refuse_check touches r12 internally but pushes/pops it; mkfs_format_build_superblock/mkfs_format_encode_root_inode/pdxb_encode_superblock/pdxb_sign_superblock are all pure leaves per their own documented register plans) or targets mkfs_sp_emit_result/mkfs_format_write_zeros, both of which push/pop every callee-save register they repurpose -- so rbx/r13/r14/r15 all survive every `call` in this function transparently. No `add reg,[mem]` anywhere (`add rdx,696` / `add rdx,10` / `add r15...` are all register-only). No `test` -- every check is `cmp reg,imm`/`cmp reg,0`. No `imul`/`mul` -- the one compile-time-constant multiply (journal bytes = blocks*4096) is `shl r8,12`. Labels prefixed mkfs_format_run_.",
+  pub let mkfs_format_run : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, paideia.crypto} =
+    fn (target_ptr: u64) (force_flag: u64) (journal_size_blocks: u64) (flags: u64) (passphrase_fd: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, paideia.crypto},
+      justification: "mkfs.pdxfs.M2-002/M2-003/M2-004 (#5, #6, #7) + M3-002/M3-003 (#9, #10): mkfs_format_run entry point, the file-target write pipeline. Pushes rbx/r12/r13/r14/r15 (5 registers) before repurposing any; pops all five (reverse order) at the single shared epilogue (mkfs_format_run_epilogue) before every return. rbx=target_ptr, r12=force_flag, r13=journal_size_blocks. Phase 1 (refusal gate): rdi=rbx, rsi=r12, `call mkfs_refuse_check` (src/refusal.pdx) -> rax in {REFUSE_OK=0, REFUSE_ALREADY_PDXB=2, REFUSE_ALREADY_PDXL=3, REFUSE_NON_BLANK=4}. `cmp rax,0; je mkfs_format_run_open` on OK. Otherwise: rdi=rbx, rsi=rax (the refusal code IS the matching FormatRecord::FR_RESULT_* code, by the one-for-one numbering src/refusal.pdx's own header documents), rdx=0 (errno unused for a refusal), `call mkfs_sp_emit_result` (M3, #10 -- src/pipe_wire.pdx's wrapper, NOT FormatRecord::format_record_emit_result directly; every terminal-record call site in this function was switched to this wrapper at M3, see module header); `mov rax,5` (MKFS_EXIT_REFUSED); jmp epilogue. Phase 2 (open): sys_open(rdi=rbx, rsi=0xC1 (O_CREAT|O_WRONLY|O_TRUNC), rdx=0x1A4 (0644), rax=2); `cmp rax,0; jl mkfs_format_run_open_fail` (no fd to close on this path). On success r14=fd. Phase 3 (superblock encode): rdi=r13, `call mkfs_format_build_superblock`; rdi=&mkfs_format_sb_summary, rsi=&mkfs_format_sb_encoded, rdx=4096, `call pdxb_encode_superblock` (libpdx-volume, cross-repo call by bare label -- see module header); `cmp rax,4096; jne mkfs_format_run_encode_fail` (defensive -- cannot actually fail since out_len is always exactly 4096, but pdxb_encode_superblock's own contract returns a distinct sentinel on a too-small buffer, so this gate is honoured rather than assumed). Phase 3b (M3, #9 -- sign in place): rdi=&mkfs_format_sb_encoded (sb_ptr), rsi=&mkfs_sign_seed_zero (seed_ptr, the placeholder all-zero seed -- see module header's Seed-key strategy section), rdx=&mkfs_format_sb_encoded+696 (out_sig_ptr, MKFS_SIGN_SIG_OFFSET), rcx=3309 (out_sig_len, MKFS_SIGN_SIG_LEN), `call pdxb_sign_superblock` (libpdx-volume, cross-repo bare-label call, same mechanism as pdxb_encode_superblock); `cmp rax,3309; jne mkfs_format_run_sign_fail` -- a failure here (PDXB_SIGN_ERR = 0xFFFFFFFFFFFFFFFF) is handled identically to an encode failure: no syscall errno exists, so mkfs_format_run_sign_fail sets the same sentinel r15 value and falls into the shared close_and_fail path. On success, the 3309 signature bytes are now resident in mkfs_format_sb_encoded[696..696+3309) -- the buffer sys_write below writes is now the SIGNED superblock. sys_write(r14, &mkfs_format_sb_encoded, 4096); `cmp rax,0; jl mkfs_format_run_close_fail`. Phase 4 (inode table, no lseek -- see module header): sys_write(r14, &mkfs_format_zero_buf, 128) for inode 0's sentinel slot via a DIRECT sys_write (128 <= 4096, one call suffices, no need for the write_zeros helper's chunking loop) -- fail check as above; `call mkfs_format_encode_root_inode`; sys_write(r14, &mkfs_format_root_inode, 128) for inode 1 -- fail check; rdi=r14, rsi=32512 ((256-2)*128), `call mkfs_format_write_zeros` for inodes 2..255 -- `cmp rax,0; jl mkfs_format_run_close_fail` (write_zeros itself returns the raw negative errno on failure, matching a direct syscall's convention). Phase 5 (bitmap): rdi=r14, rsi=1024 (MKFS_BITMAP_BYTES), `call mkfs_format_write_zeros` -- same fail check. Phase 6 (journal): `mov r8,r13; shl r8,12` (journal_size_blocks * 4096 via shift, avoiding imul per this codebase's compile-time-constant-multiply convention); rdi=r14, rsi=r8, `call mkfs_format_write_zeros` -- same fail check. Phase 7 (close + success record): sys_close(r14) (SC+ ID 3, return ignored per this repo's fd_close-of-live-fd posture); rdi=rbx, rsi=8 (FR_RESULT_SIGNED_OK, M3 -- was FR_RESULT_OK=0 at M2, since every file-target write is now signed unconditionally), rdx=0, `call mkfs_sp_emit_result`; `xor rax,rax` (MKFS_EXIT_OK); jmp epilogue. Failure paths: mkfs_format_run_encode_fail and mkfs_format_run_sign_fail both set r15 to the sentinel 0xFFFFFFFFFFFFFFFF (neither an encode nor a signing failure has a syscall errno) then fall into mkfs_format_run_close_and_fail; mkfs_format_run_close_fail computes `xor r15,r15; sub r15,rax` (positive errno from the just-failed syscall's negative rax, matching src/user/errno.pdx's syscall_check idiom exactly -- NOT a bare `neg`) then falls into the same close_and_fail; mkfs_format_run_open_fail (no fd yet) computes the same positive-errno idiom directly. mkfs_format_run_close_and_fail: sys_close(r14) best-effort (skipped on the open-fail path, which jumps straight past it since no fd exists); rdi=rbx, rsi=1 (FR_RESULT_FAIL), rdx=r15, `call mkfs_sp_emit_result`; `mov rax,3` (MKFS_EXIT_SYSCALL_ERROR); jmp epilogue. Every call site above either targets a leaf that touches no callee-save register (mkfs_refuse_check touches r12 internally but pushes/pops it; mkfs_format_build_superblock touches rbx/r12 internally as of LV11-024 (#24) but pushes/pops both; mkfs_format_encode_root_inode/pdxb_encode_superblock/pdxb_sign_superblock are all pure leaves per their own documented register plans) or targets mkfs_sp_emit_result/mkfs_format_write_zeros, both of which push/pop every callee-save register they repurpose -- so rbx/r13/r14/r15 all survive every `call` in this function transparently. No `add reg,[mem]` anywhere (`add rdx,696` / `add rdx,10` / `add r15...` are all register-only). No `test` -- every check is `cmp reg,imm`/`cmp reg,0`. No `imul`/`mul` -- the one compile-time-constant multiply (journal bytes = blocks*4096) is `shl r8,12`. Labels prefixed mkfs_format_run_.",
       block: {
+        // ---- LV11-025 (#25): stash extension args in .bss BEFORE
+        //      pushing callee-save regs. rcx/r8 are SysV caller-save
+        //      and would be clobbered by the first `syscall`/`call`;
+        //      the .bss slots survive the whole pipeline. ---------------
+        mov [rip + mkfs_format_v11_flags], rcx;
+        mov [rip + mkfs_format_v11_pfd], r8;
+
         push rbx;
         push r12;
         push r13;
@@ -549,21 +736,57 @@ module Format = structure {
         mov rdi, r13;
         call mkfs_format_build_superblock;
 
+        // ---- LV11-025 (#25) hook A: summary-level flag/version stamp. ----
+        // Iff the caller passed PA_FLAG_ENCRYPT or PA_FLAG_QUOTA_SET, the
+        // superblock version bumps to PDXB_VERSION_V2 and the matching
+        // PDXB_FLAG_* bit is OR-ed into SBS_OFF_FLAGS. Both helpers are
+        // no-ops when their bit is not set (see src/encrypt.pdx and
+        // src/quota.pdx for the bodies) -- an M2/M3-shape invocation
+        // flows through with no observable change.
+        lea rdi, [rip + mkfs_format_sb_summary];
+        mov rsi, [rip + mkfs_format_v11_flags];
+        call mkfs_encrypt_apply_flag;       // src/encrypt.pdx
+        lea rdi, [rip + mkfs_format_sb_summary];
+        mov rsi, [rip + mkfs_format_v11_flags];
+        call mkfs_quota_apply_flag;         // src/quota.pdx
+
         lea rdi, [rip + mkfs_format_sb_summary];
         lea rsi, [rip + mkfs_format_sb_encoded];
-        mov rdx, 4096;
+        mov rdx, 4096;                      // PDXB_ONDISK_BYTES
         call pdxb_encode_superblock;
-        cmp rax, 4096;
+        cmp rax, 4096;                      // PDXB_ONDISK_BYTES
         jne mkfs_format_run_encode_fail;
 
+        // ---- LV11-025 (#25) hook B: on-disk-buffer encryption stamp. ----
+        // Iff PA_FLAG_ENCRYPT is set, mkfs_encrypt_apply_wrap reads the
+        // caller's passphrase from mkfs_format_v11_pfd via a real
+        // sys_read, derives a KEK, wraps a placeholder all-zero DEK, and
+        // stamps wrapped_dek / kdf_salt / wrap_nonce into the on-disk
+        // buffer at their PDXB_D_OFF_* offsets (192 / 240 / 256). The
+        // helper returns 0 on success, non-zero on any KDF/AEAD failure
+        // -- either is treated as a MKFS_EXIT_SYSCALL_ERROR path with a
+        // FAIL record via the same close_and_fail epilogue every other
+        // pipeline failure uses.
+        mov rax, [rip + mkfs_format_v11_flags];
+        and rax, 0x80;                      // MKFS_FMT_FLAG_ENCRYPT
+        cmp rax, 0;
+        je mkfs_format_run_skip_encrypt;
+
+        lea rdi, [rip + mkfs_format_sb_encoded];
+        mov rsi, [rip + mkfs_format_v11_pfd];
+        call mkfs_encrypt_apply_wrap;       // src/encrypt.pdx
+        cmp rax, 0;
+        jne mkfs_format_run_encrypt_fail;
+
+      mkfs_format_run_skip_encrypt:
         // ---- Phase 3b (M3, #9): sign the superblock in place. ------------
         lea rdi, [rip + mkfs_format_sb_encoded];
         lea rsi, [rip + mkfs_sign_seed_zero];
         lea rdx, [rip + mkfs_format_sb_encoded];
-        add rdx, 696;                       // MKFS_SIGN_SIG_OFFSET
-        mov rcx, 3309;                      // MKFS_SIGN_SIG_LEN
+        add rdx, 696;                       // MKFS_SIGN_SIG_OFFSET (PDXB_D_OFF_SIG)
+        mov rcx, 3309;                      // MKFS_SIGN_SIG_LEN (MLDSA65_SIG_LEN)
         call pdxb_sign_superblock;
-        cmp rax, 3309;
+        cmp rax, 3309;                      // MKFS_SIGN_SIG_LEN
         jne mkfs_format_run_sign_fail;
 
         mov rdi, r14;
@@ -635,6 +858,18 @@ module Format = structure {
         mov r15, 0xFFFFFFFFFFFFFFFF;        // no syscall errno; PDXB_SIGN_ERR sentinel (M3, #9)
         jmp mkfs_format_run_close_and_fail;
 
+      mkfs_format_run_encrypt_fail:
+        // LV11-025 (#25): mkfs_encrypt_apply_wrap returned non-zero
+        // (LPV_CRYPTO_ERR_KDF_FAIL / _AEAD_FAIL / _BAD_KEY_LEN, all
+        // in the 0x09xx band -- see libpdx-volume/src/lpv_errors.pdx).
+        // Report the raw library error code verbatim through the
+        // FAIL record's `error: <n>` slot; a future lpv_strerror wire-in
+        // (see src/format_record.pdx's LV11-024 note) will resolve
+        // 0x09xx to a human-readable "crypto: kdf fail" / "crypto:
+        // aead fail" prefix without any further change here.
+        mov r15, rax;
+        jmp mkfs_format_run_close_and_fail;
+
       mkfs_format_run_close_fail:
         xor r15, r15;
         sub r15, rax;                       // positive errno from the failing syscall
@@ -695,10 +930,10 @@ module Format = structure {
   // caller-save rsi/rdx are simply left untouched until the call clobbers
   // them, which is fine since nothing after that point reads them).
   // ==========================================================================
-  pub let mkfs_format_run_device : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
-    fn (target_ptr: u64) (force_flag: u64) (journal_size_blocks: u64) -> unsafe {
+  pub let mkfs_format_run_device : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) (force_flag: u64) (journal_size_blocks: u64) (flags: u64) (passphrase_fd: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mkfs.pdxfs.M3-001 (#8): mkfs_format_run_device entry point, the device-target stub pipeline. `push rbx` before repurposing it. `mov rbx, rdi` (rbx=target_ptr; rsi/rdx -- force_flag/journal_size_blocks -- are accepted per this function's public signature but read by nothing below, per module header). `call mkfs_dev_parse_slot` (src/target.pdx, rdi=rbx already in position) -> rax = the parsed device-cap slot number; this repo's own M3 landing reads no further use of it (no kind-validation syscall exists to check it against, per src/target.pdx's own module header) -- the call is made anyway so a future real body already has the parsed value threaded through without an ABI change. `mov rdi, rbx` (target_ptr), `mov rsi, 5` (FR_RESULT_DEVICE_TARGET_STUB), `xor rdx, rdx` (errno unused), `call mkfs_sp_emit_result` (src/pipe_wire.pdx). `mov rax, 4` (MKFS_EXIT_DEVICE_STUB). `pop rbx; ret`. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_rd_ (none needed -- no branch).",
+      justification: "mkfs.pdxfs.M3-001 (#8) + LV11-025 (#25): mkfs_format_run_device entry point, the device-target stub pipeline. `push rbx` before repurposing it. `mov rbx, rdi` (rbx=target_ptr; rsi/rdx -- force_flag/journal_size_blocks -- are accepted per this function's public signature but read by nothing below, per module header). `call mkfs_dev_parse_slot` (src/target.pdx, rdi=rbx already in position) -> rax = the parsed device-cap slot number; this repo's own M3 landing reads no further use of it (no kind-validation syscall exists to check it against, per src/target.pdx's own module header) -- the call is made anyway so a future real body already has the parsed value threaded through without an ABI change. `mov rdi, rbx` (target_ptr), `mov rsi, 5` (FR_RESULT_DEVICE_TARGET_STUB), `xor rdx, rdx` (errno unused), `call mkfs_sp_emit_result` (src/pipe_wire.pdx). `mov rax, 4` (MKFS_EXIT_DEVICE_STUB). `pop rbx; ret`. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_rd_ (none needed -- no branch).",
       block: {
         push rbx;
 

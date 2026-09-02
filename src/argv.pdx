@@ -22,7 +22,7 @@
 // that swap happens.
 //
 // ----------------------------------------------------------------------
-// ParsedArgv -- out-struct layout (5 u64-aligned slots, 40 bytes)
+// ParsedArgv -- out-struct layout (7 u64-aligned slots, 56 bytes at LV11-025)
 // ----------------------------------------------------------------------
 //
 // Every field is stored as a full u64 slot (never a packed u32/narrower
@@ -98,6 +98,60 @@
 // M2.
 //
 // ----------------------------------------------------------------------
+// mkfs.pdxfs.LV11-025 (#25) — --encrypt / --passphrase-fd / --quota / --help
+// ----------------------------------------------------------------------
+//
+// v1.1 argv-surface additions per the R53 LV11 adoption wave:
+//
+//   --encrypt                bare boolean; sets PA_FLAG_ENCRYPT (0x80).
+//                            Downstream (src/format.pdx's
+//                            mkfs_format_run) branches on this bit to
+//                            invoke src/encrypt.pdx's KEK-derive +
+//                            DEK-wrap pipeline BEFORE signing.
+//   --passphrase-fd <n>      two-token; the fd number arrives as a
+//                            separate argv token (parsed via
+//                            argv_parse_u64_dec). Stored at
+//                            PA_OFF_PASSPHRASE_FD; sets
+//                            PA_FLAG_PASSPHRASE_FD_SET (0x100). Only
+//                            consulted when PA_FLAG_ENCRYPT is also
+//                            set; consuming --passphrase-fd without
+//                            --encrypt is not an error (the fd stays
+//                            unread).
+//   --quota <spec>           two-token; the "USER=SOFT,HARD" spec
+//                            arrives as a separate argv token. Every
+//                            spec pointer is appended to
+//                            argv_quota_specs (a module-local .bss
+//                            slot array of up to
+//                            ARGV_QUOTA_MAX_ENTRIES entries) with the
+//                            count in PA_OFF_QUOTA_COUNT. The flag is
+//                            repeatable; sets PA_FLAG_QUOTA_SET (0x200).
+//                            Overflow beyond ARGV_QUOTA_MAX_ENTRIES is
+//                            silently dropped (spec ignored) but the
+//                            flag still latches, matching the
+//                            "malformed value silently yields a
+//                            partial result" M1 posture.
+//   --help                   bare boolean; sets PA_FLAG_HELP (0x400).
+//                            src/main.pdx's _start prints usage to fd
+//                            1 and exits 0 when this bit is set.
+//
+// Two-token parsing detail: when --passphrase-fd or --quota is seen,
+// argv_parse's scan loop advances i by TWO (one via a manual `add r14,
+// 1` before the shared scan_next label, which itself adds another 1),
+// consuming both the flag token and its value token in one iteration.
+// A --passphrase-fd or --quota appearing as the LAST argv token (no
+// value token follows) silently sets its flag bit and stops -- no
+// error path exists for a missing value at this landing, matching the
+// existing "malformed --journal-size= silently parses as 0" posture
+// documented earlier in this header.
+//
+// Downstream reads (all in src/format.pdx's mkfs_format_run + the two
+// src/encrypt.pdx / src/quota.pdx apply helpers): PA_OFF_PASSPHRASE_FD
+// and the ParsedArgv.flags bit set is the full contract this file's
+// callers rely on. argv_quota_specs is a module-local .bss array; a
+// future quota-table serialization pass (deferred per src/quota.pdx's
+// module header) will iterate it via bare-label access.
+//
+// ----------------------------------------------------------------------
 // mkfs.pdxfs.M4-004 (#16) — --upgrade flag, stub-wired only
 // ----------------------------------------------------------------------
 //
@@ -136,12 +190,14 @@
 module Argv = structure {
 
   // --- ParsedArgv out-struct offsets (see module header). ---------------
-  pub let PA_OFF_FLAGS        : u64 = 0
-  pub let PA_OFF_LABEL_PTR    : u64 = 8
-  pub let PA_OFF_JOURNAL_SIZE : u64 = 16
-  pub let PA_OFF_SIG_KEY_PTR  : u64 = 24
-  pub let PA_OFF_TARGET_PTR   : u64 = 32
-  pub let PA_STRUCT_BYTES     : u64 = 40
+  pub let PA_OFF_FLAGS         : u64 = 0
+  pub let PA_OFF_LABEL_PTR     : u64 = 8
+  pub let PA_OFF_JOURNAL_SIZE  : u64 = 16
+  pub let PA_OFF_SIG_KEY_PTR   : u64 = 24
+  pub let PA_OFF_TARGET_PTR    : u64 = 32
+  pub let PA_OFF_PASSPHRASE_FD : u64 = 40   // LV11-025 (#25): --passphrase-fd <n>
+  pub let PA_OFF_QUOTA_COUNT   : u64 = 48   // LV11-025 (#25): count of argv_quota_specs entries
+  pub let PA_STRUCT_BYTES      : u64 = 56   // widened from 40 for the two LV11-025 slots
 
   // --- ParsedArgv.flags bit assignments. ---------------------------------
   pub let PA_FLAG_FORCE              : u64 = 0x1
@@ -151,6 +207,10 @@ module Argv = structure {
   pub let PA_FLAG_JOURNAL_SIZE_SET    : u64 = 0x10
   pub let PA_FLAG_SIG_KEY_SET         : u64 = 0x20
   pub let PA_FLAG_UPGRADE             : u64 = 0x40   // mkfs.pdxfs.M4-004 (#16): --upgrade, stub-wired only (see module header)
+  pub let PA_FLAG_ENCRYPT             : u64 = 0x80   // mkfs.pdxfs.LV11-025 (#25): --encrypt (see module header)
+  pub let PA_FLAG_PASSPHRASE_FD_SET   : u64 = 0x100  // mkfs.pdxfs.LV11-025 (#25): --passphrase-fd <n> presence bit
+  pub let PA_FLAG_QUOTA_SET           : u64 = 0x200  // mkfs.pdxfs.LV11-025 (#25): --quota <spec> latched (repeatable)
+  pub let PA_FLAG_HELP                : u64 = 0x400  // mkfs.pdxfs.LV11-025 (#25): --help
 
   // Default --journal-size when the flag is not given: 1024 blocks
   // (4 MiB at the frozen 4096-byte block size), per
@@ -176,6 +236,40 @@ module Argv = structure {
   // --- mkfs.pdxfs.M4-004 (#16): --upgrade literal (exact-match, no value). ---
   pub let argv_lit_upgrade       : [u8; 10] = "--upgrade\0"
   pub let argv_lit_upgrade_len   : u64 = 9
+
+  // --- mkfs.pdxfs.LV11-025 (#25): v1.1 flag literals. -------------------
+  //
+  // --encrypt / --help are exact-match boolean flags (streq).
+  // --passphrase-fd / --quota are exact-match two-token flags: the
+  // parser matches the flag name literal via streq, then consumes the
+  // NEXT argv token as the value. See module header for the parsing
+  // rationale (matches the brief's space-separated spelling).
+  pub let argv_lit_encrypt        : [u8; 10] = "--encrypt\0"
+  pub let argv_lit_encrypt_len    : u64 = 9
+  pub let argv_lit_passphrase_fd  : [u8; 16] = "--passphrase-fd\0"
+  pub let argv_lit_pfd_len        : u64 = 15
+  pub let argv_lit_quota          : [u8; 8]  = "--quota\0"
+  pub let argv_lit_quota_len      : u64 = 7
+  pub let argv_lit_help           : [u8; 7]  = "--help\0"
+  pub let argv_lit_help_len       : u64 = 6
+
+  // --- LV11-025 (#25) quota-spec storage. Every --quota <spec>
+  //     match appends the spec's own argv[i+1] pointer (into the
+  //     caller's own argv array, whose lifetime is the whole
+  //     process) into this .bss slot array, capped at
+  //     ARGV_QUOTA_MAX_ENTRIES. A future quota-table serialization
+  //     pass (deferred per src/quota.pdx's own module header) will
+  //     iterate this array by reading PA_OFF_QUOTA_COUNT and
+  //     dereferencing each argv_quota_specs[i]. -------------------------
+  pub let ARGV_QUOTA_MAX_ENTRIES  : u64 = 16
+  // 16 u64 slots stored as a byte reserve for uniformity with every
+  // other .bss reserve in this codebase (`[u8; N]` is the established
+  // shape; see src/format.pdx / src/encrypt.pdx). The scale-8 SIB
+  // addressing `[rip + argv_quota_specs + rcx*8]` writes / reads each
+  // slot as a u64 despite the u8 element type -- same idiom
+  // src/format.pdx's mkfs_format_sb_summary uses to store u64 fields
+  // into its own `[u8; 176]` reserve.
+  pub let mut argv_quota_specs    : [u8; 128] = uninit @align(8)  // ARGV_QUOTA_MAX_ENTRIES * 8 bytes
 
   // ==========================================================================
   // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
@@ -304,8 +398,9 @@ module Argv = structure {
   //                 forwarded here unchanged by main.pdx)
   //   rsi = argv   (VA of a char*[]; argv[0] is the program name and is
   //                 skipped -- this loop starts at index 1)
-  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 40 bytes, caller-
-  //                 allocated .bss per main.pdx)
+  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 56 bytes at
+  //                 LV11-025, was 40 at M1..M5; caller-allocated .bss
+  //                 per main.pdx)
   //
   // Register plan across the loop (all SysV callee-save; pushed on entry
   // and popped at the shared epilogue -- see the entry-point
@@ -327,7 +422,7 @@ module Argv = structure {
   pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M1-002 (#2) + M1-003 (#3): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mkfs_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching the discipline libpdx-audit's audit_send_record follows via its own push r12/push r13 pair), unlike this file's three pure-leaf helpers (argv_streq / argv_prefix_match / argv_parse_u64_dec), which never touch a callee-save register and so need no push/pop. Zero-init pass writes out.flags=0 (+0), out.label_ptr=0 (+8), out.journal_size=ARGV_DEFAULT_JOURNAL_SIZE=1024 (+16), out.sig_key_ptr=0 (+24), out.target_ptr=0 (+32) before scanning, so every unset field has a well-defined value regardless of .bss zero-init happening to already hold zero for four of the five. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` / `call argv_prefix_match` / `call argv_parse_u64_dec` invocations below -- those three callees clobber only caller-save registers per their own justifications. Main loop (mkfs_argv_scan_loop): cmp r14, rbx; jge mkfs_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Seven flag checks in a fixed order (four boolean flags via argv_streq against four exact literals -- --force/--dry-run/--verbose/--upgrade [mkfs.pdxfs.M4-004, #16, stub-wired only -- see module header], then three value flags via argv_prefix_match against the three '='-terminated literals, each followed by a store into the matching out-struct slot plus its PA_FLAG_*_SET presence bit where applicable) -- --journal-size= additionally pipes its value pointer (r15 + argv_lit_journal_size_len) through argv_parse_u64_dec before storing the resulting u64. Every check that DOESN'T match falls through to the next; a token matching none of the seven is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals -- see module header). After a match (or the positional fallthrough), jmp mkfs_argv_scan_next which increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+32]) == 0, jmp mkfs_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed mkfs_argv_.",
+      justification: "mkfs.pdxfs.M1-002 (#2) + M1-003 (#3) + LV11-025 (#25): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mkfs_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching the discipline libpdx-audit's audit_send_record follows via its own push r12/push r13 pair), unlike this file's three pure-leaf helpers (argv_streq / argv_prefix_match / argv_parse_u64_dec), which never touch a callee-save register and so need no push/pop. Zero-init pass writes out.flags=0 (+0), out.label_ptr=0 (+8), out.journal_size=ARGV_DEFAULT_JOURNAL_SIZE=1024 (+16), out.sig_key_ptr=0 (+24), out.target_ptr=0 (+32) before scanning, so every unset field has a well-defined value regardless of .bss zero-init happening to already hold zero for four of the five. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` / `call argv_prefix_match` / `call argv_parse_u64_dec` invocations below -- those three callees clobber only caller-save registers per their own justifications. Main loop (mkfs_argv_scan_loop): cmp r14, rbx; jge mkfs_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Seven flag checks in a fixed order (four boolean flags via argv_streq against four exact literals -- --force/--dry-run/--verbose/--upgrade [mkfs.pdxfs.M4-004, #16, stub-wired only -- see module header], then three value flags via argv_prefix_match against the three '='-terminated literals, each followed by a store into the matching out-struct slot plus its PA_FLAG_*_SET presence bit where applicable) -- --journal-size= additionally pipes its value pointer (r15 + argv_lit_journal_size_len) through argv_parse_u64_dec before storing the resulting u64. Every check that DOESN'T match falls through to the next; a token matching none of the seven is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals -- see module header). After a match (or the positional fallthrough), jmp mkfs_argv_scan_next which increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+32]) == 0, jmp mkfs_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed mkfs_argv_.",
       block: {
         push rbx;
         push r12;
@@ -348,6 +443,8 @@ module Argv = structure {
         xor rax, rax;
         mov [r13 + 24], rax;                // sig_key_ptr = 0
         mov [r13 + 32], rax;                // target_ptr = 0
+        mov [r13 + 40], rax;                // passphrase_fd = 0 (LV11-025 PA_OFF_PASSPHRASE_FD)
+        mov [r13 + 48], rax;                // quota_count  = 0 (LV11-025 PA_OFF_QUOTA_COUNT)
 
         mov r14, 1;                         // i = 1 (skip argv[0])
 
@@ -399,11 +496,111 @@ module Argv = structure {
         lea rsi, [rip + argv_lit_upgrade];
         call argv_streq;
         cmp rax, 0;
-        je mkfs_argv_check_label;
+        je mkfs_argv_check_help;
 
         mov rax, [r13 + 0];
         or rax, 0x40;                       // PA_FLAG_UPGRADE
         mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_help:
+        // ---- LV11-025 (#25): --help (exact, no value). -------------------
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_help];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_encrypt;
+
+        mov rax, [r13 + 0];
+        or rax, 0x400;                      // PA_FLAG_HELP
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_encrypt:
+        // ---- LV11-025 (#25): --encrypt (exact, no value). ----------------
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_encrypt];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_pfd;
+
+        mov rax, [r13 + 0];
+        or rax, 0x80;                       // PA_FLAG_ENCRYPT
+        mov [r13 + 0], rax;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_pfd:
+        // ---- LV11-025 (#25): --passphrase-fd <n> (two-token). ------------
+        // Match the flag-name literal first; on a match, consume
+        // argv[i+1] as the fd number via argv_parse_u64_dec.
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_passphrase_fd];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_quota;
+
+        // Bounds: need argv[i+1] present. LV11-025 fixup (v1.1.1
+        // debugger SUSPECT #3): if the fd token is missing, do NOT
+        // latch the presence bit; otherwise --encrypt --passphrase-fd
+        // (with no value) bypasses main.pdx's encrypt-needs-pfd gate
+        // and silently reads the passphrase from stdin.
+        mov rax, r14;
+        add rax, 1;                         // rax = i + 1
+        cmp rax, rbx;
+        jge mkfs_argv_scan_next;            // no next token: drop flag entirely
+
+        // Parse next token as u64 fd.
+        mov rdi, [r12 + rax*8];             // fd_str = argv[i+1]
+        call argv_parse_u64_dec;
+        mov [r13 + 40], rax;                // PA_OFF_PASSPHRASE_FD
+
+        // Latch the presence bit ONLY after a value token was consumed.
+        mov rax, [r13 + 0];
+        or rax, 0x100;                      // PA_FLAG_PASSPHRASE_FD_SET
+        mov [r13 + 0], rax;
+
+        // Advance i by an extra 1 (scan_next adds the second 1).
+        add r14, 1;
+        jmp mkfs_argv_scan_next;
+
+      mkfs_argv_check_quota:
+        // ---- LV11-025 (#25): --quota <spec> (two-token, repeatable). -----
+        // Match the flag-name literal first; on a match, consume
+        // argv[i+1] as the spec-string pointer and append into
+        // argv_quota_specs[count] iff count < ARGV_QUOTA_MAX_ENTRIES.
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_quota];
+        call argv_streq;
+        cmp rax, 0;
+        je mkfs_argv_check_label;
+
+        // Latch the presence bit regardless (matches the malformed-
+        // value silent-drop posture).
+        mov rax, [r13 + 0];
+        or rax, 0x200;                      // PA_FLAG_QUOTA_SET
+        mov [r13 + 0], rax;
+
+        // Bounds: need argv[i+1] present.
+        mov rax, r14;
+        add rax, 1;                         // rax = i + 1
+        cmp rax, rbx;
+        jge mkfs_argv_scan_next;            // no next token: silently drop value
+
+        // Bounds: count < ARGV_QUOTA_MAX_ENTRIES.
+        mov rcx, [r13 + 48];                // count = PA_OFF_QUOTA_COUNT
+        cmp rcx, 16;                        // ARGV_QUOTA_MAX_ENTRIES
+        jge mkfs_argv_quota_advance;        // full: drop spec, still consume token
+
+        // Append spec ptr into argv_quota_specs[count].
+        mov r10, [r12 + rax*8];             // spec = argv[i+1]
+        lea r11, [rip + argv_quota_specs];
+        mov [r11 + rcx*8], r10;
+        add rcx, 1;
+        mov [r13 + 48], rcx;                // count += 1
+
+      mkfs_argv_quota_advance:
+        // Advance i by an extra 1 (scan_next adds the second 1).
+        add r14, 1;
         jmp mkfs_argv_scan_next;
 
       mkfs_argv_check_label:

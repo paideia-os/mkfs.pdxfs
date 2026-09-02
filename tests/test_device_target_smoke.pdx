@@ -134,9 +134,17 @@ module TestDeviceTargetSmoke = structure {
       effects: {mem, sysreg}, capabilities: {fs},
       justification: "mkfs.pdxfs.M4-003 (#15): TestDeviceTargetSmoke::run entry point. rdi=&mkfs_test_device_target (target_ptr), rsi=0 (force_flag, unused by the stub body per src/format.pdx's own module header), rdx=1024 (journal_size_blocks, likewise unused), `call mkfs_format_run_device` (src/format.pdx, M3-001 #8) -- a real, wired call: internally parses the device-cap slot via Target::mkfs_dev_parse_slot and emits PdxFsFormatRecord@0.1 { result_code: DEVICE_TARGET_STUB } via src/pipe_wire.pdx's mkfs_sp_emit_result, performing no write of any kind. `cmp rax,4; jne mkfs_test_unexpected` (MKFS_EXIT_DEVICE_STUB -- the function's own u64 exit-status contract, a DIFFERENT layer/constant from the record's result_code field, see module header). Matching falls to `xor rax,rax; ret` (0: the stub contract holds). mkfs_test_unexpected: `mov rax,1; ret` (1: the stub's behaviour changed -- a signal a real device-write body has landed and this driver needs a real update). No register survives the one nested call, so no push/pop. No `add reg,[mem]`. No `test` mnemonic. No branch label needed beyond mkfs_test_unexpected.",
       block: {
+        // LV11-025 (#25) widened mkfs_format_run_device's signature to
+        // 5 args (rcx=flags, r8=passphrase_fd). This stub driver's
+        // pre-LV11 shape read only rdi/rsi/rdx, but rcx/r8 now carry
+        // real caller responsibility even though the stub body still
+        // ignores them at this landing -- zero both so a future real
+        // device-write body inherits a deterministic starting state.
         lea rdi, [rip + mkfs_test_device_target];
         xor rsi, rsi;                        // force_flag (unused by the stub body)
         mov rdx, 1024;                       // journal_size_blocks (unused by the stub body)
+        xor rcx, rcx;                        // flags = 0 (LV11-025)
+        xor r8,  r8;                         // passphrase_fd = 0 (LV11-025)
         call mkfs_format_run_device;
 
         cmp rax, 4;                          // MKFS_EXIT_DEVICE_STUB

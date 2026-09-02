@@ -161,9 +161,17 @@ module TestFileTargetHappy = structure {
 
       mkfs_test_phase2:
         // ---- Phase 2: real write against a fresh target. ----------------
+        // LV11-025 (#25) widened mkfs_format_run's signature to 5 args
+        // (rcx=flags, r8=passphrase_fd); this driver exercises the M2
+        // shape only, so both extras stay zero -- rcx=0 with the encrypt
+        // bit (0x80) clear routes through mkfs_encrypt_apply_flag +
+        // mkfs_encrypt_apply_wrap as no-ops, exactly the M2 pipeline
+        // this phase asserts.
         lea rdi, [rip + mkfs_test_path_real];
         xor rsi, rsi;                        // force_flag = 0
         mov rdx, 4;                          // journal_size (blocks)
+        xor rcx, rcx;                        // flags = 0 (LV11-025)
+        xor r8,  r8;                         // passphrase_fd = 0 (unused)
         call mkfs_format_run;
         cmp rax, 0;                          // MKFS_EXIT_OK
         jne mkfs_test_fail_phase2;
@@ -172,6 +180,8 @@ module TestFileTargetHappy = structure {
         lea rdi, [rip + mkfs_test_path_real];
         xor rsi, rsi;                        // force_flag = 0
         mov rdx, 4;
+        xor rcx, rcx;                        // flags = 0 (LV11-025)
+        xor r8,  r8;                         // passphrase_fd = 0
         call mkfs_format_run;
         cmp rax, 5;                          // MKFS_EXIT_REFUSED
         jne mkfs_test_fail_phase3;
@@ -180,6 +190,8 @@ module TestFileTargetHappy = structure {
         lea rdi, [rip + mkfs_test_path_real];
         mov rsi, 1;                          // force_flag = 1
         mov rdx, 4;
+        xor rcx, rcx;                        // flags = 0 (LV11-025)
+        xor r8,  r8;                         // passphrase_fd = 0
         call mkfs_format_run;
         cmp rax, 0;                          // MKFS_EXIT_OK
         jne mkfs_test_fail_phase4;

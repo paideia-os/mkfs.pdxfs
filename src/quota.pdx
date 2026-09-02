@@ -1,0 +1,153 @@
+// src/quota.pdx -- mkfs.pdxfs.LV11-025 (#25) -- --quota format-time
+// wiring around libpdx-volume M4-001/M4-002 (#27, #28)
+//
+// ----------------------------------------------------------------------
+// Scope
+// ----------------------------------------------------------------------
+//
+// This file lands the one hook body src/format.pdx's mkfs_format_run
+// invokes when the caller's ParsedArgv carries PA_FLAG_QUOTA_SET:
+//
+//   mkfs_quota_apply_flag(summary_ptr, flags) -> ()
+//     Called BEFORE pdxb_encode_superblock. Iff `flags & PA_FLAG_QUOTA_SET`
+//     (0x200), bumps the summary's version to PDXB_VERSION_V2 via
+//     pdxb_sb_set_version and OR-s PDXB_FLAG_HAS_QUOTA (0x01) into
+//     SBS_OFF_FLAGS via a get_flags/set_flags pair. When the bit is
+//     not set the function returns immediately without touching the
+//     summary. Idempotent + composable with mkfs_encrypt_apply_flag:
+//     both may run on the same summary in either order (both set the
+//     same version, both OR distinct flag bits).
+//
+// ----------------------------------------------------------------------
+// Quota-table serialization: documented as deferred substrate
+// ----------------------------------------------------------------------
+//
+// libpdx-volume M4-001 (#27) landed the real quota-row codec
+// (`pdxb_quota_row_encode` / `_row_parse`) and the row/summary layout
+// families (PDXQ_D_OFF_* / PDXQ_OFF_*), and M4-002 (#28) landed the
+// enforcement helpers (`pdxb_quota_check` / `_commit`). What this
+// landing does NOT do at LV11-025:
+//
+//   1. **Reserve quota-table LBAs in the on-disk layout.** The
+//      superblock's `_reserved` region carries no
+//      `quota_table_lba` / `quota_table_bcount` slot pair in
+//      libpdx-volume v1.1.1's SBS_OFF_* summary layout; both fields
+//      the issue brief names live in the still-unfrozen v2 superblock
+//      _reserved region that this repo would need libpdx-volume to
+//      publish accessors for before the mkfs write could point
+//      anywhere. **Flagged for main and for libpdx-volume:** add
+//      `SBS_OFF_QUOTA_LBA` / `SBS_OFF_QUOTA_BCOUNT` (and matching
+//      `PDXB_D_OFF_QUOTA_*`) plus `pdxb_sb_get_quota_lba` / _set_ etc.
+//      accessors to libpdx-volume/src/pdxb_superblock.pdx.
+//
+//   2. **Encode quota rows into a quota-table region.** The row codec
+//      is ready (`pdxb_quota_row_encode`), and mkfs.pdxfs already has
+//      the argv-parsed spec strings sitting in src/argv.pdx's
+//      `argv_quota_specs` .bss array with the count in
+//      `PA_OFF_QUOTA_COUNT` -- but a real per-spec walk (parse the
+//      "USER=SOFT,HARD" string form, build a PDXQ_SUMMARY_BYTES scratch,
+//      call `pdxb_quota_row_encode` into a per-row 64-byte slot,
+//      sys_write the resulting rows at the reserved LBAs) needs the
+//      LBA reservation in (1) to have a destination. Deferred to the
+//      same follow-up wave.
+//
+// What THIS landing does deliver at LV11-025:
+//
+//   - The `--quota=<spec>` argv flag parses cleanly (repeatable, up
+//     to `ARGV_QUOTA_MAX_ENTRIES` entries), setting PA_FLAG_QUOTA_SET
+//     and populating `argv_quota_specs` + `PA_OFF_QUOTA_COUNT`.
+//   - The superblock's `flags` slot has `PDXB_FLAG_HAS_QUOTA` OR-ed
+//     in and the version is bumped to PDXB_VERSION_V2, so a future
+//     mount.pdxfs / fsck can distinguish a quota-enabled volume from
+//     one that only holds the format-time bit.
+//   - Wire-record `has_quota` surfacing is deferred pending a
+//     `format_record.pdx` v0.2 revision that adds the suffix segment;
+//     today mkfs surfaces the enabled-flag only via the superblock's
+//     `PDXB_FLAG_HAS_QUOTA` on-disk bit (a prior draft of this header
+//     claimed a `has_quota: true` PdxFsFormatRecord@0.1 suffix, but
+//     no such field was ever added to `src/format_record.pdx`; the
+//     wire-record additions listed there for LV11-025 do not exist --
+//     grep-confirmed 2026-09-02, mkfs.pdxfs 1.1.1 fixup).
+//
+// This posture -- "wire fields real, substrate deferred" -- matches
+// this tool's existing pattern for the placeholder ML-DSA-65 signing
+// seed (src/format.pdx's Seed-key strategy section) and for the
+// documented device-target stub (src/format.pdx's M3-001 section).
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `@no_frame` anywhere (frame prologue implicit). No `add reg, [mem]`
+// anywhere. No `test` mnemonic. Reserved-label discipline: every
+// branch label prefixed `mkfs_quota_`.
+
+module Quota = structure {
+
+  // --- LV11-025 (#25) flag bit masks, mirrored from src/argv.pdx. ---
+  pub let MKFS_QUOTA_FLAG_QUOTA_SET : u64 = 0x200   // PA_FLAG_QUOTA_SET
+
+  // --- PDXB v2 constants, cited from libpdx-volume/src/pdxb_superblock.pdx. -
+  pub let PDXB_VERSION_V2         : u64 = 2       // libpdx-volume
+  pub let PDXB_FLAG_HAS_QUOTA     : u64 = 0x01    // libpdx-volume flags bit
+
+  // ==========================================================================
+  // mkfs_quota_apply_flag(summary_ptr, flags) -> ()
+  //
+  //   rdi = summary_ptr (176-byte PdxbSuperblockSummary, SBS_OFF_* layout)
+  //   rsi = flags       (ParsedArgv.flags verbatim)
+  //
+  // Iff `flags & PA_FLAG_QUOTA_SET` (0x200), bumps the summary's version
+  // to PDXB_VERSION_V2 (via pdxb_sb_set_version) and OR-s
+  // PDXB_FLAG_HAS_QUOTA (0x01) into SBS_OFF_FLAGS (via a
+  // pdxb_sb_get_flags -> or -> pdxb_sb_set_flags round trip). No-op
+  // when the bit is not set. Idempotent, composable with
+  // mkfs_encrypt_apply_flag.
+  //
+  // Register plan: rbx = summary_ptr, r12 = flags. Both callee-save,
+  // pushed on entry and popped before the single ret. r13 is
+  // additionally pushed/popped in mkfs.pdxfs 1.1.1 fixup (Bug #3) as
+  // a throwaway third slot for rsp%16==0 stack alignment across the
+  // nested `call` sites -- SysV entry hands us rsp%16==8, so an odd
+  // number of pushes (three) restores rsp%16==0 as the callees expect.
+  // ==========================================================================
+  pub let mkfs_quota_apply_flag : (u64, u64) -> () !{mem} @{} =
+    fn (summary_ptr: u64) (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs.LV11-025 (#25) + 1.1.1 fixup (Bug #3): mkfs_quota_apply_flag entry point. push rbx; push r12; push r13 before repurposing either -- r13 is a throwaway third push whose ONLY role is to keep rsp % 16 == 0 across the three nested pdxb_sb_* calls (SysV entry hands us rsp % 16 == 8; two callee-save pushes would leave rsp % 16 == 8 which is a stack-misalignment ABI violation at every call site even though the pdxb_sb_get_flags/_set_flags/_set_version leaves currently tolerate it; three pushes restore rsp % 16 == 0, matching mkfs_encrypt_apply_wrap's rbx/r12/r13 push shape). rbx = summary_ptr, r12 = flags. Flag gate: `mov rax, r12; and rax, 0x200` (PA_FLAG_QUOTA_SET / MKFS_QUOTA_FLAG_QUOTA_SET -- imm16-safe under cmp-imm bounds); `cmp rax, 0; je done` skips the whole body when the bit is not set. On the quota path: (1) pdxb_sb_set_version(rbx, 2=PDXB_VERSION_V2) via `mov rdi, rbx; mov rsi, 2; call pdxb_sb_set_version`. (2) pdxb_sb_get_flags(rbx) via `mov rdi, rbx; call pdxb_sb_get_flags` -> rax = current flags. (3) OR the has-quota bit: `mov r10, rax; or r10, 0x01` (PDXB_FLAG_HAS_QUOTA -- imm8). (4) pdxb_sb_set_flags(rbx, r10) via `mov rdi, rbx; mov rsi, r10; call pdxb_sb_set_flags`. done: pop r12; pop rbx; ret. Every nested call is a pure leaf per its own libpdx-volume/src/pdxb_superblock.pdx justification, so rbx/r12 survive each call transparently. Composable with mkfs_encrypt_apply_flag on the same summary in either order: both set the same version verbatim (idempotent) and OR distinct flag bits into SBS_OFF_FLAGS. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_quota_af_. Frame prologue implicit.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                           // 1.1.1 Bug #3: throwaway third push for rsp%16==0
+
+        mov rbx, rdi;                       // rbx = summary_ptr
+        mov r12, rsi;                       // r12 = flags
+
+        mov rax, r12;
+        and rax, 0x200;                     // MKFS_QUOTA_FLAG_QUOTA_SET
+        cmp rax, 0;
+        je mkfs_quota_af_done;
+
+        // ---- Bump version to v2. -----------------------------------------
+        mov rdi, rbx;
+        mov rsi, 2;                         // PDXB_VERSION_V2
+        call pdxb_sb_set_version;
+
+        // ---- OR the has-quota flag bit into SBS_OFF_FLAGS. --------------
+        mov rdi, rbx;
+        call pdxb_sb_get_flags;
+        mov r10, rax;
+        or r10, 0x01;                       // PDXB_FLAG_HAS_QUOTA
+
+        mov rdi, rbx;
+        mov rsi, r10;
+        call pdxb_sb_set_flags;
+
+      mkfs_quota_af_done:
+        pop r13;                            // 1.1.1 Bug #3: matches the entry push_r13
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

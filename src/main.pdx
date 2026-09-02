@@ -101,12 +101,15 @@
 
 module Main = structure {
 
-  // --- ParsedArgv scratch struct (Argv::PA_STRUCT_BYTES = 40 bytes). ------
-  // .bss, zero-initialised by the loader before _start runs; argv_parse
-  // additionally writes every field explicitly (including the
-  // journal_size default) so this function never reads stale/uninit
-  // bytes even on a build where .bss zero-init were somehow skipped.
-  pub let mut mkfs_argv_out : [u8; 40] = uninit @align(8)
+  // --- ParsedArgv scratch struct (Argv::PA_STRUCT_BYTES = 56 bytes at
+  //     LV11-025 (#25); was 40 at M1..M5, widened for the new
+  //     passphrase_fd + quota_count slots). .bss, zero-initialised by
+  //     the loader before _start runs; argv_parse additionally writes
+  //     every field explicitly (including the journal_size default and
+  //     the two new LV11-025 slots) so this function never reads
+  //     stale/uninit bytes even on a build where .bss zero-init were
+  //     somehow skipped.
+  pub let mut mkfs_argv_out : [u8; 56] = uninit @align(8)
 
   // --- Diagnostic messages (fd 2). -----------------------------------------
   pub let mkfs_msg_missing_target     : [u8; 28] = "mkfs.pdxfs: missing target\n\0"
@@ -114,6 +117,63 @@ module Main = structure {
 
   pub let mkfs_msg_not_implemented     : [u8; 33] = "mkfs.pdxfs: not yet implemented\n\0"
   pub let mkfs_msg_not_implemented_len : u64 = 32
+
+  // --- mkfs.pdxfs 1.1.1 fixup (LV11-025 Bug #2): --encrypt without
+  //     --passphrase-fd is refused fail-closed here in main.pdx BEFORE
+  //     any dispatch, so `mkfs_encrypt_apply_wrap` never reaches
+  //     `sys_read(fd=0, ...)` and reads a passphrase from stdin under
+  //     the caller's back (see src/format.pdx's LV11-025 comment at
+  //     the mkfs_format_run signature which now honestly cites this
+  //     upstream refusal instead of claiming an already-landed check).
+  //     Byte count: "mkfs.pdxfs: --encrypt requires --passphrase-fd\n"
+  //     is 47 bytes (10 "mkfs.pdxfs" + ": " + "--encrypt" 9 +
+  //     " requires " 10 + "--passphrase-fd" 15 + "\n" 1 = 47), plus
+  //     one NUL for the byte-array length.
+  pub let mkfs_msg_encrypt_needs_pfd     : [u8; 48] = "mkfs.pdxfs: --encrypt requires --passphrase-fd\n\0"
+  pub let mkfs_msg_encrypt_needs_pfd_len : u64 = 47
+
+  // --- LV11-025 (#25): --help usage lines, written to fd 1. -------------
+  //
+  // Compact one-line-per-flag layout matching the design/tooling/
+  // volume-tooling-ux.md §3.1 CLI grammar plus the four v1.1
+  // additions (--encrypt / --passphrase-fd / --quota / --help). Every
+  // v1.1 line carries a "(v1.1)" tag so an operator reading the help
+  // can tell the added surface from the M1..M5 surface at a glance.
+  //
+  // Emitted as thirteen per-line sys_writes rather than a single
+  // multi-line literal because paideia-as's byte-array initialiser
+  // does not use backslash-newline string continuation anywhere else
+  // in this codebase (see src/pipe_wire.pdx's own sp_lit_header for
+  // the established single-line convention). Each per-line literal
+  // includes its trailing '\n' + '\0'; mkfs_msg_help_line_N_len is
+  // the sys_write length (bytes minus the NUL), same pattern the two
+  // diagnostic messages above use.
+  pub let mkfs_msg_help_l01     : [u8; 31] = "mkfs.pdxfs [options] <target>\n\0"
+  pub let mkfs_msg_help_l01_len : u64 = 30
+  pub let mkfs_msg_help_l02     : [u8; 10] = "Options:\n\0"
+  pub let mkfs_msg_help_l02_len : u64 = 9
+  pub let mkfs_msg_help_l03     : [u8; 61] = "  --force                       overwrite non-blank targets\n\0"
+  pub let mkfs_msg_help_l03_len : u64 = 60
+  pub let mkfs_msg_help_l04     : [u8; 46] = "  --label=<str>                 volume label\n\0"
+  pub let mkfs_msg_help_l04_len : u64 = 45
+  pub let mkfs_msg_help_l05     : [u8; 71] = "  --journal-size=<n>            journal size in blocks (default 1024)\n\0"
+  pub let mkfs_msg_help_l05_len : u64 = 70
+  pub let mkfs_msg_help_l06     : [u8; 55] = "  --dry-run                     preview; do not write\n\0"
+  pub let mkfs_msg_help_l06_len : u64 = 54
+  pub let mkfs_msg_help_l07     : [u8; 48] = "  --verbose                     verbose output\n\0"
+  pub let mkfs_msg_help_l07_len : u64 = 47
+  pub let mkfs_msg_help_l08     : [u8; 60] = "  --sig-key=<cap-uri>           signing key capability URI\n\0"
+  pub let mkfs_msg_help_l08_len : u64 = 59
+  pub let mkfs_msg_help_l09     : [u8; 59] = "  --upgrade                     PDXL->PDXB rewrite (stub)\n\0"
+  pub let mkfs_msg_help_l09_len : u64 = 58
+  pub let mkfs_msg_help_l10     : [u8; 69] = "  --encrypt                     (v1.1) enable v2 encrypted DEK wrap\n\0"
+  pub let mkfs_msg_help_l10_len : u64 = 68
+  pub let mkfs_msg_help_l11     : [u8; 66] = "  --passphrase-fd <n>           (v1.1) read passphrase from fd n\n\0"
+  pub let mkfs_msg_help_l11_len : u64 = 65
+  pub let mkfs_msg_help_l12     : [u8; 68] = "  --quota <spec>                (v1.1) USER=SOFT,HARD (repeatable)\n\0"
+  pub let mkfs_msg_help_l12_len : u64 = 67
+  pub let mkfs_msg_help_l13     : [u8; 65] = "  --help                        (v1.1) print this help and exit\n\0"
+  pub let mkfs_msg_help_l13_len : u64 = 64
 
   // ==========================================================================
   // _start -- user program entry point. Never returns (every terminal
@@ -123,7 +183,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001 (#4) + M3 (#8, #9, #10, #11, #12): mkfs.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mkfs_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to the missing-target path: sys_write(2, mkfs_msg_missing_target, 27), sys_exit(2) -- UNCHANGED from M1/M2; no audit record is opened for this path (see module header). Phase 2 (on ARGV_OK, mkfs_main_argv_ok): r14 = &mkfs_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags); r15 = [r14+32] (ParsedArgv.target_ptr). NEW at M3 (#11): rdi=r15 (target_ptr), rax=rbx&0x1 (PA_FLAG_FORCE) moved into rsi (force_flag), `call mkfs_audit_begin` (src/audit_wire.pdx) -> rax=audit_id; `mov r12, rax` (r12 reused from the now-dead argc, see module header's register plan). Gate 1 (classify): rdi=r15; call target_classify (src/target.pdx, UNCHANGED); `cmp rax,0; je mkfs_main_target_file` (Target::TARGET_FILE); `cmp rax,1; je mkfs_main_target_device` (Target::TARGET_DEVICE_CAP, NEW at M3 -- no longer falls straight through); any other value (Target::TARGET_INVALID) falls through to `jmp mkfs_main_not_implemented`. mkfs_main_target_file: Gate 2, rax=rbx&0x2 (PA_FLAG_DRY_RUN); `cmp rax,0; je mkfs_main_file_real` when NOT given. When --dry-run WAS given: rdi=r15, rsi=[r14+8] (label_ptr), rdx=[r14+16] (journal_size); `call mkfs_sp_emit_dry_run` (src/pipe_wire.pdx, M3 #10 -- replaces the M1/M2 direct call to format_record_emit_dry_run) -- prints the deferred-header line then the M1 four-field preview line; rdi=r12 (audit_id), xor rsi,rsi (exit_status=0), `call mkfs_audit_commit` (src/audit_wire.pdx); xor rdi,rdi; sys_exit(0). mkfs_main_file_real: rdi=r15, rax=rbx&0x1 (force_flag), rdx=[r14+16] (journal_size); `call mkfs_format_run` (src/format.pdx, M2 #5/#6/#7, extended M3 #9 to sign) -> rax=exit_status; `mov r13, rax` (stashed -- r13, argv, is dead by this point, see module header); rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(r13). mkfs_main_target_device (NEW at M3, #8/#12): rdi=r15, `call mkfs_dev_parse_slot` (src/target.pdx) -> rax=dev_slot; `mov r13, rax` (stashed). rdi=r15, rsi=r13, `call mkfs_elev_require_device_write` (src/elevate_wire.pdx) -> rax in {MKFS_ELEV_DENY=0, MKFS_ELEV_GRANT=1}; `cmp rax,1; je mkfs_main_device_grant`. DENY (the only value this landing's elevate_wire body can ever produce -- see that file's own header): rdi=r15, mov rsi,6 (FR_RESULT_ELEVATION_DENIED), xor rdx,rdx, `call mkfs_sp_emit_result` (src/pipe_wire.pdx); `mov r13, 6` (MKFS_EXIT_ELEVATION_DENIED, r13's dev_slot value is dead by this point -- reused as a plain scratch slot, see module header); rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(6). mkfs_main_device_grant (real, wired, unreachable at this landing): rdi=r15, rax=rbx&0x1 (force_flag), rdx=[r14+16] (journal_size); `call mkfs_format_run_device` (src/format.pdx, M3 #8, a documented stub) -> rax=exit_status; `mov r13, rax`; rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(r13). mkfs_main_not_implemented: sys_write(2, mkfs_msg_not_implemented, 32); rdi=r12, mov rsi,1, `call mkfs_audit_commit` (NEW at M3 -- this path is now also audit-wrapped, since audit_begin already ran unconditionally in Phase 2); sys_exit(1). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders, matching every other _start in the paideia-os monorepo's src/user/ tree. target_classify/mkfs_dev_parse_slot/mkfs_elev_require_device_write are pure/self-preserving per their own justifications; mkfs_format_run/mkfs_format_run_device/mkfs_sp_emit_dry_run/mkfs_sp_emit_result/mkfs_audit_begin/mkfs_audit_commit all either touch only caller-save registers or explicitly preserve every callee-save register they repurpose (design/architecture.md §7) -- so rbx/r14/r15 (and r12/r13 once assigned their M3 roles) all survive every call in this function transparently, needing no push/pop here. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mkfs_main_.",
+      justification: "mkfs.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001 (#4) + M3 (#8, #9, #10, #11, #12) + 1.1.1 fixup (LV11-025 Bug #2 + Bug #4): mkfs.pdxfs _start. mkfs.pdxfs 1.1.1 fixup precedence: (a) `--help` is checked IMMEDIATELY after `call argv_parse` -- BEFORE the argv_parse return-code branch -- so a bare `mkfs.pdxfs --help` (which argv_parse reports as ARGV_ERR_MISSING_TARGET because there is no positional) still prints usage + exits 0 rather than surfacing a spurious \"missing target\" error. argv_parse latches PA_FLAG_HELP into mkfs_argv_out.flags during its scan regardless of the eventual missing-target verdict (src/argv.pdx's mkfs_argv_check_help block), so a direct memory load of PA_OFF_FLAGS (offset 0) reveals the bit even on the ARGV_ERR_MISSING_TARGET path. The argv_parse return code is stashed in r10 across the flag load. (b) `--encrypt` without `--passphrase-fd` is refused fail-closed inside mkfs_main_argv_ok, right after rbx=flags is loaded but BEFORE the audit record opens or any dispatch fires -- this closes the interactive-or-EOF hazard where mkfs_encrypt_apply_wrap would otherwise sys_read from fd 0 (stdin) using ParsedArgv.passphrase_fd's zero default. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mkfs_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On a non-zero return (ARGV_ERR_MISSING_TARGET), jump to the missing-target path: sys_write(2, mkfs_msg_missing_target, 27), sys_exit(2) -- UNCHANGED from M1/M2; no audit record is opened for this path (see module header). Phase 2 (on ARGV_OK, mkfs_main_argv_ok): r14 = &mkfs_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags); r15 = [r14+32] (ParsedArgv.target_ptr). NEW at M3 (#11): rdi=r15 (target_ptr), rax=rbx&0x1 (PA_FLAG_FORCE) moved into rsi (force_flag), `call mkfs_audit_begin` (src/audit_wire.pdx) -> rax=audit_id; `mov r12, rax` (r12 reused from the now-dead argc, see module header's register plan). Gate 1 (classify): rdi=r15; call target_classify (src/target.pdx, UNCHANGED); `cmp rax,0; je mkfs_main_target_file` (Target::TARGET_FILE); `cmp rax,1; je mkfs_main_target_device` (Target::TARGET_DEVICE_CAP, NEW at M3 -- no longer falls straight through); any other value (Target::TARGET_INVALID) falls through to `jmp mkfs_main_not_implemented`. mkfs_main_target_file: Gate 2, rax=rbx&0x2 (PA_FLAG_DRY_RUN); `cmp rax,0; je mkfs_main_file_real` when NOT given. When --dry-run WAS given: rdi=r15, rsi=[r14+8] (label_ptr), rdx=[r14+16] (journal_size); `call mkfs_sp_emit_dry_run` (src/pipe_wire.pdx, M3 #10 -- replaces the M1/M2 direct call to format_record_emit_dry_run) -- prints the deferred-header line then the M1 four-field preview line; rdi=r12 (audit_id), xor rsi,rsi (exit_status=0), `call mkfs_audit_commit` (src/audit_wire.pdx); xor rdi,rdi; sys_exit(0). mkfs_main_file_real: rdi=r15, rax=rbx&0x1 (force_flag), rdx=[r14+16] (journal_size); `call mkfs_format_run` (src/format.pdx, M2 #5/#6/#7, extended M3 #9 to sign) -> rax=exit_status; `mov r13, rax` (stashed -- r13, argv, is dead by this point, see module header); rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(r13). mkfs_main_target_device (NEW at M3, #8/#12): rdi=r15, `call mkfs_dev_parse_slot` (src/target.pdx) -> rax=dev_slot; `mov r13, rax` (stashed). rdi=r15, rsi=r13, `call mkfs_elev_require_device_write` (src/elevate_wire.pdx) -> rax in {MKFS_ELEV_DENY=0, MKFS_ELEV_GRANT=1}; `cmp rax,1; je mkfs_main_device_grant`. DENY (the only value this landing's elevate_wire body can ever produce -- see that file's own header): rdi=r15, mov rsi,6 (FR_RESULT_ELEVATION_DENIED), xor rdx,rdx, `call mkfs_sp_emit_result` (src/pipe_wire.pdx); `mov r13, 6` (MKFS_EXIT_ELEVATION_DENIED, r13's dev_slot value is dead by this point -- reused as a plain scratch slot, see module header); rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(6). mkfs_main_device_grant (real, wired, unreachable at this landing): rdi=r15, rax=rbx&0x1 (force_flag), rdx=[r14+16] (journal_size); `call mkfs_format_run_device` (src/format.pdx, M3 #8, a documented stub) -> rax=exit_status; `mov r13, rax`; rdi=r12, rsi=r13, `call mkfs_audit_commit`; rdi=r13; sys_exit(r13). mkfs_main_not_implemented: sys_write(2, mkfs_msg_not_implemented, 32); rdi=r12, mov rsi,1, `call mkfs_audit_commit` (NEW at M3 -- this path is now also audit-wrapped, since audit_begin already ran unconditionally in Phase 2); sys_exit(1). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders, matching every other _start in the paideia-os monorepo's src/user/ tree. target_classify/mkfs_dev_parse_slot/mkfs_elev_require_device_write are pure/self-preserving per their own justifications; mkfs_format_run/mkfs_format_run_device/mkfs_sp_emit_dry_run/mkfs_sp_emit_result/mkfs_audit_begin/mkfs_audit_commit all either touch only caller-save registers or explicitly preserve every callee-save register they repurpose (design/architecture.md §7) -- so rbx/r14/r15 (and r12/r13 once assigned their M3 roles) all survive every call in this function transparently, needing no push/pop here. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mkfs_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -133,6 +193,29 @@ module Main = structure {
         mov rsi, r13;
         lea rdx, [rip + mkfs_argv_out];
         call argv_parse;
+
+        // ---- 1.1.1 fixup (LV11-025 Bug #4): --help precedence. -----------
+        // argv_parse latches PA_FLAG_HELP during its scan (src/argv.pdx's
+        // mkfs_argv_check_help block) regardless of whether it eventually
+        // returns ARGV_OK or ARGV_ERR_MISSING_TARGET. We must therefore
+        // consult PA_FLAG_HELP BEFORE branching on the return code -- a
+        // bare `mkfs.pdxfs --help` (no positional target) makes argv_parse
+        // return ARGV_ERR_MISSING_TARGET, but --help is a documentation
+        // query and MUST print usage + exit 0, not surface a spurious
+        // "missing target" error.
+        //
+        // r10 (SysV caller-save, not otherwise live at this point) stashes
+        // argv_parse's return so we can restore it for the cmp below. The
+        // flag load is a direct rip-relative memory read of
+        // mkfs_argv_out + PA_OFF_FLAGS (offset 0), sidestepping the r14
+        // base-address setup that only happens once we know argv_parse
+        // succeeded.
+        mov r10, rax;                         // stash argv_parse return
+        mov rax, [rip + mkfs_argv_out + 0];   // flags word (Argv::PA_OFF_FLAGS)
+        and rax, 0x400;                       // Argv::PA_FLAG_HELP
+        cmp rax, 0;
+        jne mkfs_main_do_help;
+        mov rax, r10;                         // restore for the ARGV_OK compare
 
         cmp rax, 0;                          // ARGV_OK
         je mkfs_main_argv_ok;
@@ -149,12 +232,141 @@ module Main = structure {
         syscall;
         hlt;
 
+      mkfs_main_do_help:
+        // ---- LV11-025 (#25): --help usage emission (fd 1, sys_exit 0).
+        //      Reached from the upstream --help precedence check above --
+        //      covers BOTH the bare `mkfs.pdxfs --help` (no positional,
+        //      argv_parse returned ARGV_ERR_MISSING_TARGET) and the
+        //      `mkfs.pdxfs /tmp/x.img --help` (positional supplied,
+        //      argv_parse returned ARGV_OK) cases. Placed here (between
+        //      the missing-target path and mkfs_main_argv_ok) so that
+        //      fall-through from either surrounding block cannot reach
+        //      it -- both surrounding blocks terminate in sys_exit + hlt
+        //      before this label, and this block itself terminates in
+        //      sys_exit + hlt before mkfs_main_argv_ok. Each sys_write
+        //      clobbers only caller-save registers (rax/rcx/rdx/rdi/rsi/
+        //      r8-r11 per the amd64 fast-syscall convention -- callee-
+        //      save regs are preserved by SYSCALL itself); no callee-
+        //      save reg is live at this label since we jumped in from
+        //      before mkfs_main_argv_ok's r14/rbx/r15 setup ran, so
+        //      there is nothing this sequence must preserve.
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l01];
+        mov rdx, 30;                         // mkfs_msg_help_l01_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l02];
+        mov rdx, 9;                          // mkfs_msg_help_l02_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l03];
+        mov rdx, 60;                         // mkfs_msg_help_l03_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l04];
+        mov rdx, 45;                         // mkfs_msg_help_l04_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l05];
+        mov rdx, 70;                         // mkfs_msg_help_l05_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l06];
+        mov rdx, 54;                         // mkfs_msg_help_l06_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l07];
+        mov rdx, 47;                         // mkfs_msg_help_l07_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l08];
+        mov rdx, 59;                         // mkfs_msg_help_l08_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l09];
+        mov rdx, 58;                         // mkfs_msg_help_l09_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l10];
+        mov rdx, 68;                         // mkfs_msg_help_l10_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l11];
+        mov rdx, 65;                         // mkfs_msg_help_l11_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l12];
+        mov rdx, 67;                         // mkfs_msg_help_l12_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;
+        lea rsi, [rip + mkfs_msg_help_l13];
+        mov rdx, 64;                         // mkfs_msg_help_l13_len
+        mov rax, 1;
+        syscall;
+
+        xor rdi, rdi;                        // status = 0
+        mov rax, 60;                         // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
       mkfs_main_argv_ok:
         lea r14, [rip + mkfs_argv_out];      // r14 = &ParsedArgv
 
         mov rbx, [r14 + 0];                  // rbx = flags (Argv::PA_OFF_FLAGS)
         mov r15, [r14 + 32];                 // r15 = target_ptr (Argv::PA_OFF_TARGET_PTR)
 
+        // ---- 1.1.1 fixup (LV11-025 Bug #2): --encrypt without
+        //      --passphrase-fd is refused fail-closed here, BEFORE the
+        //      audit record opens or any dispatch fires. Without this
+        //      gate, mkfs_format_run's rcx/r8 path would reach
+        //      mkfs_encrypt_apply_wrap with passphrase_fd == 0 (the
+        //      ParsedArgv default), whose Phase-1 sys_read(fd=0, ...)
+        //      would either block on stdin (interactive hazard) or
+        //      swallow an empty EOF token (silent password-of-length-0
+        //      hazard). Both are worse than refusing outright.
+        //
+        //      Presence semantics: PA_FLAG_PASSPHRASE_FD_SET (0x100) is
+        //      the correct gate rather than "passphrase_fd != 0",
+        //      because a caller can legitimately name fd 0 as the
+        //      passphrase source (uncommon but valid) -- the presence
+        //      bit distinguishes "explicitly set to fd 0" from "left
+        //      unset", exactly the reason src/argv.pdx's PA_FLAG_*_SET
+        //      family exists.
+        mov rax, rbx;
+        and rax, 0x80;                       // Argv::PA_FLAG_ENCRYPT
+        cmp rax, 0;
+        je mkfs_main_encrypt_pfd_ok;
+
+        mov rax, rbx;
+        and rax, 0x100;                      // Argv::PA_FLAG_PASSPHRASE_FD_SET
+        cmp rax, 0;
+        jne mkfs_main_encrypt_pfd_ok;
+
+        // Refuse: --encrypt was given but --passphrase-fd was not.
+        mov rdi, 2;                          // fd = stderr
+        lea rsi, [rip + mkfs_msg_encrypt_needs_pfd];
+        mov rdx, 47;                         // mkfs_msg_encrypt_needs_pfd_len
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, 2;                          // status = 2 (invalid argument)
+        mov rax, 60;                         // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      mkfs_main_encrypt_pfd_ok:
         // ---- M3 (#11): open the audit record before any dispatch. --------
         mov rdi, r15;                        // target_ptr
         mov rax, rbx;
@@ -195,12 +407,16 @@ module Main = structure {
         hlt;
 
       mkfs_main_file_real:
-        // ---- M2 (#4/#5/#6/#7), extended M3 (#9) to sign: real write path. -
+        // ---- M2 (#4/#5/#6/#7), extended M3 (#9) to sign, extended
+        //      LV11-025 (#25) to pass flags + passphrase_fd for the
+        //      new --encrypt / --quota hooks: real write path. -------
         mov rdi, r15;                        // target_ptr
         mov rax, rbx;
         and rax, 0x1;                        // Argv::PA_FLAG_FORCE
         mov rsi, rax;                        // force_flag (0 or 1)
         mov rdx, [r14 + 16];                 // journal_size (blocks)
+        mov rcx, rbx;                        // LV11-025: flags (verbatim)
+        mov r8,  [r14 + 40];                 // LV11-025: PA_OFF_PASSPHRASE_FD
         call mkfs_format_run;
 
         mov r13, rax;                        // exit_status (argv is dead; see module header)
@@ -243,12 +459,19 @@ module Main = structure {
 
       mkfs_main_device_grant:
         // ---- Real, wired, unreachable at this landing -- see
-        //      src/elevate_wire.pdx's module header. ------------------------
+        //      src/elevate_wire.pdx's module header. LV11-025 (#25)
+        //      widens the call to also pass flags + passphrase_fd
+        //      even though mkfs_format_run_device itself does not
+        //      consume them at this landing (the device path is a
+        //      documented stub); the two extra args keep the two
+        //      Format:: entry points signature-consistent. --------
         mov rdi, r15;                        // target_ptr
         mov rax, rbx;
         and rax, 0x1;                        // Argv::PA_FLAG_FORCE
         mov rsi, rax;                        // force_flag
         mov rdx, [r14 + 16];                 // journal_size (blocks)
+        mov rcx, rbx;                        // LV11-025: flags (verbatim)
+        mov r8,  [r14 + 40];                 // LV11-025: PA_OFF_PASSPHRASE_FD
         call mkfs_format_run_device;          // src/format.pdx (M3, #8)
 
         mov r13, rax;                        // exit_status

@@ -1,8 +1,9 @@
 # mkfs.pdxfs — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M5 (dual-signed release) — **landed**
-**Version:** 1.0.0
+**Current milestone:** LV11 (libpdx-volume v1.1 adoption pass, issues
+#24 + #25) — **landed**; supersedes M5 (dual-signed release) — landed.
+**Version:** 1.1.1
 
 See `design/tooling/volume-tooling-ux.md` §9.1 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -217,6 +218,63 @@ full 18-issue breakdown this checklist mirrors.
       milestone -- see `release/RELEASE-1.0.0.md` §3 for the four
       substrate items still needed (toolchain, mirror endpoint, live
       seed key, an actual link pass).
+
+### LV11 — libpdx-volume v1.1 adoption (post-M5)
+
+Follow-up wave triggered by libpdx-volume's v1.1 landing (LV.M1-003 /
+#18 accessor family, LV.M4-001 / #27 quota codec, LV.M5-001/-002 /
+#29/#30 v2 encryption + wrapped-DEK on-disk layout). Bumps this repo's
+own version 1.0.0 -> 1.1.0.
+
+- [x] **LV11-024** (#24) — libpdx-volume v1.1 API cleanup. Every
+      per-field summary store in `src/format.pdx`'s
+      `mkfs_format_build_superblock` now routes through
+      libpdx-volume's `pdxb_sb_set_*` accessor family; every hardcoded
+      superblock-summary offset / on-disk offset immediate in
+      `src/format.pdx` now cites the matching `PdxbSuperblock::`
+      exported constant (`SB_SUMMARY_BYTES`, `PDXB_ONDISK_BYTES`,
+      `PDXB_D_OFF_SIG`). Register plan for `mkfs_format_build_
+      superblock` promoted from pure-leaf to caller-preserving (push
+      rbx / push r12) since it now performs eleven nested setter
+      calls. The bulk zero-fill loop is KEPT as a scale-8 SIB store
+      loop bounded by the exported `SB_SUMMARY_SLOTS` (22) rather
+      than replaced with 22 zero-setter calls -- matches libpdx-
+      volume's own `pdxb_encode_superblock` zero-fill idiom byte-for-
+      byte.
+- [x] **LV11-025** (#25) — `--encrypt` + `--passphrase-fd` + `--quota`
+      argv-surface additions + format-time hook wiring. New scaffold
+      files `src/encrypt.pdx` (`mkfs_encrypt_apply_flag` +
+      `mkfs_encrypt_apply_wrap` -- real KEK derive via
+      `pdxb_kek_derive`, real AEAD wrap of a PLACEHOLDER all-zero
+      DEK via `pdxb_dek_wrap`; documented gap: no `sys_getrandom`
+      exists yet, so DEK / KDF salt / wrap nonce all stand in as
+      permanently-zero .bss buffers, matching M3's placeholder ML-
+      DSA-65 seed posture) and `src/quota.pdx`
+      (`mkfs_quota_apply_flag` -- flag-set only; quota-table
+      serialization deferred pending libpdx-volume publishing
+      `SBS_OFF_QUOTA_*` accessors). `src/argv.pdx` widened
+      `ParsedArgv` from 40 to 56 bytes for the new `PA_OFF_
+      PASSPHRASE_FD` (40) and `PA_OFF_QUOTA_COUNT` (48) slots,
+      added `PA_FLAG_ENCRYPT` (0x80) / `PA_FLAG_PASSPHRASE_FD_SET`
+      (0x100) / `PA_FLAG_QUOTA_SET` (0x200) / `PA_FLAG_HELP`
+      (0x400) bits, added the four new literal-table entries, added
+      a module-local `argv_quota_specs` .bss slot array (up to
+      `ARGV_QUOTA_MAX_ENTRIES` = 16 entries) for a future quota-
+      table serializer to iterate. `src/main.pdx` widened
+      `mkfs_argv_out` from 40 to 56 bytes, added a `--help`
+      short-circuit (thirteen inlined sys_write(fd=1) calls of the
+      per-line usage literals, then sys_exit 0), and widened the
+      two `mkfs_format_run` / `mkfs_format_run_device` call sites
+      to pass the new `rcx=flags` and `r8=passphrase_fd` arguments.
+      **Flagged for main + libpdx-volume:** missing
+      `pdxb_sb_get_wrap_nonce` / `pdxb_sb_set_wrap_nonce`
+      accessor pair (src/encrypt.pdx uses direct qword+dword stores
+      at `PDXB_D_OFF_WRAP_NONCE` + 0/8 instead); missing
+      `SBS_OFF_QUOTA_LBA` / `SBS_OFF_QUOTA_BCOUNT` (and matching
+      `PDXB_D_OFF_QUOTA_*`) + `pdxb_sb_get_quota_lba` / `_set_`
+      accessors (blocks reserving quota-table LBAs in the on-disk
+      layout, which in turn blocks a real per-spec walk of
+      `argv_quota_specs` calling `pdxb_quota_row_encode`).
 
 ## Next milestone
 

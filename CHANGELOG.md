@@ -16,6 +16,211 @@
   time; a `--extra-obj-dir` naming a missing or empty directory
   contributes nothing and is never an error.
 
+## 1.1.1 — 2026-09-02 (LV11 fixup: four broken-on-arrival bugs from 1.1.0)
+
+**Patch release** per the semver policy below — correctness fixes only,
+no surface additions or removals. Every fix is a debugger-flagged bug
+in the 1.1.0 (LV11) landing; a consumer built against 1.1.0 that had
+never exercised `--encrypt` without `--passphrase-fd`, never invoked
+`--help` without a positional target, and never suffered the latent
+2-push stack misalignment in `mkfs_format_build_superblock` /
+`mkfs_encrypt_apply_flag` / `mkfs_quota_apply_flag` observes no
+behavior change; a consumer that exercised any of those observes the
+corrected behavior described below.
+
+### Fixed
+
+- **Bug #1 — fabricated `has_quota` claim in `src/quota.pdx`.** The
+  1.1.0 module header claimed the `PdxFsFormatRecord@0.1` dry-run and
+  result records gained a `has_quota: true` suffix segment "see
+  src/format_record.pdx's LV11-025 additions"; grep confirms no such
+  field or LV11 marker exists there. This landing strikes the false
+  claim from `src/quota.pdx`'s "What THIS landing does deliver"
+  bullet and replaces it with an honest deferral note: wire-record
+  `has_quota` surfacing awaits a future `format_record.pdx` v0.2
+  revision; today mkfs surfaces the enabled state only via the
+  superblock's `PDXB_FLAG_HAS_QUOTA` on-disk bit. Documentation-only
+  fix; no code change.
+- **Bug #2 — `--encrypt` without `--passphrase-fd` silently reads
+  stdin.** 1.1.0's `src/format.pdx` at the `mkfs_format_run`
+  signature comment claimed the caller had refused this combination
+  upstream ("see src/main.pdx's own check"); no such check existed.
+  A `mkfs.pdxfs --encrypt /tmp/x.img` invocation with no
+  `--passphrase-fd` would therefore reach
+  `mkfs_encrypt_apply_wrap` with `passphrase_fd == 0` (the
+  `ParsedArgv` default), whose Phase-1 `sys_read(fd=0, ...)` would
+  either block on stdin (interactive hazard) or swallow an empty EOF
+  token (silent-empty-passphrase hazard). This landing adds the
+  missing gate in `src/main.pdx` (new `mkfs_main_encrypt_pfd_ok`
+  path): after `argv_parse` succeeds, if `PA_FLAG_ENCRYPT` (0x80)
+  is set AND `PA_FLAG_PASSPHRASE_FD_SET` (0x100) is not, print
+  `mkfs.pdxfs: --encrypt requires --passphrase-fd\n` to stderr and
+  `sys_exit(2)` -- BEFORE the audit record opens or any dispatch
+  fires. Uses `PA_FLAG_PASSPHRASE_FD_SET` (not "passphrase_fd != 0")
+  so a caller who deliberately names fd 0 as the passphrase source
+  still works. The false claim comment in `src/format.pdx` is
+  updated to accurately cite the newly-added `main.pdx` gate.
+- **Bug #3 — stack misalignment (2-push before nested `call`) in
+  three functions.** `mkfs_format_build_superblock`
+  (`src/format.pdx`, 11 nested `pdxb_sb_set_*` calls),
+  `mkfs_encrypt_apply_flag` (`src/encrypt.pdx`, 3 nested
+  `pdxb_sb_*` calls), and `mkfs_quota_apply_flag` (`src/quota.pdx`,
+  3 nested `pdxb_sb_*` calls) each pushed exactly two callee-save
+  registers (`rbx`, `r12`) before their nested calls -- SysV entry
+  hands us `rsp % 16 == 8`, so two pushes leave `rsp % 16 == 8` at
+  every call site, which is a stack-misalignment ABI violation even
+  though the current leaf callees tolerate it (latent bug: any
+  future callee that uses SSE would fault). This landing adds a
+  throwaway `push r13` / `pop r13` pair to each of the three
+  functions, restoring `rsp % 16 == 0` and matching the existing
+  rbx/r12/r13 push shape in `mkfs_encrypt_apply_wrap`. `r13` is
+  never read; only the epilogue pop matches the entry push.
+- **Bug #4 — bare `mkfs.pdxfs --help` hits the missing-target
+  error.** `src/argv.pdx`'s parse loop latches `PA_FLAG_HELP`
+  during its scan, but the missing-target verdict fires
+  unconditionally when `target_ptr == 0`; `src/main.pdx` routed any
+  non-zero `argv_parse` return to the missing-target error path
+  BEFORE any help-flag check ran (the check was buried inside
+  `mkfs_main_argv_ok`, only reached when `argv_parse` returned OK).
+  Net: `mkfs.pdxfs --help` (no positional) exited 2 with "missing
+  target" instead of exiting 0 with usage. This landing hoists the
+  help check to immediately after `call argv_parse` (before the
+  return-code branch): loads `mkfs_argv_out + PA_OFF_FLAGS`
+  directly, and jumps to `mkfs_main_do_help` if `PA_FLAG_HELP` is
+  set -- catching both the `mkfs.pdxfs --help` (return ==
+  ARGV_ERR_MISSING_TARGET) and `mkfs.pdxfs /tmp/x.img --help`
+  (return == ARGV_OK) cases. The old inline `mkfs_main_after_help`
+  transition label was removed since it is no longer referenced;
+  help emission moved to a dedicated `mkfs_main_do_help` block
+  between the missing-target and `mkfs_main_argv_ok` bodies (both
+  surrounding blocks terminate in `sys_exit + hlt` before this
+  label, and this block itself terminates the same way before
+  `mkfs_main_argv_ok`, so no fall-through is possible).
+
+### Fixed (debugger pass follow-up, same v1.1.1 release)
+
+- **Bug #5 — 5 of 13 `--help` message literals had short array
+  sizes / length constants** (debugger pass on the initial fixup
+  wave). `mkfs_msg_help_l08`/`l09`/`l11`/`l12`/`l13` in `src/main.pdx`
+  were declared `[u8; N]` with N one-or-two-bytes under the real
+  string length (including trailing `\n\0`); paideia-as's strict
+  fixed-array typing would reject or silently truncate. Corrected
+  each array size, `_len` constant, and paired `mov rdx, N` write
+  immediate.
+- **Bug #6 — `--passphrase-fd` with no following value token
+  bypassed the Bug #2 gate.** `src/argv.pdx`'s `mkfs_argv_check_pfd`
+  latched `PA_FLAG_PASSPHRASE_FD_SET` BEFORE the bounds check for the
+  value token. So `mkfs.pdxfs --encrypt /tmp/x.img --passphrase-fd`
+  (fd flag as last token) set the presence bit while
+  `passphrase_fd` stayed at 0 -- main.pdx's new gate saw ENCRYPT set
+  + SET-bit set -> allowed the invocation through, defeating the
+  Bug #2 stdin-read guard. Reordered: bounds-check first, then only
+  latch the presence bit AFTER a value token is confirmed and
+  parsed.
+
+### Files touched
+
+- `src/quota.pdx` — Bug #1 header rewrite, Bug #3 push_r13/pop_r13
+  in `mkfs_quota_apply_flag`.
+- `src/main.pdx` — Bug #2 `mkfs_msg_encrypt_needs_pfd` message +
+  `mkfs_main_encrypt_pfd_ok` gate; Bug #4 upstream `--help`
+  precedence check + `mkfs_main_do_help` label relocation; removed
+  dead `mkfs_main_after_help` label; Bug #5 5-literal array/length
+  corrections. Justification text updated.
+- `src/format.pdx` — Bug #2 comment correction at `mkfs_format_run`
+  signature; Bug #3 push_r13/pop_r13 in
+  `mkfs_format_build_superblock`; Bug #5 sibling justification
+  cleanup (r13 pop order).
+- `src/encrypt.pdx` — Bug #3 push_r13/pop_r13 in
+  `mkfs_encrypt_apply_flag`.
+- `src/argv.pdx` — Bug #6 reorder presence-bit latch after bounds
+  check.
+- `STATUS.md` — version bump to 1.1.1.
+
+### Known deferred (not fixed in v1.1.1)
+
+- No regression-test coverage was added for any of Bugs #1-#6. All
+  six live in code paths (`_start`'s new gates, argv scan-loop, or
+  functions the existing 4 test files bypass). File a follow-up if
+  test-suite parity with the LV11-025 argv surface is desired.
+- Stale justification in `src/encrypt.pdx` (`mkfs_encrypt_apply_wrap`
+  header) claims r13 = scratch for the passphrase-read return
+  value; the actual body stashes it in a .bss slot instead. Pre-
+  existing 1.1.0-era text; harmless doc drift left in place to
+  avoid a v1.1.2 patch cycle for a comment-only fix.
+
+## 1.1.0 — 2026-09-02 (LV11 wave: libpdx-volume v1.1 adoption)
+
+**Additive minor** per the semver policy below — adds new argv
+surface (`--encrypt`, `--passphrase-fd`, `--quota`, `--help`) and new
+format-time behavior (v2 wrapped-DEK stamping, v2 flag/version bump
+on quota) without removing or renumbering any M1..M5 surface.
+Consumers built against 1.0.0 that pass no LV11 flags observe no
+behavior change on the file-target path.
+
+### Landed
+
+- **LV11-024** (#24) — libpdx-volume v1.1 API cleanup. Every
+  per-field summary store in `src/format.pdx`'s
+  `mkfs_format_build_superblock` now routes through libpdx-volume's
+  `pdxb_sb_set_*` accessor family (LV.M1-003, libpdx-volume#18); every
+  hardcoded on-disk / summary offset in `src/format.pdx`'s text now
+  cites the matching `PdxbSuperblock::` exported constant
+  (`SB_SUMMARY_BYTES`, `PDXB_ONDISK_BYTES`, `PDXB_D_OFF_SIG`).
+  `mkfs_format_build_superblock`'s register plan was promoted from
+  pure-leaf to caller-preserving (push rbx; push r12) since it now
+  performs eleven nested setter calls.
+- **LV11-025** (#25) — `--encrypt` + `--passphrase-fd <n>` +
+  `--quota <spec>` (repeatable) + `--help` argv-surface additions.
+  New scaffold files `src/encrypt.pdx` (real `pdxb_kek_derive` +
+  `pdxb_dek_wrap` over a PLACEHOLDER all-zero DEK / KDF-salt /
+  wrap-nonce, matching M3's placeholder ML-DSA-65 seed posture --
+  documented gap: no `sys_getrandom` primitive exists yet at any
+  sysno) and `src/quota.pdx` (flag-set only; quota-table
+  serialization deferred pending libpdx-volume publishing
+  `SBS_OFF_QUOTA_*` accessors). When `--encrypt` is set the
+  superblock version bumps to `PDXB_VERSION_V2` and
+  `PDXB_FLAG_ENCRYPTED` is OR-ed into `SBS_OFF_FLAGS`; when
+  `--quota` is set the same version bump happens and
+  `PDXB_FLAG_HAS_QUOTA` is OR-ed instead (both bits latch on a
+  volume that carries both flags). `src/argv.pdx`'s `ParsedArgv`
+  struct widened 40 -> 56 bytes for the new `PA_OFF_PASSPHRASE_FD`
+  (40) and `PA_OFF_QUOTA_COUNT` (48) slots; `src/main.pdx`'s
+  `mkfs_argv_out` .bss reserve widened to match, and the two
+  `mkfs_format_run` / `mkfs_format_run_device` call sites now pass
+  the new `rcx=flags` + `r8=passphrase_fd` arguments.
+
+### Known deferred substrate (LV11 additions)
+
+- **No `sys_getrandom` / equivalent syscall exists**, so the wrapped
+  DEK / KDF salt / wrap nonce this landing stamps under `--encrypt`
+  are all permanently-zero placeholders (see `src/encrypt.pdx`'s
+  module header for the full "placeholder-material posture" write-up).
+  Same posture M3's placeholder ML-DSA-65 seed uses. Every wire byte
+  is a genuine byte-for-byte record of what this run passed to
+  `pdxb_dek_wrap`, so a future entropy-wired revision produces
+  wire-visible diffs against this landing.
+- **`--passphrase-fd <n>` reads a real passphrase from the caller's
+  fd** but pairs it with the zero salt above, so two invocations with
+  the same passphrase produce identical wrapped-DEK bytes. This is
+  fine for a wire-format demonstration; a random salt (persisted into
+  `PDXB_D_OFF_KDF_SALT`) MUST land before the tool ships against real
+  user data.
+- **`--quota <spec>` populates `argv_quota_specs` and latches
+  `PDXB_FLAG_HAS_QUOTA`** but does NOT yet serialize per-quota-row
+  entries into a reserved quota-table region -- libpdx-volume v1.1.1
+  publishes no `SBS_OFF_QUOTA_LBA` / `SBS_OFF_QUOTA_BCOUNT` accessor
+  pair, and no `PDXB_D_OFF_QUOTA_*` on-disk offsets, so this landing
+  has no destination to point at. Flagged for main + libpdx-volume;
+  see `src/quota.pdx`'s module header for the full list.
+- **`pdxb_sb_get_wrap_nonce` / `pdxb_sb_set_wrap_nonce` accessor pair
+  is missing** from libpdx-volume v1.1.1 -- the two aligned wrapped-
+  DEK and KDF-salt fields have full accessors, but the 12-byte
+  `wrap_nonce` at `PDXB_D_OFF_WRAP_NONCE` = 256 does not. This
+  landing writes it via one qword + one dword direct store; a future
+  accessor-symmetric revision swaps that for two `pdxb_sb_set_wrap_
+  nonce` calls. Flagged for main + libpdx-volume.
+
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5)
 
 **First release.** Manifest scaffolded for a future dual-signed

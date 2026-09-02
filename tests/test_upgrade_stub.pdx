@@ -77,10 +77,15 @@ module TestUpgradeStub = structure {
   pub let mkfs_test_argv2 : [u8; 27] = "/tmp/mkfs_test_upgrade.img\0"
 
   // --- .bss scratch: a real 3-slot char*[] and a ParsedArgv out-struct
-  //     (Argv::PA_STRUCT_BYTES = 40 bytes), populated at runtime since
-  //     this dialect has no relocatable-pointer static initializer. ------
+  //     (Argv::PA_STRUCT_BYTES = 56 bytes at LV11-025 (#25); was 40 at
+  //     M4-004 close), populated at runtime since this dialect has no
+  //     relocatable-pointer static initializer. Widened here in step
+  //     with src/argv.pdx / src/main.pdx: argv_parse now writes to
+  //     PA_OFF_PASSPHRASE_FD (40) and PA_OFF_QUOTA_COUNT (48) as part
+  //     of its zero-init pass, so a 40-byte buffer would let those
+  //     two stores overflow into adjacent .bss. ------------------------
   pub let mut mkfs_test_argv_slots  : [u8; 24] = uninit @align(8)
-  pub let mut mkfs_test_parsed_argv : [u8; 40] = uninit @align(8)
+  pub let mut mkfs_test_parsed_argv : [u8; 56] = uninit @align(8)
 
   // ==========================================================================
   // run() -> u64
