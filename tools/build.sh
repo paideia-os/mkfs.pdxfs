@@ -14,18 +14,36 @@
 # accept the syntax used in this repo.
 #
 # Usage:
-#   tools/build.sh [--extra-obj-dir DIR]...
+#   tools/build.sh [--extra-obj-dir DIR]... [--extra-archive PATH]...
 #
 # --extra-obj-dir DIR may be repeated. Every *.o file found directly
 # inside DIR (e.g. pre-built libpdx-* dependency objects) is linked
 # alongside this repo's own src/*.o objects. A DIR that does not exist
 # or holds no .o files contributes nothing — it is not an error.
 # tests/*.o objects are compiled but never linked into the ELF.
+#
+# --extra-archive PATH may be repeated. Each PATH is a static archive
+# (`.a`) appended to the final `ld` link line AFTER --extra-obj-dir
+# objects (paideia-os#2226, satellite-runtime-shim design §4.1/§5).
+# Archives on the link line are pulled in AS-NEEDED (unlike loose
+# objects, which link unconditionally), so unused Rust symbols in the
+# Phase A/B satellite-runtime + audit-satellite archives are pruned by
+# `--gc-sections` and never reach the output ELF. Standard invocation:
+#
+#   bash tools/build.sh \
+#     --extra-obj-dir ../libpdx-volume/build-out \
+#     --extra-archive .../libpaideia_satellite_runtime.a \
+#     --extra-archive .../libpdx-audit-satellite.a
+#
+# A --extra-archive PATH that does not exist causes ld to fail at link
+# time (not an early parse error) — the flag itself only validates that
+# the value slot was supplied.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EXTRA_OBJECTS=()
+EXTRA_ARCHIVES=()
 OWN_OBJECTS=()
 
 while [ "$#" -gt 0 ]; do
@@ -39,6 +57,11 @@ while [ "$#" -gt 0 ]; do
                 [ -f "$obj" ] && EXTRA_OBJECTS+=("$obj")
             done
             shopt -u nullglob
+            ;;
+        --extra-archive)
+            [ "$#" -ge 2 ] || { echo "[build] FAIL: --extra-archive requires an argument" >&2; exit 2; }
+            EXTRA_ARCHIVES+=("$2")
+            shift 2
             ;;
         *)
             echo "[build] FAIL: unrecognized argument: $1" >&2
@@ -116,10 +139,10 @@ echo "[build] OK"
 
 if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
     echo "[link] ld -T link.ld -> $BUILD_DIR/mkfs.pdxfs.elf"
-    ld -nostdlib --warn-common --fatal-warnings \
+    ld -nostdlib --warn-common --fatal-warnings --gc-sections \
         -T link.ld \
         -o "$BUILD_DIR/mkfs.pdxfs.elf" \
-        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}"
+        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}" "${EXTRA_ARCHIVES[@]}"
     echo "[link] OK -> $BUILD_DIR/mkfs.pdxfs.elf"
 
     objcopy -O binary "$BUILD_DIR/mkfs.pdxfs.elf" "$BUILD_DIR/mkfs.pdxfs.bin"

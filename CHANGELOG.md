@@ -1,5 +1,65 @@
 # mkfs.pdxfs — CHANGELOG
 
+## 1.1.2 — 2026-09-02 (Phase C: `--extra-archive` + `--gc-sections` for satellite-runtime link)
+
+**Patch bump — additive `tools/build.sh` flag; every existing invocation
+still works unchanged.** Wires the two Phase A/B archives from
+paideia-os#2226's satellite-runtime-shim landing (paideia-as v0.29.1
+`libpaideia_satellite_runtime.a` + libpdx-audit v1.1.1
+`libpdx-audit-satellite.a`) through this repo's own final `ld` link so
+`bash tools/build.sh --extra-archive .../libpaideia_satellite_runtime.a
+--extra-archive .../libpdx-audit-satellite.a` now resolves the 83
+previously-unresolved satellite-runtime symbol references (crypto FFI
+thunks + `mldsa65_sign_runtime_entry` + `audit_begin` / `audit_commit`
+satellite bodies + panic/allocator/eh_personality shim) end-to-end.
+
+### Added
+
+- **`--extra-archive PATH` (repeatable)** on `tools/build.sh`, symmetric
+  to the existing `--extra-obj-dir DIR` flag: each PATH is a static
+  archive (`.a`) appended to the final `ld` link line AFTER the
+  --extra-obj-dir loose objects. Archives are pulled in AS-NEEDED
+  (unlike loose objects, which link unconditionally), so the archive
+  contents only pay their way for symbols the ELF actually references.
+  Bounds-checks the value slot; a bare `--extra-archive` with no
+  following PATH exits 2 with `--extra-archive requires an argument`
+  (same discipline as `--extra-obj-dir`). A PATH that names a missing
+  file surfaces later as an `ld` open-failure at link time (not an
+  early parse error) — the flag validates only that the slot was
+  supplied, mirroring how `--extra-obj-dir` never validates its DIR.
+
+### Changed
+
+- **`ld` link line** — added `--gc-sections` to the `ld -nostdlib
+  --warn-common --fatal-warnings` invocation. Essential when linking
+  the Phase A staticlib: Rust archives emit per-function sections
+  (`.text.<sym>`), and `--gc-sections` walks from `_start` (KEEPed by
+  `link.ld` at `.text._start`) and prunes every satellite-runtime
+  symbol nothing in this repo transitively references. Without it, the
+  archive dumps ~200KB of unused compiler-builtins/std padding into
+  the ELF and leaves dangling refs from Rust's own internal call
+  graph. This repo's own `src/*.pdx` objects emit into one big `.text`
+  section per module, so `--gc-sections` is a no-op for them (the
+  section stays live as soon as `_start` is reached).
+
+### Invocation (unchanged for callers not wiring in Phase A/B archives)
+
+```
+# Old — still works, still emits build-out/mkfs.pdxfs.elf against
+# just this repo's own objects (dangling refs on satellite-runtime
+# symbols surface at ld, not here):
+bash tools/build.sh --extra-obj-dir ../libpdx-volume/build-out
+
+# New — resolves every satellite-runtime ref, end-to-end link OK:
+bash tools/build.sh \
+  --extra-obj-dir ../libpdx-volume/build-out \
+  --extra-archive $HOME/Development/PaideiaOS/tools/paideia-as/target/release/libpaideia_satellite_runtime.a \
+  --extra-archive $HOME/tmp/libpdx-audit/build-out/libpdx-audit-satellite.a
+```
+
+References: paideia-os#2226, paideia-as#1348, libpdx-audit#19, design
+doc `design/infrastructure/satellite-runtime-shim.md` §4.1 + §5 Step 5.
+
 ## Unreleased
 
 - **ELF-linking phase** for `tools/build.sh`, part of wiring this repo
