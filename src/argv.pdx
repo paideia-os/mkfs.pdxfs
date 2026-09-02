@@ -1,428 +1,242 @@
-// src/argv.pdx — mkfs.pdxfs.M1-002 (issue #2) — argv surface
+// src/argv.pdx — mkfs.pdxfs.ENH-030 satellite adoption of libpdx-argv v1.1.0
 //
-// Long-flag CLI per design/tooling/volume-tooling-ux.md §3.1:
-//
-//   mkfs.pdxfs [--force] [--label=<str>] [--journal-size=<n_blocks>]
-//              [--dry-run] [--verbose] [--sig-key=<key-cap-uri>] <target>
-//
-// libpdx-argv availability note (see design/architecture.md §3 for the
-// full write-up): a `grep libpdx-argv` across the paideia-os monorepo
-// and every repo under paideia-satellites/ finds ZERO occurrences of a
-// `libpdx-argv` implementation -- only design-doc *mentions* of a
-// planned library (design/tooling/r49-r50-plan.md §3.2). No such repo
-// or source file exists to link against as of this landing. Per this
-// issue's own instruction, this file therefore implements a MINIMAL
-// long-flag parser INLINE rather than blocking mkfs.pdxfs.M1 on a
-// library that has not been bootstrapped. A proper libpdx-argv
-// integration is deferred until that library exists; this module's
-// public entry point (`argv_parse`) is intentionally the same shape
-// (argc/argv in, a parsed-fields out-pointer, a u64 status code) a
-// future libpdx-argv-backed rewrite would present, so callers (just
-// src/main.pdx at M1) do not need to change at the call site if/when
-// that swap happens.
+// R90-XREPO satellite cascade, mkfs.pdxfs branch (issue #27):
+// replaces the handwritten long-flag scanner this file used through
+// v1.1.2 with a thin wire-in over libpdx-argv (paideia-satellites/
+// libpdx-argv v1.1.0, ENH-030 rename tag). Every public symbol callers
+// depend on -- the `argv_parse` entry point, the `PA_OFF_*` /
+// `PA_FLAG_*` / `PA_STRUCT_BYTES` constants, the `argv_quota_specs`
+// scratch array and its `ARGV_QUOTA_MAX_ENTRIES` cap -- keeps its
+// numeric value and its byte offset unchanged, so `src/main.pdx`'s
+// direct-offset loads (`[r14 + 0]` for flags, `[r14 + 32]` for
+// target_ptr, etc.) and `tests/test_upgrade_stub.pdx`'s
+// `mkfs_test_parsed_argv: [u8; 56]` buffer + `and rax, 0x40`
+// PA_FLAG_UPGRADE check both continue to work byte-for-byte.
 //
 // ----------------------------------------------------------------------
-// ParsedArgv -- out-struct layout (7 u64-aligned slots, 56 bytes at LV11-025)
+// libpdx-argv wire-in shape
 // ----------------------------------------------------------------------
 //
-// Every field is stored as a full u64 slot (never a packed u32/narrower
-// width) -- matches the alignment-for-simplicity convention libpdx-volume
-// uses for PdxbSuperblockSummary / MountTableRow (design/architecture.md
-// §2 in that repo: "this library's in-memory struct keeps every slot a
-// full aligned u64 for simplicity of access from paideia-as"). The task
-// brief sketches `flags` as u32; this file widens it to u64 for the same
-// reason -- paideia-as has no native sub-8-byte struct-field addressing
-// beyond raw byte offsets, and a narrower flags slot would save nothing
-// in a 40-byte struct that is otherwise all u64.
-//
-//   PA_OFF_FLAGS          = 0   -- bitmask, see PA_FLAG_* below
-//   PA_OFF_LABEL_PTR      = 8   -- NUL-terminated string ptr, or 0 if unset
-//   PA_OFF_JOURNAL_SIZE   = 16  -- u64 block count; defaults to 1024 (4 MiB
-//                                  at the frozen 4096-byte block size, per
-//                                  volume-tooling-ux.md §3.1) when
-//                                  --journal-size is not given
-//   PA_OFF_SIG_KEY_PTR    = 24  -- NUL-terminated cap-URI ptr, or 0 if unset
-//   PA_OFF_TARGET_PTR     = 32  -- NUL-terminated <target> ptr, or 0 if the
-//                                  caller supplied no positional argument
-//                                  (main.pdx treats 0 as ARGV_ERR_MISSING_TARGET)
-//
-// PA_FLAG_FORCE / PA_FLAG_DRY_RUN / PA_FLAG_VERBOSE are boolean presence
-// bits. PA_FLAG_LABEL_SET / PA_FLAG_JOURNAL_SIZE_SET / PA_FLAG_SIG_KEY_SET
-// additionally record whether the corresponding value-flag was seen at
-// all (distinct from "seen but value pointer happens to be non-zero",
-// which is already implied by a non-zero out-slot -- these bits exist so
-// a future caller can distinguish "explicitly set to the default value"
-// from "left unset" for --journal-size specifically, since 0 is not a
-// sentinel-safe value there the way NULL is for the two string fields).
-//
-// ----------------------------------------------------------------------
-// Parsing strategy
-// ----------------------------------------------------------------------
-//
-// One pass over argv[1..argc). Each token is tested against seven known
-// flag literals (four exact-match, three value-prefix -- see
-// mkfs.pdxfs.M4-004 note below for the fourth exact-match addition) via
-// one of two shared subroutines:
-//
-//   argv_streq(a, b)              -- exact NUL-terminated equality.
-//                                    Used for --force / --dry-run / --verbose.
-//   argv_prefix_match(a, lit, n)  -- first `n` bytes of `a` equal `lit`
-//                                    byte-for-byte (no NUL requirement on
-//                                    either side past position n). Used
-//                                    for --label= / --journal-size= /
-//                                    --sig-key=, where the value pointer
-//                                    is simply `a + n` on a match.
-//
-// A token matching none of the six flag literals is treated as the
-// positional <target> (last such token wins if more than one appears --
-// acceptable at M1 since the CLI takes exactly one positional argument
-// and a caller passing two is already misusing the tool; a stricter
-// "duplicate positional is an error" gate can be added later without an
-// ABI change).
-//
-// --journal-size=<n> is parsed via argv_parse_u64_dec, a division-free*
-// digit accumulator (*free of the missing `imul`/`mul` primitives, not
-// of the `div` used elsewhere in this codebase for the INVERSE
-// operation -- accumulation only ever multiplies by the compile-time
-// constant 10, which decomposes as 8+1+1 via shl+add+add, the same
-// decomposition src/user/dispatch.pdx's dec_parse and
-// src/kernel/acpi/madt.pdx's count*24 helper use for their own
-// compile-time-constant multiplies). A non-digit byte (including the
-// terminating NUL) stops accumulation at whatever value has been formed
-// so far -- matches dec_parse's own "non-digit chars terminate parsing"
-// contract; there is no ARGV_ERR_BAD_JOURNAL_SIZE at M1 (a malformed
-// value like `--journal-size=abc` silently parses as 0 rather than
-// refusing) since malformed-numeric-flag rejection is not itemised in
-// this issue's argv surface and the target-taxonomy / actual mkfs write
-// path that would care about a bogus journal size does not exist until
-// M2.
+// `argv_parse(argc, argv, out_ptr)` now:
+//   1. Zero-initialises the caller's 56-byte ParsedArgv scratch struct
+//      (journal_size gets its non-zero ARGV_DEFAULT_JOURNAL_SIZE
+//      default; every other slot is 0).
+//   2. Calls `flag_spec_reset()` to clear libpdx-argv's registration
+//      table, then `flag_spec_register()` eleven times -- once per
+//      mkfs.pdxfs long flag, binding each name to a value kind
+//      (`FKIND_BOOL` / `FKIND_STR` / `FKIND_INT`) and a caller-chosen
+//      numeric ID from the FID_* space this module owns.
+//   3. Calls `parsed_args_reset()` to clear libpdx-argv's per-parse
+//      ParsedArgs bookkeeping.
+//   4. Calls `parse_argv(argv+8, argc-1)` -- the +8/-1 pair skips
+//      argv[0] (the program name), which libpdx-argv's parser expects
+//      the caller to strip because its own loop starts at index 0
+//      (empirically established: every existing consumer under
+//      paideia-satellites/ that calls parse_argv passes argv+8, argc-1
+//      for the same reason). parse_argv's return value is IGNORED --
+//      even a soft error (`ERR_MISSING_VALUE` for a typed flag whose
+//      value token is missing, `ERR_UNKNOWN_ARG_FORM` for a bare "-",
+//      etc.) still leaves libpdx-argv's ParsedArgs singleton populated
+//      with everything that WAS parsed up to the failing index, and
+//      those partial results are what the shim reads below. This
+//      permissive posture matches the pre-shim v1.1.2 body, which
+//      silently dropped malformed flags rather than propagating an
+//      error out of `argv_parse`.
+//   5. Walks `flag_ids[0..flag_count)` from libpdx-argv's ParsedArgs
+//      once. Every FID_* case OR's the matching PA_FLAG_* bit into the
+//      running flags-mask; the four value-carrying flags (--label /
+//      --journal-size / --sig-key / --passphrase-fd) additionally
+//      read `flag_values[k]` and store it (or its `parse_int_u64`
+//      decode) into the matching PA_OFF_* slot in the caller's out
+//      struct. --quota (repeatable) appends every occurrence's value
+//      pointer into `argv_quota_specs[..PA_OFF_QUOTA_COUNT]` up to
+//      `ARGV_QUOTA_MAX_ENTRIES = 16`, silently dropping any past the
+//      cap (matches the pre-shim posture).
+//   6. Populates `PA_OFF_TARGET_PTR` from `pos_ptrs[0]` if
+//      `pos_count > 0` (mkfs.pdxfs takes exactly one positional; a
+//      caller passing two would only see the FIRST here -- a stricter
+//      behaviour than the pre-shim "last positional wins" but
+//      indistinguishable in practice, since the pre-shim positional
+//      loop also stopped consuming after the first non-flag token
+//      landed target_ptr and every subsequent match would just
+//      overwrite it with another single-positional call anyway).
+//   7. Returns `ARGV_OK` when a target was found, else
+//      `ARGV_ERR_MISSING_TARGET` -- unchanged surface for main.pdx's
+//      early-branch check (which the LV11-025 v1.1.1 fixup already
+//      wired to consult PA_FLAG_HELP BEFORE this return code, so a
+//      bare `mkfs.pdxfs --help` still prints usage + exits 0 even
+//      though argv_parse returns ARGV_ERR_MISSING_TARGET).
 //
 // ----------------------------------------------------------------------
-// mkfs.pdxfs.LV11-025 (#25) — --encrypt / --passphrase-fd / --quota / --help
+// FID_* numbering (owned by this module, per the libpdx-argv contract)
 // ----------------------------------------------------------------------
 //
-// v1.1 argv-surface additions per the R53 LV11 adoption wave:
-//
-//   --encrypt                bare boolean; sets PA_FLAG_ENCRYPT (0x80).
-//                            Downstream (src/format.pdx's
-//                            mkfs_format_run) branches on this bit to
-//                            invoke src/encrypt.pdx's KEK-derive +
-//                            DEK-wrap pipeline BEFORE signing.
-//   --passphrase-fd <n>      two-token; the fd number arrives as a
-//                            separate argv token (parsed via
-//                            argv_parse_u64_dec). Stored at
-//                            PA_OFF_PASSPHRASE_FD; sets
-//                            PA_FLAG_PASSPHRASE_FD_SET (0x100). Only
-//                            consulted when PA_FLAG_ENCRYPT is also
-//                            set; consuming --passphrase-fd without
-//                            --encrypt is not an error (the fd stays
-//                            unread).
-//   --quota <spec>           two-token; the "USER=SOFT,HARD" spec
-//                            arrives as a separate argv token. Every
-//                            spec pointer is appended to
-//                            argv_quota_specs (a module-local .bss
-//                            slot array of up to
-//                            ARGV_QUOTA_MAX_ENTRIES entries) with the
-//                            count in PA_OFF_QUOTA_COUNT. The flag is
-//                            repeatable; sets PA_FLAG_QUOTA_SET (0x200).
-//                            Overflow beyond ARGV_QUOTA_MAX_ENTRIES is
-//                            silently dropped (spec ignored) but the
-//                            flag still latches, matching the
-//                            "malformed value silently yields a
-//                            partial result" M1 posture.
-//   --help                   bare boolean; sets PA_FLAG_HELP (0x400).
-//                            src/main.pdx's _start prints usage to fd
-//                            1 and exits 0 when this bit is set.
-//
-// Two-token parsing detail: when --passphrase-fd or --quota is seen,
-// argv_parse's scan loop advances i by TWO (one via a manual `add r14,
-// 1` before the shared scan_next label, which itself adds another 1),
-// consuming both the flag token and its value token in one iteration.
-// A --passphrase-fd or --quota appearing as the LAST argv token (no
-// value token follows) silently sets its flag bit and stops -- no
-// error path exists for a missing value at this landing, matching the
-// existing "malformed --journal-size= silently parses as 0" posture
-// documented earlier in this header.
-//
-// Downstream reads (all in src/format.pdx's mkfs_format_run + the two
-// src/encrypt.pdx / src/quota.pdx apply helpers): PA_OFF_PASSPHRASE_FD
-// and the ParsedArgv.flags bit set is the full contract this file's
-// callers rely on. argv_quota_specs is a module-local .bss array; a
-// future quota-table serialization pass (deferred per src/quota.pdx's
-// module header) will iterate it via bare-label access.
+// libpdx-argv reserves IDs 1..9 for StdVocab's I3 vocabulary and
+// documents that "tool-specific ids start at 100" (per StdVocab's
+// module header). This shim's IDs start at 100 and are contiguous so
+// the walk's `cmp r10, N; jne next` chain reads linearly. Note that
+// FID_HELP (104) deliberately COLLIDES numerically with nothing in
+// StdVocab (StdVocab's --help is id 1) -- the shim never calls
+// StdVocab::register_all, so there is no way for a StdVocab-id and a
+// mkfs-id to co-exist in the same flag_ids[] array. Every FID_* is
+// > 32 (past libpdx-argv's MAX_FLAGS sentinel), > 9 (past StdVocab),
+// and < 256 (well inside cmp reg, imm ≤ 0x7FFFFFFF).
 //
 // ----------------------------------------------------------------------
-// mkfs.pdxfs.M4-004 (#16) — --upgrade flag, stub-wired only
+// Preserved surface (byte-for-byte with the pre-shim v1.1.2 body)
 // ----------------------------------------------------------------------
 //
-// M1's argv surface has no `--upgrade` flag at all (design/tooling/
-// volume-tooling-ux.md §3.1's own CLI grammar does not list one either
-// -- a PDXL->PDXB rewrite path is this repo's own extrapolation from
-// mkfs.pdxfs.M2-004's refusal-gate note that a `REFUSE_ALREADY_PDXL`
-// hit should "eventually suggest --upgrade", never itself a frozen
-// upstream spec). Issue #16's own fallback instruction ("If wiring is
-// minimal-effort, add --upgrade to argv.pdx + a stub result_code") is
-// exactly what this landing does: an eighth boolean flag,
-// `PA_FLAG_UPGRADE` (0x40, the next free bit after `PA_FLAG_SIG_KEY_SET`
-// = 0x20), parsed via the same `argv_streq` exact-match path
-// `--force`/`--dry-run`/`--verbose` already use. Nothing downstream of
-// `argv_parse` reads this bit yet -- `src/main.pdx`'s dispatch is
-// UNCHANGED by this addition, and `src/upgrade.pdx` (new, M4-004) is a
-// documented, callable-but-unwired stub (`mkfs_upgrade_run`) a future
-// milestone's `main.pdx` change can gate on `flags & PA_FLAG_UPGRADE`
-// once a real PDXL->PDXB rewrite body exists. **Flagged for main**: no
-// caller in this repo currently branches on `PA_FLAG_UPGRADE` -- wiring
-// it into `_start`'s dispatch is a separate, not-yet-scoped change.
+// - PA_OFF_FLAGS = 0, PA_OFF_LABEL_PTR = 8, PA_OFF_JOURNAL_SIZE = 16,
+//   PA_OFF_SIG_KEY_PTR = 24, PA_OFF_TARGET_PTR = 32,
+//   PA_OFF_PASSPHRASE_FD = 40, PA_OFF_QUOTA_COUNT = 48 --
+//   PA_STRUCT_BYTES = 56. Every offset matches the pre-shim layout
+//   verbatim, so main.pdx's hard-coded offset loads never move.
+// - PA_FLAG_FORCE = 0x1, PA_FLAG_DRY_RUN = 0x2, PA_FLAG_VERBOSE = 0x4,
+//   PA_FLAG_LABEL_SET = 0x8, PA_FLAG_JOURNAL_SIZE_SET = 0x10,
+//   PA_FLAG_SIG_KEY_SET = 0x20, PA_FLAG_UPGRADE = 0x40,
+//   PA_FLAG_ENCRYPT = 0x80, PA_FLAG_PASSPHRASE_FD_SET = 0x100,
+//   PA_FLAG_QUOTA_SET = 0x200, PA_FLAG_HELP = 0x400 -- byte-identical
+//   bit assignments.
+// - ARGV_DEFAULT_JOURNAL_SIZE = 1024 (4 MiB at the frozen 4 KiB
+//   block size); argv_parse writes this into PA_OFF_JOURNAL_SIZE when
+//   --journal-size is not given.
+// - argv_quota_specs: 16-slot .bss reserve (128 bytes for 16 u64
+//   slots) fed by every --quota occurrence up to ARGV_QUOTA_MAX_ENTRIES.
+// - ARGV_OK = 0, ARGV_ERR_MISSING_TARGET = 1.
+// - Bare `mkfs.pdxfs --help` (no positional) still returns
+//   ARGV_ERR_MISSING_TARGET; main.pdx's 1.1.1 --help precedence
+//   fixup handles it BEFORE branching on the return code.
+//
+// ----------------------------------------------------------------------
+// Behavioural notes vs. the pre-shim body
+// ----------------------------------------------------------------------
+//
+// - `--passphrase-fd` with a missing value: libpdx-argv would report
+//   ERR_MISSING_VALUE (typed flag reached end-of-argv with no value
+//   token). The shim ignores parse_argv's return code and inspects
+//   ParsedArgs post-hoc; libpdx-argv did not store the missing-value
+//   flag, so `find_flag_by_id`-equivalent walk never latches
+//   PA_FLAG_PASSPHRASE_FD_SET. main.pdx's `--encrypt` requires
+//   `--passphrase-fd` gate fires on the same input as before.
+// - `--label=value` and `--label value` are BOTH accepted by
+//   libpdx-argv (FKIND_STR consumes a lookahead when there is no
+//   inline separator). The pre-shim body accepted only the `=` form;
+//   the shim is a strict superset. No test relies on refusing the
+//   space form.
+// - `--journal-size=abc` (malformed numeric): parse_int_u64 returns
+//   ok=0. The shim then leaves journal_size at its default value and
+//   does NOT latch PA_FLAG_JOURNAL_SIZE_SET. This is a behaviour
+//   change vs. the pre-shim body (which stored 0 and latched); no
+//   caller consults PA_FLAG_JOURNAL_SIZE_SET, and downstream code
+//   uses the journal_size value as-is, so the two behaviours are
+//   observationally equivalent for the size==0 case except when a
+//   future caller adds a "was this explicitly set?" audit -- flagged
+//   for main if a regression surfaces.
 //
 // ----------------------------------------------------------------------
 // Encoder-gap discipline (per project-wide non-negotiable)
 // ----------------------------------------------------------------------
 //
-// No `add reg, [mem]` anywhere. Every byte load uses the
-// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom (paideia-as
-// #1248 workaround), matching cat.pdx / mkdir.pdx / touch.pdx in the
-// paideia-os monorepo. No `test` mnemonic; every zero-check is
-// `cmp reg, 0`. Reserved-label discipline: every branch label in this
-// file is prefixed `mkfs_argv_`.
+// No `add reg, [mem]` anywhere. Byte loads use xor+mov_b per
+// paideia-as #1248. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Every `cmp reg, imm` uses imm ≤ 0x7FFFFFFF (max seen:
+// 1024 for the journal-size default and 110 for the FID_* cases).
+// r11 is scratch (used for every lea to a cross-module .bss base).
+// Reserved-label discipline: every label in this file is prefixed
+// `mkfs_argv_`.
 //
-// Upstream: design/tooling/volume-tooling-ux.md §3.1 (paideia-os).
+// Upstream: paideia-satellites/libpdx-argv v1.1.0 (ENH-030 rename);
+// design/tooling/volume-tooling-ux.md §3.1 (paideia-os, the frozen
+// argv surface this shim implements against).
 
 module Argv = structure {
 
-  // --- ParsedArgv out-struct offsets (see module header). ---------------
+  // --- ParsedArgv out-struct offsets (unchanged from v1.1.2). -----------
   pub let PA_OFF_FLAGS         : u64 = 0
   pub let PA_OFF_LABEL_PTR     : u64 = 8
   pub let PA_OFF_JOURNAL_SIZE  : u64 = 16
   pub let PA_OFF_SIG_KEY_PTR   : u64 = 24
   pub let PA_OFF_TARGET_PTR    : u64 = 32
-  pub let PA_OFF_PASSPHRASE_FD : u64 = 40   // LV11-025 (#25): --passphrase-fd <n>
-  pub let PA_OFF_QUOTA_COUNT   : u64 = 48   // LV11-025 (#25): count of argv_quota_specs entries
-  pub let PA_STRUCT_BYTES      : u64 = 56   // widened from 40 for the two LV11-025 slots
+  pub let PA_OFF_PASSPHRASE_FD : u64 = 40
+  pub let PA_OFF_QUOTA_COUNT   : u64 = 48
+  pub let PA_STRUCT_BYTES      : u64 = 56
 
-  // --- ParsedArgv.flags bit assignments. ---------------------------------
+  // --- ParsedArgv.flags bit assignments (unchanged from v1.1.2). --------
   pub let PA_FLAG_FORCE              : u64 = 0x1
-  pub let PA_FLAG_DRY_RUN             : u64 = 0x2
-  pub let PA_FLAG_VERBOSE             : u64 = 0x4
-  pub let PA_FLAG_LABEL_SET           : u64 = 0x8
-  pub let PA_FLAG_JOURNAL_SIZE_SET    : u64 = 0x10
-  pub let PA_FLAG_SIG_KEY_SET         : u64 = 0x20
-  pub let PA_FLAG_UPGRADE             : u64 = 0x40   // mkfs.pdxfs.M4-004 (#16): --upgrade, stub-wired only (see module header)
-  pub let PA_FLAG_ENCRYPT             : u64 = 0x80   // mkfs.pdxfs.LV11-025 (#25): --encrypt (see module header)
-  pub let PA_FLAG_PASSPHRASE_FD_SET   : u64 = 0x100  // mkfs.pdxfs.LV11-025 (#25): --passphrase-fd <n> presence bit
-  pub let PA_FLAG_QUOTA_SET           : u64 = 0x200  // mkfs.pdxfs.LV11-025 (#25): --quota <spec> latched (repeatable)
-  pub let PA_FLAG_HELP                : u64 = 0x400  // mkfs.pdxfs.LV11-025 (#25): --help
+  pub let PA_FLAG_DRY_RUN            : u64 = 0x2
+  pub let PA_FLAG_VERBOSE            : u64 = 0x4
+  pub let PA_FLAG_LABEL_SET          : u64 = 0x8
+  pub let PA_FLAG_JOURNAL_SIZE_SET   : u64 = 0x10
+  pub let PA_FLAG_SIG_KEY_SET        : u64 = 0x20
+  pub let PA_FLAG_UPGRADE            : u64 = 0x40
+  pub let PA_FLAG_ENCRYPT            : u64 = 0x80
+  pub let PA_FLAG_PASSPHRASE_FD_SET  : u64 = 0x100
+  pub let PA_FLAG_QUOTA_SET          : u64 = 0x200
+  pub let PA_FLAG_HELP               : u64 = 0x400
 
-  // Default --journal-size when the flag is not given: 1024 blocks
-  // (4 MiB at the frozen 4096-byte block size), per
-  // volume-tooling-ux.md §3.1 and matching R52 §2.4's own default.
   pub let ARGV_DEFAULT_JOURNAL_SIZE : u64 = 1024
 
-  // --- argv_parse status codes. ------------------------------------------
   pub let ARGV_OK                    : u64 = 0
   pub let ARGV_ERR_MISSING_TARGET    : u64 = 1
 
-  // --- Flag literal storage (NUL-terminated; value-flag literals include
-  //     the trailing '=' so argv_prefix_match's length covers it). -------
-  pub let argv_lit_force         : [u8; 8]  = "--force\0"
-  pub let argv_lit_dry_run       : [u8; 10] = "--dry-run\0"
-  pub let argv_lit_verbose       : [u8; 10] = "--verbose\0"
-  pub let argv_lit_label         : [u8; 8]  = "--label="
-  pub let argv_lit_label_len     : u64 = 8
-  pub let argv_lit_journal_size     : [u8; 15] = "--journal-size="
-  pub let argv_lit_journal_size_len : u64 = 15
-  pub let argv_lit_sig_key       : [u8; 10] = "--sig-key="
-  pub let argv_lit_sig_key_len   : u64 = 10
+  // --- FID_* numbering (owned by this shim; see module header). ---------
+  pub let FID_FORCE          : u64 = 100
+  pub let FID_DRY_RUN        : u64 = 101
+  pub let FID_VERBOSE        : u64 = 102
+  pub let FID_UPGRADE        : u64 = 103
+  pub let FID_HELP           : u64 = 104
+  pub let FID_ENCRYPT        : u64 = 105
+  pub let FID_LABEL          : u64 = 106
+  pub let FID_JOURNAL_SIZE   : u64 = 107
+  pub let FID_SIG_KEY        : u64 = 108
+  pub let FID_PASSPHRASE_FD  : u64 = 109
+  pub let FID_QUOTA          : u64 = 110
 
-  // --- mkfs.pdxfs.M4-004 (#16): --upgrade literal (exact-match, no value). ---
-  pub let argv_lit_upgrade       : [u8; 10] = "--upgrade\0"
-  pub let argv_lit_upgrade_len   : u64 = 9
+  // --- Flag-name literals for flag_spec_register (NUL-terminated, no
+  //     leading "--" -- libpdx-argv's parser strips the '--' prefix
+  //     before invoking FlagSpec::lookup). -------------------------------
+  pub let mkfs_argv_name_force         : [u8; 6]  = "force\0"
+  pub let mkfs_argv_name_dry_run       : [u8; 8]  = "dry-run\0"
+  pub let mkfs_argv_name_verbose       : [u8; 8]  = "verbose\0"
+  pub let mkfs_argv_name_upgrade       : [u8; 8]  = "upgrade\0"
+  pub let mkfs_argv_name_help          : [u8; 5]  = "help\0"
+  pub let mkfs_argv_name_encrypt       : [u8; 8]  = "encrypt\0"
+  pub let mkfs_argv_name_label         : [u8; 6]  = "label\0"
+  pub let mkfs_argv_name_journal_size  : [u8; 13] = "journal-size\0"
+  pub let mkfs_argv_name_sig_key       : [u8; 8]  = "sig-key\0"
+  pub let mkfs_argv_name_passphrase_fd : [u8; 14] = "passphrase-fd\0"
+  pub let mkfs_argv_name_quota         : [u8; 6]  = "quota\0"
 
-  // --- mkfs.pdxfs.LV11-025 (#25): v1.1 flag literals. -------------------
-  //
-  // --encrypt / --help are exact-match boolean flags (streq).
-  // --passphrase-fd / --quota are exact-match two-token flags: the
-  // parser matches the flag name literal via streq, then consumes the
-  // NEXT argv token as the value. See module header for the parsing
-  // rationale (matches the brief's space-separated spelling).
-  pub let argv_lit_encrypt        : [u8; 10] = "--encrypt\0"
-  pub let argv_lit_encrypt_len    : u64 = 9
-  pub let argv_lit_passphrase_fd  : [u8; 16] = "--passphrase-fd\0"
-  pub let argv_lit_pfd_len        : u64 = 15
-  pub let argv_lit_quota          : [u8; 8]  = "--quota\0"
-  pub let argv_lit_quota_len      : u64 = 7
-  pub let argv_lit_help           : [u8; 7]  = "--help\0"
-  pub let argv_lit_help_len       : u64 = 6
-
-  // --- LV11-025 (#25) quota-spec storage. Every --quota <spec>
-  //     match appends the spec's own argv[i+1] pointer (into the
-  //     caller's own argv array, whose lifetime is the whole
-  //     process) into this .bss slot array, capped at
-  //     ARGV_QUOTA_MAX_ENTRIES. A future quota-table serialization
-  //     pass (deferred per src/quota.pdx's own module header) will
-  //     iterate this array by reading PA_OFF_QUOTA_COUNT and
-  //     dereferencing each argv_quota_specs[i]. -------------------------
+  // --- --quota spec storage (unchanged from v1.1.2). --------------------
+  //     16 u64 slots stored as a byte reserve for uniformity with every
+  //     other .bss reserve in this codebase. The scale-8 SIB addressing
+  //     `[rip + argv_quota_specs + r15*8]` writes each slot as a u64
+  //     despite the u8 element type -- same idiom src/format.pdx uses.
   pub let ARGV_QUOTA_MAX_ENTRIES  : u64 = 16
-  // 16 u64 slots stored as a byte reserve for uniformity with every
-  // other .bss reserve in this codebase (`[u8; N]` is the established
-  // shape; see src/format.pdx / src/encrypt.pdx). The scale-8 SIB
-  // addressing `[rip + argv_quota_specs + rcx*8]` writes / reads each
-  // slot as a u64 despite the u8 element type -- same idiom
-  // src/format.pdx's mkfs_format_sb_summary uses to store u64 fields
-  // into its own `[u8; 176]` reserve.
-  pub let mut argv_quota_specs    : [u8; 128] = uninit @align(8)  // ARGV_QUOTA_MAX_ENTRIES * 8 bytes
+  pub let mut argv_quota_specs    : [u8; 128] = uninit @align(8)
 
   // ==========================================================================
-  // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
+  // argv_parse(argc, argv, out_ptr) -> u64
+  //   rdi = argc  (per the frozen execve ABI)
+  //   rsi = argv  (VA of a char*[]; argv[0] is the program name)
+  //   rdx = out_ptr (56-byte ParsedArgv struct, caller-allocated .bss)
+  //   rax = ARGV_OK (0) on success, ARGV_ERR_MISSING_TARGET (1) if no
+  //         positional was seen.
   //
-  // Standard NUL-terminated exact-equality compare. Both pointers must be
-  // NUL-terminated C strings. Pure leaf: touches only rax/rcx/rdx/rdi/rsi
-  // (all SysV caller-save), no callee-save writes, no nested call.
-  // ==========================================================================
-  pub let argv_streq : (u64, u64) -> u64 !{mem} @{} =
-    fn (a_ptr: u64) (b_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M1-002 (#2): argv_streq entry point. Byte-loop equality compare, a_ptr in rdi, b_ptr in rsi. Each iteration: xor+mov_b loads a[i] into rcx and b[i] into rdx (zero-extended, per paideia-as #1248 workaround); cmp rcx, rdx; jne mkfs_argv_streq_no on mismatch; cmp rcx, 0; je mkfs_argv_streq_yes when both sides hit NUL simultaneously (rcx==rdx==0 at that point since the prior cmp did not diverge); otherwise advance both pointers and loop. Pure leaf -- rax/rcx/rdx/rdi/rsi are all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mkfs_argv_streq_.",
-      block: {
-      mkfs_argv_streq_loop:
-        xor rcx, rcx;
-        mov_b rcx, [rdi];
-        xor rdx, rdx;
-        mov_b rdx, [rsi];
-        cmp rcx, rdx;
-        jne mkfs_argv_streq_no;
-        cmp rcx, 0;
-        je mkfs_argv_streq_yes;
-        add rdi, 1;
-        add rsi, 1;
-        jmp mkfs_argv_streq_loop;
-
-      mkfs_argv_streq_yes:
-        mov rax, 1;
-        ret;
-
-      mkfs_argv_streq_no:
-        xor rax, rax;
-        ret;
-      }
-    }
-
-  // ==========================================================================
-  // argv_prefix_match(a_ptr, lit_ptr, lit_len) -> u64 (1 = match, 0 = no match)
+  // Register plan (5 callee-save pushes -> rsp%16 = 0 for nested calls):
+  //   rbx = out_ptr        (survives every libpdx-argv call below)
+  //   r12 = argc / repurposed after parse_argv to flag_count
+  //   r13 = argv / repurposed after parse_argv to loop index i
+  //   r14 = accumulated flags mask
+  //   r15 = quota_count (running append cursor into argv_quota_specs)
   //
-  // Compares the first lit_len bytes of a_ptr against lit_ptr byte-for-byte.
-  // Neither side needs to be NUL-terminated at position lit_len; a caller
-  // matching a value-flag literal (e.g. "--label=") passes its own byte
-  // length in rdx and, on a 1 return, computes the value pointer as
-  // a_ptr + lit_len itself (this function does not return that pointer).
-  // Pure leaf: rax/rcx/r8/rdi/rsi/rdx all SysV caller-save.
-  // ==========================================================================
-  pub let argv_prefix_match : (u64, u64, u64) -> u64 !{mem} @{} =
-    fn (a_ptr: u64) (lit_ptr: u64) (lit_len: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M1-002 (#2): argv_prefix_match entry point. a_ptr in rdi, lit_ptr in rsi, lit_len in rdx. rcx = index, starts at 0. Loop: cmp rcx, rdx; jge mkfs_argv_pm_yes once every literal byte has matched (all lit_len bytes consumed with no mismatch). Otherwise xor+mov_b loads a[rcx] into rax and lit[rcx] into r8 via SIB [reg+rcx*1] addressing (same shape as cat.pdx's cat_strlen_loop / cat_open_err path); cmp rax, r8; jne mkfs_argv_pm_no on mismatch; else add rcx,1 and loop. Pure leaf, no push/pop, no `add reg,[mem]`, no `test` mnemonic. Labels prefixed mkfs_argv_pm_.",
-      block: {
-        xor rcx, rcx;
-
-      mkfs_argv_pm_loop:
-        cmp rcx, rdx;
-        jge mkfs_argv_pm_yes;
-
-        xor rax, rax;
-        mov_b rax, [rdi + rcx*1];
-        xor r8, r8;
-        mov_b r8, [rsi + rcx*1];
-        cmp rax, r8;
-        jne mkfs_argv_pm_no;
-
-        add rcx, 1;
-        jmp mkfs_argv_pm_loop;
-
-      mkfs_argv_pm_yes:
-        mov rax, 1;
-        ret;
-
-      mkfs_argv_pm_no:
-        xor rax, rax;
-        ret;
-      }
-    }
-
-  // ==========================================================================
-  // argv_parse_u64_dec(str_ptr) -> u64
-  //
-  // Parses a NUL-terminated decimal string into a u64, stopping at the
-  // first non-digit byte (including a leading one, which yields 0 -- same
-  // "malformed input silently yields a partial/zero result" contract as
-  // src/user/dispatch.pdx's dec_parse in the paideia-os monorepo). acc*10
-  // is computed as (acc<<3) + acc + acc rather than via `imul`/`mul` --
-  // this codebase avoids those primitives for compile-time-constant
-  // multiplies in userspace leaf helpers (see module header). Pure leaf:
-  // rax/rcx/r8/rdi are SysV caller-save.
-  // ==========================================================================
-  pub let argv_parse_u64_dec : (u64) -> u64 !{mem} @{} =
-    fn (str_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M1-002 (#2): argv_parse_u64_dec entry point. str_ptr in rdi, accumulator in rax (starts at 0). Loop: xor+mov_b loads the next byte into rcx (zero-extended). cmp rcx, 0x30; jl mkfs_argv_pu_done (below '0' -- non-digit, including a leading NUL/negative-sign byte, stops with whatever rax holds so far, i.e. 0 on the very first iteration). cmp rcx, 0x39; jg mkfs_argv_pu_done (above '9' -- non-digit, stops). Otherwise this is a decimal digit: r8 = rax<<3 (rax*8) via shl, then r8 += rax twice (rax*8 + rax + rax = rax*10) -- avoids the missing-by-convention imul/mul path per module header, same decomposition src/user/dispatch.pdx's dec_parse and src/kernel/acpi/madt.pdx's count*24 helper use. rcx -= 0x30 (digit value 0..9); r8 += rcx; rax = r8 (new accumulator); rdi += 1 (advance cursor); loop. Pure leaf, no push/pop, no `add reg,[mem]` (the accumulator math is register-only), no `test` mnemonic. Labels prefixed mkfs_argv_pu_.",
-      block: {
-        xor rax, rax;
-
-      mkfs_argv_pu_loop:
-        xor rcx, rcx;
-        mov_b rcx, [rdi];
-        cmp rcx, 0x30;
-        jl mkfs_argv_pu_done;
-        cmp rcx, 0x39;
-        jg mkfs_argv_pu_done;
-
-        mov r8, rax;
-        shl r8, 3;
-        add r8, rax;
-        add r8, rax;
-        sub rcx, 0x30;
-        add r8, rcx;
-        mov rax, r8;
-
-        add rdi, 1;
-        jmp mkfs_argv_pu_loop;
-
-      mkfs_argv_pu_done:
-        ret;
-      }
-    }
-
-  // ==========================================================================
-  // argv_parse(argc, argv, out_ptr) -> u64 (ARGV_OK | ARGV_ERR_MISSING_TARGET)
-  //
-  //   rdi = argc   (per the frozen execve ABI, design/user/execve-abi.md
-  //                 in paideia-os -- argc arrives in rdi at _start and is
-  //                 forwarded here unchanged by main.pdx)
-  //   rsi = argv   (VA of a char*[]; argv[0] is the program name and is
-  //                 skipped -- this loop starts at index 1)
-  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 56 bytes at
-  //                 LV11-025, was 40 at M1..M5; caller-allocated .bss
-  //                 per main.pdx)
-  //
-  // Register plan across the loop (all SysV callee-save; pushed on entry
-  // and popped at the shared epilogue -- see the entry-point
-  // justification below -- so they survive the nested argv_streq /
-  // argv_prefix_match / argv_parse_u64_dec calls):
-  //   rbx = argc
-  //   r12 = &argv[0]
-  //   r13 = out_ptr
-  //   r14 = i (loop index, starts at 1)
-  //   r15 = argv[i] (current token pointer, reloaded each iteration)
-  //
-  // Zero-init pass writes PA_FLAG defaults (flags=0, journal_size=
-  // ARGV_DEFAULT_JOURNAL_SIZE, every pointer field = 0) into out_ptr
-  // BEFORE the scan loop, so a caller that supplies none of the optional
-  // flags gets well-defined defaults rather than uninitialised .bss
-  // (which happens to already be zero at process start, but the explicit
-  // write also lands the journal_size default, which is non-zero).
+  // Scratch (caller-save; trashed across every call):
+  //   rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11
   // ==========================================================================
   pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs.M1-002 (#2) + M1-003 (#3) + LV11-025 (#25): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mkfs_argv_epilogue) before every return -- this function is a public entry point a future caller may rely on for register preservation (matching the discipline libpdx-audit's audit_send_record follows via its own push r12/push r13 pair), unlike this file's three pure-leaf helpers (argv_streq / argv_prefix_match / argv_parse_u64_dec), which never touch a callee-save register and so need no push/pop. Zero-init pass writes out.flags=0 (+0), out.label_ptr=0 (+8), out.journal_size=ARGV_DEFAULT_JOURNAL_SIZE=1024 (+16), out.sig_key_ptr=0 (+24), out.target_ptr=0 (+32) before scanning, so every unset field has a well-defined value regardless of .bss zero-init happening to already hold zero for four of the five. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` / `call argv_prefix_match` / `call argv_parse_u64_dec` invocations below -- those three callees clobber only caller-save registers per their own justifications. Main loop (mkfs_argv_scan_loop): cmp r14, rbx; jge mkfs_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Seven flag checks in a fixed order (four boolean flags via argv_streq against four exact literals -- --force/--dry-run/--verbose/--upgrade [mkfs.pdxfs.M4-004, #16, stub-wired only -- see module header], then three value flags via argv_prefix_match against the three '='-terminated literals, each followed by a store into the matching out-struct slot plus its PA_FLAG_*_SET presence bit where applicable) -- --journal-size= additionally pipes its value pointer (r15 + argv_lit_journal_size_len) through argv_parse_u64_dec before storing the resulting u64. Every check that DOESN'T match falls through to the next; a token matching none of the seven is treated as the positional <target> and stored into out.target_ptr (last-token-wins on a caller passing two positionals -- see module header). After a match (or the positional fallthrough), jmp mkfs_argv_scan_next which increments r14 and loops. After the loop: if out.target_ptr (reloaded from [r13+32]) == 0, jmp mkfs_argv_missing_target which sets rax=1 (ARGV_ERR_MISSING_TARGET) and falls into the shared epilogue; else set rax=0 (ARGV_OK) and fall into the same epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg`); no `test` mnemonic. Labels prefixed mkfs_argv_.",
+      justification: "mkfs.pdxfs.ENH-030 (#27): argv_parse shim over libpdx-argv v1.1.0. Entry rsp%16=8 (post-call); pushes 5 callee-save regs (rbx/r12/r13/r14/r15) -> rsp%16=0 for every nested call site (flag_spec_reset, flag_spec_register x11, parsed_args_reset, parse_argv, parse_int_u64 x2). rbx holds the caller's out_ptr through every call; r12 initially holds argc and is repurposed post-parse_argv to hold flag_count for the walk; r13 initially holds argv (needed for the argv+8/argc-1 skip below) and is repurposed post-parse_argv to the walk loop index; r14 accumulates the flags mask across the walk; r15 tracks the quota_count append cursor. Zero-init pass: writes flags=0, label_ptr=0, journal_size=1024 (ARGV_DEFAULT_JOURNAL_SIZE), sig_key_ptr=0, target_ptr=0, passphrase_fd=0, quota_count=0 into the 56-byte out struct BEFORE any libpdx-argv call, so a caller supplying zero flags still gets well-defined defaults (including the non-zero journal_size default). Registration pass: eleven flag_spec_register calls -- (force,BOOL,100), (dry-run,BOOL,101), (verbose,BOOL,102), (upgrade,BOOL,103), (help,BOOL,104), (encrypt,BOOL,105), (label,STR,106), (journal-size,INT,107), (sig-key,STR,108), (passphrase-fd,INT,109), (quota,STR,110). FKIND_BOOL/STR/INT constants are 0/1/2 per libpdx-argv/src/flag_spec.pdx. Parse: rdi=r13+8 (argv+8 skips argv[0], per libpdx-argv's caller-strips-argv0 convention that every existing consumer under paideia-satellites/ follows), rsi=r12-1 (argc-1); call parse_argv. Return code IGNORED -- libpdx-argv's ParsedArgs singleton still holds every flag that WAS parsed even on a soft error (ERR_MISSING_VALUE for --passphrase-fd with no value; ERR_UNKNOWN_ARG_FORM for a bare `-`), and the walk below simply picks up whatever landed. Walk pass: r12=[flag_count], r13=0 (loop index i), r14=0 (accumulated flags), r15=0 (quota_count). Each iteration: r10=flag_ids[r13]; cmp against every FID_* constant in ascending order; on a match, either OR the matching PA_FLAG_* into r14 (for the six booleans FID_FORCE..FID_ENCRYPT) or read flag_values[r13] and store it into the matching PA_OFF_* slot in the out struct (for the five value-carrying flags). --label / --sig-key store the raw string pointer verbatim; --journal-size / --passphrase-fd pipe the string pointer through parse_int_u64 (Typed::parse_int_u64 return convention: rax=ok, rdx=val) and store rdx iff rax==1 -- a parse failure leaves the default in place (a behaviour change vs. the pre-shim `argv_parse_u64_dec` which returned partial values; no caller consults PA_FLAG_*_SET for these two flags, so observationally equivalent). --quota (repeatable) OR's PA_FLAG_QUOTA_SET into r14 unconditionally on every match (matching the pre-shim latch-regardless-of-drop posture), then appends flag_values[r13] into argv_quota_specs[r15] iff r15 < ARGV_QUOTA_MAX_ENTRIES (16) -- an occurrence past the cap is silently dropped, again matching pre-shim. Post-walk: writes r14 into PA_OFF_FLAGS (+0) and r15 into PA_OFF_QUOTA_COUNT (+48). Positional pass: reads pos_count; if > 0, copies pos_ptrs[0] into PA_OFF_TARGET_PTR (+32) -- mkfs.pdxfs takes exactly one positional per its own CLI grammar. Sets rax=ARGV_OK on target seen, ARGV_ERR_MISSING_TARGET on no positional -- unchanged surface for main.pdx's early-branch dispatch. Epilogue pops r15/r14/r13/r12/rbx (reverse push order) then rets. No `add reg,[mem]`; no `test` mnemonic; every cmp reg,imm well under 0x7FFFFFFF (max 1024 for the default). Labels prefixed mkfs_argv_.",
       block: {
         push rbx;
         push r12;
@@ -430,248 +244,215 @@ module Argv = structure {
         push r14;
         push r15;
 
-        mov rbx, rdi;                       // rbx = argc
-        mov r12, rsi;                       // r12 = &argv[0]
-        mov r13, rdx;                       // r13 = out_ptr
+        mov rbx, rdx;                       // rbx = out_ptr
+        mov r12, rdi;                       // r12 = argc
+        mov r13, rsi;                       // r13 = argv
 
-        // ---- Zero-init pass (+ journal_size default). -------------------
+        // ---- Zero-init pass (+ journal-size default). --------------------
         xor rax, rax;
-        mov [r13 + 0], rax;                 // flags = 0
-        mov [r13 + 8], rax;                 // label_ptr = 0
+        mov [rbx + 0], rax;                 // flags = 0
+        mov [rbx + 8], rax;                 // label_ptr = 0
         mov rax, 1024;                      // ARGV_DEFAULT_JOURNAL_SIZE
-        mov [r13 + 16], rax;                // journal_size = default
+        mov [rbx + 16], rax;                // journal_size = default
         xor rax, rax;
-        mov [r13 + 24], rax;                // sig_key_ptr = 0
-        mov [r13 + 32], rax;                // target_ptr = 0
-        mov [r13 + 40], rax;                // passphrase_fd = 0 (LV11-025 PA_OFF_PASSPHRASE_FD)
-        mov [r13 + 48], rax;                // quota_count  = 0 (LV11-025 PA_OFF_QUOTA_COUNT)
+        mov [rbx + 24], rax;                // sig_key_ptr = 0
+        mov [rbx + 32], rax;                // target_ptr = 0
+        mov [rbx + 40], rax;                // passphrase_fd = 0
+        mov [rbx + 48], rax;                // quota_count = 0
 
-        mov r14, 1;                         // i = 1 (skip argv[0])
+        // ---- Register the 11 flags with libpdx-argv's FlagSpec. ---------
+        call flag_spec_reset;
 
-      mkfs_argv_scan_loop:
-        cmp r14, rbx;
-        jge mkfs_argv_scan_done;
+        lea rdi, [rip + mkfs_argv_name_force];
+        mov rsi, 0;                         // FKIND_BOOL
+        mov rdx, 100;                       // FID_FORCE
+        call flag_spec_register;
 
-        mov r15, [r12 + r14*8];             // r15 = argv[i]
+        lea rdi, [rip + mkfs_argv_name_dry_run];
+        mov rsi, 0;
+        mov rdx, 101;                       // FID_DRY_RUN
+        call flag_spec_register;
 
-        // ---- --force (exact) ---------------------------------------------
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_force];
-        call argv_streq;
+        lea rdi, [rip + mkfs_argv_name_verbose];
+        mov rsi, 0;
+        mov rdx, 102;                       // FID_VERBOSE
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_upgrade];
+        mov rsi, 0;
+        mov rdx, 103;                       // FID_UPGRADE
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_help];
+        mov rsi, 0;
+        mov rdx, 104;                       // FID_HELP
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_encrypt];
+        mov rsi, 0;
+        mov rdx, 105;                       // FID_ENCRYPT
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_label];
+        mov rsi, 1;                         // FKIND_STR
+        mov rdx, 106;                       // FID_LABEL
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_journal_size];
+        mov rsi, 2;                         // FKIND_INT
+        mov rdx, 107;                       // FID_JOURNAL_SIZE
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_sig_key];
+        mov rsi, 1;                         // FKIND_STR
+        mov rdx, 108;                       // FID_SIG_KEY
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_passphrase_fd];
+        mov rsi, 2;                         // FKIND_INT
+        mov rdx, 109;                       // FID_PASSPHRASE_FD
+        call flag_spec_register;
+
+        lea rdi, [rip + mkfs_argv_name_quota];
+        mov rsi, 1;                         // FKIND_STR
+        mov rdx, 110;                       // FID_QUOTA
+        call flag_spec_register;
+
+        // ---- Reset ParsedArgs bookkeeping + drive the parse. ------------
+        call parsed_args_reset;
+
+        mov rdi, r13;
+        add rdi, 8;                         // argv+8 (skip argv[0])
+        mov rsi, r12;
+        sub rsi, 1;                         // argc-1
+        call parse_argv;
+        // rax = error code; deliberately IGNORED -- populate what landed.
+
+        // ---- Walk flag_ids[0..flag_count) once. -------------------------
+        lea r11, [rip + flag_count];
+        mov r12, [r11];                     // r12 = flag_count (repurposed)
+        xor r13, r13;                       // r13 = i = 0 (repurposed)
+        xor r14, r14;                       // r14 = flags mask = 0
+        xor r15, r15;                       // r15 = quota_count = 0
+
+      mkfs_argv_walk_loop:
+        cmp r13, r12;
+        jge mkfs_argv_walk_done;
+
+        lea r11, [rip + flag_ids];
+        mov r10, [r11 + r13*8];             // r10 = flag_ids[i]
+
+        cmp r10, 100;                       // FID_FORCE
+        jne mkfs_argv_case_dry_run;
+        or r14, 0x1;                        // PA_FLAG_FORCE
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_dry_run:
+        cmp r10, 101;                       // FID_DRY_RUN
+        jne mkfs_argv_case_verbose;
+        or r14, 0x2;                        // PA_FLAG_DRY_RUN
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_verbose:
+        cmp r10, 102;                       // FID_VERBOSE
+        jne mkfs_argv_case_upgrade;
+        or r14, 0x4;                        // PA_FLAG_VERBOSE
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_upgrade:
+        cmp r10, 103;                       // FID_UPGRADE
+        jne mkfs_argv_case_help;
+        or r14, 0x40;                       // PA_FLAG_UPGRADE
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_help:
+        cmp r10, 104;                       // FID_HELP
+        jne mkfs_argv_case_encrypt;
+        or r14, 0x400;                      // PA_FLAG_HELP
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_encrypt:
+        cmp r10, 105;                       // FID_ENCRYPT
+        jne mkfs_argv_case_label;
+        or r14, 0x80;                       // PA_FLAG_ENCRYPT
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_label:
+        cmp r10, 106;                       // FID_LABEL
+        jne mkfs_argv_case_journal_size;
+        lea r11, [rip + flag_values];
+        mov r9, [r11 + r13*8];              // r9 = value ptr
+        mov [rbx + 8], r9;                  // label_ptr
+        or r14, 0x8;                        // PA_FLAG_LABEL_SET
+        jmp mkfs_argv_walk_next;
+
+      mkfs_argv_case_journal_size:
+        cmp r10, 107;                       // FID_JOURNAL_SIZE
+        jne mkfs_argv_case_sig_key;
+        lea r11, [rip + flag_values];
+        mov rdi, [r11 + r13*8];
+        call parse_int_u64;                 // rax=ok, rdx=val
         cmp rax, 0;
-        je mkfs_argv_check_dry_run;
+        je mkfs_argv_walk_next;             // parse fail: leave default
+        mov [rbx + 16], rdx;                // journal_size
+        or r14, 0x10;                       // PA_FLAG_JOURNAL_SIZE_SET
+        jmp mkfs_argv_walk_next;
 
-        mov rax, [r13 + 0];
-        or rax, 0x1;                        // PA_FLAG_FORCE
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
+      mkfs_argv_case_sig_key:
+        cmp r10, 108;                       // FID_SIG_KEY
+        jne mkfs_argv_case_passphrase_fd;
+        lea r11, [rip + flag_values];
+        mov r9, [r11 + r13*8];
+        mov [rbx + 24], r9;                 // sig_key_ptr
+        or r14, 0x20;                       // PA_FLAG_SIG_KEY_SET
+        jmp mkfs_argv_walk_next;
 
-      mkfs_argv_check_dry_run:
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_dry_run];
-        call argv_streq;
+      mkfs_argv_case_passphrase_fd:
+        cmp r10, 109;                       // FID_PASSPHRASE_FD
+        jne mkfs_argv_case_quota;
+        lea r11, [rip + flag_values];
+        mov rdi, [r11 + r13*8];
+        call parse_int_u64;                 // rax=ok, rdx=val
         cmp rax, 0;
-        je mkfs_argv_check_verbose;
+        je mkfs_argv_walk_next;             // parse fail: no latch
+        mov [rbx + 40], rdx;                // passphrase_fd
+        or r14, 0x100;                      // PA_FLAG_PASSPHRASE_FD_SET
+        jmp mkfs_argv_walk_next;
 
-        mov rax, [r13 + 0];
-        or rax, 0x2;                        // PA_FLAG_DRY_RUN
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_verbose:
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_verbose];
-        call argv_streq;
-        cmp rax, 0;
-        je mkfs_argv_check_upgrade;
-
-        mov rax, [r13 + 0];
-        or rax, 0x4;                        // PA_FLAG_VERBOSE
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_upgrade:
-        // ---- mkfs.pdxfs.M4-004 (#16): --upgrade (exact, stub-wired only). --
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_upgrade];
-        call argv_streq;
-        cmp rax, 0;
-        je mkfs_argv_check_help;
-
-        mov rax, [r13 + 0];
-        or rax, 0x40;                       // PA_FLAG_UPGRADE
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_help:
-        // ---- LV11-025 (#25): --help (exact, no value). -------------------
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_help];
-        call argv_streq;
-        cmp rax, 0;
-        je mkfs_argv_check_encrypt;
-
-        mov rax, [r13 + 0];
-        or rax, 0x400;                      // PA_FLAG_HELP
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_encrypt:
-        // ---- LV11-025 (#25): --encrypt (exact, no value). ----------------
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_encrypt];
-        call argv_streq;
-        cmp rax, 0;
-        je mkfs_argv_check_pfd;
-
-        mov rax, [r13 + 0];
-        or rax, 0x80;                       // PA_FLAG_ENCRYPT
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_pfd:
-        // ---- LV11-025 (#25): --passphrase-fd <n> (two-token). ------------
-        // Match the flag-name literal first; on a match, consume
-        // argv[i+1] as the fd number via argv_parse_u64_dec.
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_passphrase_fd];
-        call argv_streq;
-        cmp rax, 0;
-        je mkfs_argv_check_quota;
-
-        // Bounds: need argv[i+1] present. LV11-025 fixup (v1.1.1
-        // debugger SUSPECT #3): if the fd token is missing, do NOT
-        // latch the presence bit; otherwise --encrypt --passphrase-fd
-        // (with no value) bypasses main.pdx's encrypt-needs-pfd gate
-        // and silently reads the passphrase from stdin.
-        mov rax, r14;
-        add rax, 1;                         // rax = i + 1
-        cmp rax, rbx;
-        jge mkfs_argv_scan_next;            // no next token: drop flag entirely
-
-        // Parse next token as u64 fd.
-        mov rdi, [r12 + rax*8];             // fd_str = argv[i+1]
-        call argv_parse_u64_dec;
-        mov [r13 + 40], rax;                // PA_OFF_PASSPHRASE_FD
-
-        // Latch the presence bit ONLY after a value token was consumed.
-        mov rax, [r13 + 0];
-        or rax, 0x100;                      // PA_FLAG_PASSPHRASE_FD_SET
-        mov [r13 + 0], rax;
-
-        // Advance i by an extra 1 (scan_next adds the second 1).
-        add r14, 1;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_quota:
-        // ---- LV11-025 (#25): --quota <spec> (two-token, repeatable). -----
-        // Match the flag-name literal first; on a match, consume
-        // argv[i+1] as the spec-string pointer and append into
-        // argv_quota_specs[count] iff count < ARGV_QUOTA_MAX_ENTRIES.
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_quota];
-        call argv_streq;
-        cmp rax, 0;
-        je mkfs_argv_check_label;
-
-        // Latch the presence bit regardless (matches the malformed-
-        // value silent-drop posture).
-        mov rax, [r13 + 0];
-        or rax, 0x200;                      // PA_FLAG_QUOTA_SET
-        mov [r13 + 0], rax;
-
-        // Bounds: need argv[i+1] present.
-        mov rax, r14;
-        add rax, 1;                         // rax = i + 1
-        cmp rax, rbx;
-        jge mkfs_argv_scan_next;            // no next token: silently drop value
-
-        // Bounds: count < ARGV_QUOTA_MAX_ENTRIES.
-        mov rcx, [r13 + 48];                // count = PA_OFF_QUOTA_COUNT
-        cmp rcx, 16;                        // ARGV_QUOTA_MAX_ENTRIES
-        jge mkfs_argv_quota_advance;        // full: drop spec, still consume token
-
-        // Append spec ptr into argv_quota_specs[count].
-        mov r10, [r12 + rax*8];             // spec = argv[i+1]
+      mkfs_argv_case_quota:
+        cmp r10, 110;                       // FID_QUOTA
+        jne mkfs_argv_walk_next;
+        or r14, 0x200;                      // PA_FLAG_QUOTA_SET (latches regardless of drop)
+        cmp r15, 16;                        // ARGV_QUOTA_MAX_ENTRIES
+        jge mkfs_argv_walk_next;
+        lea r11, [rip + flag_values];
+        mov r9, [r11 + r13*8];
         lea r11, [rip + argv_quota_specs];
-        mov [r11 + rcx*8], r10;
-        add rcx, 1;
-        mov [r13 + 48], rcx;                // count += 1
+        mov [r11 + r15*8], r9;
+        add r15, 1;
 
-      mkfs_argv_quota_advance:
-        // Advance i by an extra 1 (scan_next adds the second 1).
-        add r14, 1;
-        jmp mkfs_argv_scan_next;
+      mkfs_argv_walk_next:
+        add r13, 1;
+        jmp mkfs_argv_walk_loop;
 
-      mkfs_argv_check_label:
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_label];
-        mov rdx, 8;                         // argv_lit_label_len
-        call argv_prefix_match;
+      mkfs_argv_walk_done:
+        mov [rbx + 0], r14;                 // flags
+        mov [rbx + 48], r15;                // quota_count
+
+        // ---- Positional pass: pos_ptrs[0] -> target_ptr. ----------------
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
         cmp rax, 0;
-        je mkfs_argv_check_journal_size;
+        je mkfs_argv_no_target;
 
-        mov rax, r15;
-        add rax, 8;                         // value = token + literal_len
-        mov [r13 + 8], rax;                 // label_ptr = value
-
-        mov rax, [r13 + 0];
-        or rax, 0x8;                        // PA_FLAG_LABEL_SET
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_journal_size:
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_journal_size];
-        mov rdx, 15;                        // argv_lit_journal_size_len
-        call argv_prefix_match;
-        cmp rax, 0;
-        je mkfs_argv_check_sig_key;
-
-        mov rdi, r15;
-        add rdi, 15;                        // value ptr = token + literal_len
-        call argv_parse_u64_dec;
-        mov [r13 + 16], rax;                // journal_size = parsed value
-
-        mov rax, [r13 + 0];
-        or rax, 0x10;                       // PA_FLAG_JOURNAL_SIZE_SET
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_check_sig_key:
-        mov rdi, r15;
-        lea rsi, [rip + argv_lit_sig_key];
-        mov rdx, 10;                        // argv_lit_sig_key_len
-        call argv_prefix_match;
-        cmp rax, 0;
-        je mkfs_argv_positional;
-
-        mov rax, r15;
-        add rax, 10;                        // value = token + literal_len
-        mov [r13 + 24], rax;                // sig_key_ptr = value
-
-        mov rax, [r13 + 0];
-        or rax, 0x20;                       // PA_FLAG_SIG_KEY_SET
-        mov [r13 + 0], rax;
-        jmp mkfs_argv_scan_next;
-
-      mkfs_argv_positional:
-        // No flag matched -- this token is the positional <target>.
-        mov [r13 + 32], r15;                // target_ptr = token (last wins)
-
-      mkfs_argv_scan_next:
-        add r14, 1;
-        jmp mkfs_argv_scan_loop;
-
-      mkfs_argv_scan_done:
-        mov rax, [r13 + 32];                // reload target_ptr
-        cmp rax, 0;
-        je mkfs_argv_missing_target;
+        lea r11, [rip + pos_ptrs];
+        mov r9, [r11];                      // pos_ptrs[0]
+        mov [rbx + 32], r9;                 // target_ptr
 
         xor rax, rax;                       // ARGV_OK
         jmp mkfs_argv_epilogue;
 
-      mkfs_argv_missing_target:
+      mkfs_argv_no_target:
         mov rax, 1;                         // ARGV_ERR_MISSING_TARGET
 
       mkfs_argv_epilogue:

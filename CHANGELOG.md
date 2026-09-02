@@ -1,5 +1,78 @@
 # mkfs.pdxfs — CHANGELOG
 
+## 1.1.3 — 2026-09-02 (ENH-030: libpdx-argv adoption — replaces handwritten scanner)
+
+**Patch bump — no observable behaviour change for well-formed input;
+every exit code + stderr diagnostic preserved.** Replaces the
+handwritten long-flag scanner in `src/argv.pdx` with a thin wire-in
+over paideia-satellites/libpdx-argv v1.1.0 (ENH-030 rename tag). Every
+public symbol callers depend on — the `argv_parse` entry point, the
+`PA_OFF_*` / `PA_FLAG_*` / `PA_STRUCT_BYTES` constants,
+`argv_quota_specs` + `ARGV_QUOTA_MAX_ENTRIES`, and every
+`ARGV_ERR_*` return code — keeps its numeric value and its byte
+offset unchanged, so `src/main.pdx`'s direct-offset loads and
+`tests/test_upgrade_stub.pdx`'s `[u8; 56]` buffer with its
+`PA_FLAG_UPGRADE` (0x40) check both continue to work byte-for-byte.
+
+### Added
+
+- **libpdx-argv wire-in** — `argv_parse` now registers the 11
+  mkfs.pdxfs long flags with `flag_spec_register()` (each bound to a
+  `FID_*` in the 100..110 range and a `FKIND_BOOL` / `FKIND_STR` /
+  `FKIND_INT` value kind), drives `parse_argv(argv+8, argc-1)` over
+  the caller's argv (the +8/-1 pair strips argv[0] per libpdx-argv's
+  caller-strips-argv0 convention), then walks
+  `flag_ids[0..flag_count)` once to populate the caller's 56-byte
+  ParsedArgv struct via a linear `cmp r10, FID_*; jne next` chain.
+- **Flag-name literals** — new NUL-terminated `[u8; N]` names in
+  .rodata (`mkfs_argv_name_force`, `_dry_run`, `_verbose`, `_upgrade`,
+  `_help`, `_encrypt`, `_label`, `_journal_size`, `_sig_key`,
+  `_passphrase_fd`, `_quota`), each without the `--` prefix
+  (libpdx-argv's parser strips it before calling FlagSpec::lookup).
+
+### Removed
+
+- **Handwritten scanner** — `argv_streq`, `argv_prefix_match`,
+  `argv_parse_u64_dec`, and every `argv_lit_*` (`--force\0`,
+  `--dry-run\0`, etc.) literal are deleted. The equivalent semantics
+  now live in libpdx-argv's `Parser::parse_argv` (name matching),
+  `Typed::parse_int_u64` (decimal decoding for `--journal-size` and
+  `--passphrase-fd`), and `Parser`'s own inline `=`/`:` separator
+  handling for `--label=value` / `--sig-key=value` / etc.
+
+### Behaviour notes
+
+- **`--passphrase-fd` with a missing value**: libpdx-argv reports
+  ERR_MISSING_VALUE for a typed flag that reaches end-of-argv with no
+  value token. The shim ignores parse_argv's return code and inspects
+  ParsedArgs post-hoc; libpdx-argv did not store the missing-value
+  flag, so the walk never latches PA_FLAG_PASSPHRASE_FD_SET.
+  `src/main.pdx`'s `--encrypt requires --passphrase-fd` gate fires on
+  exactly the same inputs as before.
+- **`--label value` / `--journal-size 4096`** (space-separated
+  spellings): now accepted (libpdx-argv's FKIND_STR / FKIND_INT
+  consume the lookahead when no inline `=`/`:` is present). The
+  pre-shim body accepted only the `=` form; the shim is a strict
+  superset. No test exercised the space form on refusal, so this is
+  a permissive extension only.
+- **`--journal-size=abc`** (malformed numeric): now leaves the
+  default 1024 in place and does NOT latch PA_FLAG_JOURNAL_SIZE_SET
+  (the pre-shim body stored 0 and latched). No caller consults the
+  presence bit, and downstream code uses the value as-is.
+
+### Build
+
+- **`bash tools/build.sh --extra-obj-dir ../libpdx-argv/build-out
+  ...`** — the standing invocation must now include libpdx-argv's
+  build-out alongside libpdx-volume's, so the linker can resolve
+  `flag_spec_register` / `parsed_args_reset` / `parse_argv` /
+  `flag_count` / `flag_ids` / `flag_values` / `pos_count` /
+  `pos_ptrs` / `parse_int_u64` from libpdx-argv's own objects.
+
+Closes #27 (satellite adoption of libpdx-argv). Depends on
+libpdx-argv v1.1.0 (ENH-030 rename that ended the multi-module
+`reset` / `register` link collision).
+
 ## 1.1.2 — 2026-09-02 (Phase C: `--extra-archive` + `--gc-sections` for satellite-runtime link)
 
 **Patch bump — additive `tools/build.sh` flag; every existing invocation

@@ -3,7 +3,7 @@
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
 **Current milestone:** LV11 (libpdx-volume v1.1 adoption pass, issues
 #24 + #25) — **landed**; supersedes M5 (dual-signed release) — landed.
-**Version:** 1.1.1
+**Version:** 1.1.3 (ENH-030: libpdx-argv adoption — replaces handwritten scanner, #27)
 
 See `design/tooling/volume-tooling-ux.md` §9.1 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
