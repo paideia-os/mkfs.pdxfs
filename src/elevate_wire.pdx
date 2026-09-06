@@ -1,19 +1,175 @@
 // src/elevate_wire.pdx — mkfs.pdxfs.M3-005 (#12) — libpdx-elevate
-// KIND_BLOCK_DEVICE(write) elevation request for device targets.
+// KIND_BLKDEV(write) elevation request for device targets. Revisited at
+// LE-001 (paideia-os/mkfs.pdxfs#26, "wire elevate gate on block-device
+// format") to fully specify the real call sequence and pin down BOTH
+// concrete blockers that still keep this function's BODY at its M3-005
+// fail-closed DENY. See "LE-001 addendum" below for what this landing
+// changed and why the gate itself is still not live.
 //
 // ----------------------------------------------------------------------
-// The API this issue assumes does not exist -- what libpdx-elevate
-// actually offers
+// LE-001 addendum: the API this issue names now DOES exist -- but two
+// separate, verified blockers still make a real call dishonest to write
 // ----------------------------------------------------------------------
 //
-// This issue's own task text describes calling
+// The M3-005 header below (kept verbatim for history) found no
+// `elevate_client_acquire`-shaped API at all. That is no longer true:
+// libpdx-elevate has since landed ENH-001..ENH-003 (issues #11/#13/#15)
+// and the real, mature entry points this issue's own desired end-state
+// names are all real, all present, all callable by SysV convention:
+//
+//   ElevateClientAcquire::elevate_client_acquire(caps, dur, req_buf,
+//     reply_ep_id, reply_buf, mint_ctx_buf) -> row_id (<16) | error
+//   ElevateClientCap::elevate_client_cap_bind_scope(row_id, scope_fp)
+//     -> ELCC_OK (0) | ELCC_ERR_BAD_ROW (0xFFFFEA30)
+//   ElevateClientRequire::elevate_client_require_scoped(row_id,
+//     needed_caps, scope_fp) -> ELCA_OK (0) | ELCA_ERR_EXPIRED |
+//     ELCA_ERR_CAPS_INSUFFICIENT | ELCA_ERR_SCOPE_MISMATCH | ...
+//
+// This landing resolves every input value this file's own M3-005 header
+// left open:
+//
+//   target_cap_kind    = 0x42   (KIND_BLKDEV, src/kernel/core/cap/
+//                                 kind_blkdev.pdx -- the landed kind;
+//                                 no longer ambiguous with the doc-alias
+//                                 KIND_BLOCK_DEVICE name, per this
+//                                 repo's own caps.decl note)
+//   target_cap_rights  = 0x00F  (this repo's OWN caps.decl floor for
+//                                 KIND_BLKDEV: "open+write+flush+query" --
+//                                 sourced from caps.decl, not invented)
+//   caps (elevate mask) = 0x01  (MKFS_ELEV_CAP_BLOCK_FORMAT below -- a
+//                                 LOCAL bit-0 reservation in libpdx-
+//                                 elevate's 8-bit ElevateRequest::
+//                                 ELV_CAP_MASK_VALID space. Checked: no
+//                                 org-wide named-capability registry for
+//                                 this space exists anywhere in
+//                                 libpdx-elevate or design/ -- issue
+//                                 #26's own "R_BLOCK_FORMAT" name is
+//                                 aspirational, not a landed constant.
+//                                 This tool owns bit 0 until an org-wide
+//                                 registry exists.)
+//   dur                = 30 s   (MKFS_ELEV_DUR_NS below -- issue #26's
+//                                 own "short lifetime" framing; well
+//                                 inside ElevateRequest::[ELV_DUR_MIN_NS
+//                                 =1s, ELV_DUR_MAX_NS=1h])
+//   scope_fp           = dev_slot (verbatim). elevate_client_cap_
+//                                 bind_scope's own doc is explicit that
+//                                 scope_fp is OPAQUE to the library --
+//                                 no particular hash function is
+//                                 mandated. dev_slot already uniquely
+//                                 identifies the format target, so it
+//                                 satisfies issue #26's own "re-asserts
+//                                 against a different device are
+//                                 refused with ELCA_ERR_SCOPE_MISMATCH"
+//                                 criterion with no blake3 dependency
+//                                 this repo does not have.
+//   reply_ep_id        = STILL UNRESOLVED. elevate_client_send_req's own
+//                                 doc allows 0 ("reply-on-source"), but
+//                                 elevate_client_recv_reply (the OTHER
+//                                 half of the same composed flow) gates
+//                                 `cmp rbx,1; jb bad_ep` -- reply_ep_id
+//                                 MUST be a real endpoint id this
+//                                 process owns, in [1..127]. mkfs.pdxfs
+//                                 has no endpoint-mint call site anywhere
+//                                 in its own tree, so there is no honest
+//                                 non-zero value to supply here either --
+//                                 a second, independent instance of the
+//                                 SAME "no provisioning story for a
+//                                 standalone CLI tool" gap parent_ep_slot
+//                                 already has (see M3-005 header below,
+//                                 unchanged).
+//   requester_pid      = derivable, not yet wired. audit_wire.pdx's own
+//                                 doc records `audit_id = (pid<<32)|
+//                                 local_id`; a future real caller can
+//                                 extract requester_pid = audit_id >> 32
+//                                 from the audit_id main.pdx already
+//                                 computes at mkfs_audit_begin, rather
+//                                 than fabricating a value. Threading
+//                                 audit_id into this function as a third
+//                                 argument is a caller-side ABI change
+//                                 this landing intentionally does NOT
+//                                 make (see "why the body is unchanged"
+//                                 below) -- there is nothing to derive a
+//                                 pid FROM yet if the whole call cannot
+//                                 be placed.
+//
+// So the *design* is now fully specified end-to-end. But actually
+// PLACING an `elevate_client_acquire`/`elevate_client_cap_bind_scope`/
+// `elevate_client_require_scoped` call in this file's body today would
+// be dishonest for a reason that is NEW at this landing, distinct from
+// (and layered ON TOP of) the parent_ep_slot / reply_ep_id gaps above:
+//
+// ----------------------------------------------------------------------
+// Blocker #2 (NEWLY VERIFIED at LE-001): the superproject's own
+// tools/build.sh DELIBERATELY EXCLUDES libpdx-elevate from this tool's
+// link line
+// ----------------------------------------------------------------------
+//
+// paideia-os/tools/build.sh (superproject root, ~lines 209-244, the
+// R64v2 sibling-lib + satellite-tool ELF pipeline) builds
+// mkfs.pdxfs/mount.pdxfs/umount.pdxfs each with
+// `--extra-obj-dir .../libpdx-volume-link --extra-obj-dir
+// .../libpdx-audit-link` -- and that file's own comment says, verbatim:
+// "libpdx-elevate is DELIBERATELY EXCLUDED from the tools' link line:
+// none of mkfs.pdxfs/mount.pdxfs/umount.pdxfs calls any real
+// elevate_client_* symbol at this landing ... pulling those objects in
+// unconditionally would hard-fail the link with undefined references
+// for code no tool ever calls. Revisit this exclusion the day a tool's
+// elevate path stops being a stub." libpdx-elevate's own client-side
+// objects pull in kernel/broker-only symbols (hpet_now_ns, svc_lookup,
+// endpoint_take_pending/write_pending,
+// elevate_channel_cap_mint_inner/revoke, uej_append) that exist in
+// NEITHER libpdx-volume, libpdx-audit, NOR any tool's own tree -- so a
+// bare `ld` link of mkfs.pdxfs's objects plus a raw libpdx-elevate
+// build-out/ directory hard-fails with undefined references, exactly as
+// that comment predicts. This is verified by reading the actual
+// tools/build.sh source, not inferred.
+//
+// Placing a real `call elevate_client_acquire` in THIS file today would
+// therefore break the very next superproject `bash tools/build.sh` run
+// -- not because the call is wrong, but because the object graph it
+// depends on is not on mkfs.pdxfs's link line. Fixing that requires a
+// superproject-level change (adding a `libpdx-elevate` entry to that
+// script's own per-lib filtered-staging loop at ~lines 285-299, the
+// same pattern already used for libpdx-volume/libpdx-audit, then adding
+// a matching `--extra-obj-dir` to the SAT_APPS build invocation at
+// ~lines 305-312) -- explicitly out of scope for a satellite-only
+// dispatch against this repo alone.
+//
+// ----------------------------------------------------------------------
+// Why this function's body is UNCHANGED at this landing
+// ----------------------------------------------------------------------
+//
+// Two independent, verified blockers -- no honest parent_ep_slot/
+// reply_ep_id value to supply (unchanged from M3-005), AND a build
+// graph that does not yet link libpdx-elevate into this tool at all
+// (new at LE-001) -- both have to clear before a real call here is
+// buildable, let alone honest. Landing a real call now would either
+// silently fabricate the missing broker-provisioning inputs (the exact
+// trap this file's own M3-005 header already documents avoiding) or
+// break the next full build for a reason with no fix reachable from
+// this repo. `mkfs_elev_require_device_write` therefore keeps its
+// M3-005 body verbatim: always returns `MKFS_ELEV_DENY`, an honest
+// answer to "can this process prove it holds elevation" when no real
+// request can be constructed OR linked. The four `MKFS_ELEV_*`
+// constants below (cap mask, duration, target kind/rights) are pure
+// data -- no external symbol reference, safe to land today -- so the
+// day BOTH blockers clear, only this function's BODY needs the
+// three-call sequence described above; every input it needs already
+// has a named, resolved constant to read from.
+//
+// ----------------------------------------------------------------------
+// M3-005 (#12) landing: fail-closed STUB -- kept verbatim for history
+// ----------------------------------------------------------------------
+//
+// This issue's own task text described calling
 // `elevate_client_require(RESOURCE_KIND=KIND_BLOCK_DEVICE, action=WRITE,
-// target=<dev_slot>)`. A full read of `libpdx-elevate`'s real, mature
-// (4844 LOC) source finds NO such function shape anywhere: there is no
+// target=<dev_slot>)`. A full read of `libpdx-elevate`'s source at that
+// time found NO such function shape anywhere: there was no
 // `RESOURCE_KIND`/`action` vocabulary, no `KIND_BLOCK_DEVICE`- or
-// `KIND_BLKDEV`-specific entry point, and "target" is never a device
-// slot or URI. The library's real model is a capability-BITMASK handle,
-// opaque to the library itself:
+// `KIND_BLKDEV`-specific entry point, and "target" was never a device
+// slot or URI. The library's real model was already a capability-
+// BITMASK handle, opaque to the library itself -- unchanged by
+// everything ENH-001..003 later added on top:
 //
 //   elevate_client_acquire(caps, dur, req_buf, reply_ep_id, reply_buf,
 //                           mint_ctx_buf) -> row_id (u64, <16) | error
@@ -31,50 +187,44 @@
 //        resource kind, action, or target device.
 //
 // `mkfs.pdxfs` has no `parent_ep_slot` -- this repo's own `caps.decl`
-// (M1 landing) declares `KIND_ELEVATE_CHANNEL = 0x191` as a PLACEHOLDER
-// only, "not declared as a consumed kind at M1: no code path in this
-// landing calls libpdx-elevate" -- unchanged by this M3 landing, since
-// no design doc or osarch coordination point has since minted mkfs.pdxfs
-// a real broker endpoint cap to acquire from. Without that cap, this
+// (M1 landing) declares `KIND_ELEVATE_CHANNEL = 0x191` as absent by
+// design, "mkfs elevates on demand per the R90-XREPO.011 elevate-broker
+// policy and never holds an elevate cap ambiently at exec time" -- and
+// design/user/fs-tools-caps.md §2.1 (paideia-os) confirms this is the
+// INTENDED policy, not a gap to close by promoting the kind to
+// mandatory. No design doc or osarch coordination point has since
+// minted mkfs.pdxfs a real broker endpoint cap. Without that cap, this
 // file cannot construct a real `elevate_client_acquire` call at all --
 // there is no `req_buf`/`mint_ctx_buf` this repo could honestly fill in
-// with a target_cap_kind/target_cap_rights pair meaning "KIND_BLKDEV,
-// write", because `libpdx-elevate` treats both of those fields as
-// opaque values "declared by whatever the caller links this library
-// into" (its own README's own wording) -- and no such declaration has
-// been coordinated with osarch for mkfs.pdxfs's device-cap path (see
-// design/architecture.md §6's still-unresolved KIND_BLKDEV/
-// KIND_BLOCK_DEVICE naming note, which this same gap blocks on).
-//
-// ----------------------------------------------------------------------
-// Fail-closed: DENY is the only reachable outcome at M3
-// ----------------------------------------------------------------------
+// that a real broker-provisioning mechanism has actually granted.
 //
 // Rather than fabricate a plausible-looking `elevate_client_acquire`/
-// `elevate_client_require` call sequence against fields this repo cannot
-// honestly populate (which would look real without being real -- the
-// same trap `src/pipe_wire.pdx`'s own module header documents avoiding
-// for the semantic-pipe schema-hash question), `mkfs_elev_require_
-// device_write` always returns `MKFS_ELEV_DENY`. This is not a
+// `elevate_client_require` call sequence against fields this repo
+// cannot honestly populate (which would look real without being real --
+// the same trap `src/pipe_wire.pdx`'s own module header documents
+// avoiding for the semantic-pipe schema-hash question), `mkfs_elev_
+// require_device_write` always returns `MKFS_ELEV_DENY`. This is not a
 // fabricated denial of a request that was never sent -- it is this
 // file's own honest, fail-closed answer to "can this process prove it
 // holds write elevation over this block device": since no real
-// elevation request can be constructed at all (the broker-endpoint
-// prerequisite above), "cannot prove GRANT" and "DENY" are the same
-// externally observable outcome, and this repo's security posture
-// (matching `src/refusal.pdx`'s own non-blank-target refusal discipline)
-// treats an unprovable claim as a denial rather than an implicit grant.
+// elevation request can be constructed at all (both blockers above),
+// "cannot prove GRANT" and "DENY" are the same externally observable
+// outcome, and this repo's security posture (matching `src/refusal.pdx`'s
+// own non-blank-target refusal discipline) treats an unprovable claim as
+// a denial rather than an implicit grant.
 //
 // `src/main.pdx`'s device-target dispatch therefore ALWAYS takes the
 // `FormatRecord::FR_RESULT_ELEVATION_DENIED` exit for a `cap:blkdev:`
-// target at this landing (see that file's own header). The `MKFS_ELEV_
-// GRANT` return value and the GRANT arm of the caller's dispatch are
-// real, wired code paths -- not dead code removed for tidiness -- kept
-// so the day a real broker-endpoint cap and a resolved
-// target_cap_kind/target_cap_rights pair exist (see design/
-// architecture.md §11 for the exact follow-up chain), only this
-// function's BODY needs to change to a real `elevate_client_acquire` +
-// `elevate_client_require` sequence -- no caller-side change.
+// target at this landing (see that file's own header) -- exit code 6,
+// distinct from every `mkfs_format_run_device` failure exit, which is
+// this repo's own existing answer to LE-001's "distinct error code so
+// the caller can distinguish 'no permission' from 'format failed'"
+// acceptance bar. The `MKFS_ELEV_GRANT` return value and the GRANT arm
+// of the caller's dispatch are real, wired code paths -- not dead code
+// removed for tidiness -- kept so the day both LE-001-addendum blockers
+// clear, only this function's BODY needs to change to the three-call
+// sequence documented above -- no caller-side change beyond, at most,
+// threading `audit_id` in as a third argument for `requester_pid`.
 //
 // ----------------------------------------------------------------------
 // Encoder-gap discipline
@@ -84,16 +234,53 @@
 // discipline: every branch label in this file is prefixed `mkfs_elev_`.
 //
 // Upstream: paideia-satellites/libpdx-elevate (README.md "Callers"
-// section, src/elevate_client_acquire.pdx, src/elevate_client_require.pdx);
-// design/tooling/volume-tooling-ux.md §2.1 (paideia-os, KIND_ELEVATE_
-// CHANNEL); this repo's own caps.decl (M1 landing, KIND_ELEVATE_CHANNEL
-// placeholder note, unchanged by this file).
+// section, src/elevate_client_acquire.pdx, src/elevate_client_require.pdx,
+// src/elevate_client_cap.pdx); design/tooling/volume-tooling-ux.md §2.1
+// (paideia-os, KIND_ELEVATE_CHANNEL); design/user/fs-tools-caps.md §2.1
+// (paideia-os, this tool's confirmed on-demand-elevate policy); this
+// repo's own caps.decl (M4-001 landing, KIND_ELEVATE_CHANNEL "deliberately
+// ABSENT" note, unchanged by this file); paideia-os/tools/build.sh
+// (~lines 209-244, the libpdx-elevate link-exclusion this addendum
+// verifies); mount.pdxfs's own src/mint_wire.pdx (M6-002, #22 -- the
+// sibling precedent for a real-but-gated wire-through, there delegating
+// through libpdx-volume, which IS on that tool's link line, rather than
+// through libpdx-elevate directly); umount.pdxfs's own src/elevate.pdx
+// (the identical fail-closed posture over the identical parent_ep_slot
+// gap, not yet revisited against this addendum's build-exclusion
+// finding).
 
 module ElevateWire = structure {
 
   // --- mkfs_elev_require_device_write return values. ---------------------
   pub let MKFS_ELEV_DENY  : u64 = 0
   pub let MKFS_ELEV_GRANT : u64 = 1
+
+  // --- LE-001 addendum: fully-resolved inputs for the real call sequence,
+  //     pure data (no external symbol reference -- safe to land ahead of
+  //     the body itself). See the module header for the sourcing of each
+  //     value. -------------------------------------------------------------
+
+  // Local elevate-broker capability-mask bit reserved for "format a
+  // block device" -- bit 0 of libpdx-elevate's 8-bit
+  // ElevateRequest::ELV_CAP_MASK_VALID space. No org-wide named-
+  // capability registry for this space exists yet (checked: absent from
+  // both libpdx-elevate and design/) -- this is mkfs.pdxfs's own
+  // reservation until one does.
+  pub let MKFS_ELEV_CAP_BLOCK_FORMAT : u64 = 0x01
+
+  // Bounded lifetime for the format elevate grant: 30 seconds. A format
+  // is a short, single-shot operation, not a long-lived session (issue
+  // #26's own framing). Inside libpdx-elevate's
+  // [ELV_DUR_MIN_NS=1s, ELV_DUR_MAX_NS=1h] validity window.
+  pub let MKFS_ELEV_DUR_NS : u64 = 30000000000
+
+  // target_cap_kind / target_cap_rights for a future mint_ctx_buf: the
+  // downstream capability this elevate channel would govern.
+  // KIND_BLKDEV = 0x42 (src/kernel/core/cap/kind_blkdev.pdx, the landed
+  // kind). Rights 0x00F matches this repo's OWN caps.decl floor for
+  // KIND_BLKDEV ("open+write+flush+query"), not a fabricated value.
+  pub let MKFS_ELEV_TARGET_KIND_BLKDEV   : u64 = 0x42
+  pub let MKFS_ELEV_TARGET_RIGHTS_BLKDEV : u64 = 0x00F
 
   // ==========================================================================
   // mkfs_elev_require_device_write(target_ptr, dev_slot) -> u64
@@ -108,14 +295,17 @@ module ElevateWire = structure {
   //   rsi = dev_slot     (the parsed device-cap slot number,
   //                       src/target.pdx's mkfs_dev_parse_slot output;
   //                       unused by this landing's body for the same
-  //                       reason)
+  //                       reason -- a future real body would also read
+  //                       this as the elevate_client_cap_bind_scope /
+  //                       elevate_client_require_scoped scope_fp, per
+  //                       the LE-001 addendum above)
   //
   // Pure leaf, no branches, no nested call, no push/pop.
   // ==========================================================================
   pub let mkfs_elev_require_device_write : (u64, u64) -> u64 !{} @{} =
     fn (target_ptr: u64) (dev_slot: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "mkfs.pdxfs.M3-005 (#12): mkfs_elev_require_device_write entry point. target_ptr (rdi) and dev_slot (rsi) are accepted but READ BY NOTHING in this landing's body -- see module header for why no real elevate_client_acquire/elevate_client_require call can be honestly constructed yet (no broker-endpoint cap, no resolved target_cap_kind/target_cap_rights pair). `mov rax, 0` (MKFS_ELEV_DENY) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`. Labels prefixed mkfs_elev_ (none needed -- no branch).",
+      justification: "mkfs.pdxfs.M3-005 (#12), revisited at LE-001 (#26): mkfs_elev_require_device_write entry point. target_ptr (rdi) and dev_slot (rsi) are accepted but READ BY NOTHING in this landing's body -- see module header's LE-001 addendum for the fully-specified real call sequence and the two independent, verified blockers (no honest parent_ep_slot/reply_ep_id value to supply; paideia-os/tools/build.sh deliberately excludes libpdx-elevate from this tool's link line) that keep it from being placed here today. `mov rax, 0` (MKFS_ELEV_DENY) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`. Labels prefixed mkfs_elev_ (none needed -- no branch).",
       block: {
         mov rax, 0;                          // MKFS_ELEV_DENY (fail-closed; see module header)
         ret;
