@@ -1,5 +1,52 @@
 # mkfs.pdxfs — CHANGELOG
 
+## 1.1.4 — 2026-09-11 (fix #29: `--dry-run` silent exit(0) — hoist DRY_RUN gate above target_classify)
+
+**Patch bump — fixes a silent-succeed regression under
+`boot_r64v2_tools` smoke.** `mkfs.pdxfs --dry-run /tmp/t.img` exited 0
+with **no output** — the `PdxFsFormatRecord@0.1 { target: ... }`
+preview line never landed on stdout. Root cause and shape mirror
+paideia-os/mount.pdxfs#26: the `--dry-run` gate was placed INSIDE the
+file-target branch (`mkfs_main_target_file`), so any classification
+outcome other than `TARGET_FILE` silently skipped the emit, and even
+the `TARGET_FILE` case exposed the emit to any downstream classify
+regression via the same silent-succeed shape.
+
+### Fixed
+
+- **`src/main.pdx`** — hoisted the `--dry-run` gate to run
+  immediately after `mkfs_audit_begin` (Phase 2.5), BEFORE
+  `target_classify`. When `PA_FLAG_DRY_RUN` (0x2) is set, `_start`
+  now jumps directly to a new terminal branch
+  `mkfs_main_emit_dry_run` that calls `mkfs_sp_emit_dry_run`, then
+  `mkfs_audit_commit(audit_id, 0)`, then `sys_exit(0)`. The
+  audit-record pair (INTENT via `mkfs_audit_begin`, RESULT via
+  `mkfs_audit_commit`) is preserved on the dry-run path. The
+  intermediate `mkfs_main_target_file` label is removed — the
+  classify dispatch now jumps straight to `mkfs_main_file_real` on
+  `TARGET_FILE`.
+
+### Behaviour notes
+
+- `--dry-run` is now honoured for **every** target shape (file,
+  device-cap, invalid), not just `TARGET_FILE`. A `mkfs.pdxfs
+  --dry-run cap:blkdev:0x01` now emits the preview line rather than
+  attempting `mkfs_elev_require_device_write`; a `mkfs.pdxfs
+  --dry-run xyz` (any prefix `target_classify` rejects) now emits the
+  preview verbatim rather than the "not yet implemented" diagnostic.
+  This matches the fix shape mount.pdxfs#26 landed for its own
+  `mount_point_class`-refused `/home` case: `--dry-run` is an INTENT
+  preview and must not gate on real classification.
+- `--help` precedence remains unchanged (checked BEFORE the hoisted
+  `--dry-run` gate, since `--help` short-circuits via the pre-
+  `mkfs_main_argv_ok` path). `--encrypt` without `--passphrase-fd`
+  still refuses fail-closed BEFORE the audit record opens and
+  BEFORE the hoisted `--dry-run` gate — configuration errors still
+  win over the preview.
+
+Closes paideia-os/mkfs.pdxfs#29. Related: paideia-os/mount.pdxfs#26
+(the analogous mount-side fix this landing mirrors).
+
 ## 1.1.3 — 2026-09-02 (ENH-030: libpdx-argv adoption — replaces handwritten scanner)
 
 **Patch bump — no observable behaviour change for well-formed input;
