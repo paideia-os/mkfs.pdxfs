@@ -45,6 +45,16 @@ All four landed at M4.
   equivalent, no block-granularity write syscall, no real
   `KIND_ELEVATE_CHANNEL` broker cap) that blocks one. Returns 0 if the
   stub's sentinel matched, 1 otherwise.
+- `mkfs_dry_run.pdx` — 1.1.5 fixup (#28) driver. Exports `MkfsDryRun::
+  run() -> u64`. Calls both `PipeWire::mkfs_sp_emit_dry_run` (the
+  pre-existing fd-1 preview) and the new `PipeWire::mkfs_sp_emit_dry_run_
+  fingerprint` (fd-2 fingerprint) against a real scratch path, then
+  asserts neither performed any write. Named `mkfs_dry_run.pdx` (not
+  `test_*.pdx`) per the issue's own requested filename — `tools/build.sh`
+  globs `tests/*.pdx`, not `tests/test_*.pdx`, so this does not change
+  the build. Returns 0 if the no-write invariant held for both emitters,
+  1 otherwise. See the file's own header for why a byte-for-byte fd-2
+  content assertion is not constructible in this harness.
 - `test_upgrade_stub.pdx` — M4-004 driver, **a documented STUB**.
   Exports `TestUpgradeStub::run() -> u64`. Builds a synthetic 3-element
   `argv[]` containing `--upgrade` and calls `Argv::argv_parse`

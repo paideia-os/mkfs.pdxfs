@@ -102,6 +102,47 @@ module PipeWire = structure {
   pub let sp_lit_header     : [u8; 134] = "# semantic-pipe emit deferred (svc.schema-registry not yet live, paideia-os#2000) -- PdxFsFormatRecord@0.1 line-based fallback below\n\0"
   pub let sp_lit_header_len : u64 = 133
 
+  // --- 1.1.5 fixup (#28): compact fd-2 dry-run fingerprint. ----------------
+  //
+  // Issue #28 repro'd `mkfs.pdxfs --dry-run <path>` under a 2026-09-11
+  // tool-sweep run as returning to the shell within 3ms with NO
+  // observable output at all -- not even the PdxFsFormatRecord@0.1
+  // preview line `mkfs_sp_emit_dry_run` already writes to fd 1. A fresh
+  // read of `src/main.pdx`'s own 1.1.4 (#29) landing shows the SOURCE at
+  // HEAD already fixed the shape of bug the issue describes (the
+  // --dry-run gate is hoisted above `target_classify` and unconditionally
+  // reaches `mkfs_sp_emit_dry_run` before `sys_exit(0)`); issue #28's own
+  // "bytes-size differs: seeded binary is 512 bytes" note points at a
+  // STALE SEEDED BINARY in the superproject's own `bin_seeds.pdx`
+  // pipeline as the more likely root cause of that specific repro, not a
+  // live defect in this repo's current source -- a superproject-level
+  // concern this satellite-only landing cannot fix or verify.
+  //
+  // What THIS landing adds, defensively, is a SECOND, deliberately
+  // minimal, single-line fingerprint on fd 2 (stderr) -- independent of
+  // fd 1's multi-line semantic-pipe-deferral-header + PdxFsFormatRecord
+  // rendering -- so a smoke harness (or an operator) that only checks
+  // stderr, or that greps for one short deterministic line rather than
+  // parsing the longer fd 1 record, has an unambiguous, cheap-to-match
+  // signal that the --dry-run path actually ran to completion. This is
+  // purely ADDITIVE: `mkfs_sp_emit_dry_run`'s own fd 1 contract
+  // (unchanged since M1/M3-003) is not touched by this addition, and no
+  // caller's exit-code contract changes -- `mkfs_main_emit_dry_run`
+  // (src/main.pdx) still exits 0 exactly as before, now preceded by one
+  // more `sys_write(2, ...)` call.
+  //
+  // Shape (verified via `python3 -c "print(len(...))"` against each
+  // literal, this file's own established discipline):
+  //
+  //   "[mkfs.pdxfs --dry-run " + <target, NUL-terminated, dynamic length
+  //   via FormatRecord::format_record_strlen> + " OK]\n"
+  // ---------------------------------------------------------------------
+  pub let sp_lit_fp_prefix     : [u8; 23] = "[mkfs.pdxfs --dry-run \0"
+  pub let sp_lit_fp_prefix_len : u64 = 22
+
+  pub let sp_lit_fp_suffix     : [u8; 6] = " OK]\n\0"
+  pub let sp_lit_fp_suffix_len : u64 = 5
+
   // ==========================================================================
   // mkfs_sp_emit_dry_run(target_ptr, label_ptr, journal_size) -> ()
   //
@@ -188,6 +229,68 @@ module PipeWire = structure {
 
         pop r13;
         pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_sp_emit_dry_run_fingerprint(target_ptr) -> ()
+  //     (1.1.5, #28)
+  //
+  //   rdi = target_ptr  (NUL-terminated <target> string, the same value
+  //                       main.pdx's mkfs_main_emit_dry_run already holds
+  //                       in r15)
+  //
+  // Writes exactly one compact line to fd 2 (stderr):
+  //   "[mkfs.pdxfs --dry-run <target> OK]\n"
+  // via three sys_write calls (literal prefix, dynamic target via
+  // FormatRecord::format_record_strlen -- same cross-module bare-symbol
+  // call convention this file's own two emitters above already use for
+  // FormatRecord::format_record_emit_dry_run / _emit_result -- then the
+  // literal suffix). See module header (#28 fixup) for why this is a
+  // second, independent fingerprint alongside the existing fd 1
+  // PdxFsFormatRecord@0.1 rendering, not a replacement for it.
+  //
+  // Register plan: rbx = target_ptr, the only SysV callee-save register
+  // this function repurposes (pushed on entry, popped before the single
+  // `ret`) -- it must survive the nested `call format_record_strlen`
+  // (caller-save only, per that function's own justification) and every
+  // intervening `syscall` (which zeroes only caller-save registers per
+  // the kernel's #743 info-leak hardening, restated in this file's own
+  // module header).
+  // ==========================================================================
+  pub let mkfs_sp_emit_dry_run_fingerprint : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.1.1.5 fixup (#28): mkfs_sp_emit_dry_run_fingerprint entry point. push rbx before repurposing it -- popped before the single ret. rbx=target_ptr, survives the nested call and every syscall below (callee-save, unaffected by the kernel's caller-save-only post-sysret zeroing). Segment 1: sys_write(2, sp_lit_fp_prefix, 22) -- SC+ ID 1, fd=2 (stderr). Segment 2: rdi=rbx; call format_record_strlen (src/format_record.pdx, cross-module bare-symbol call, same convention mkfs_sp_emit_dry_run/mkfs_sp_emit_result already use) -> rax=len, moved directly into rdx; sys_write(2, rbx, rdx). Segment 3: sys_write(2, sp_lit_fp_suffix, 5). Pops rbx and returns (no value). No `add reg,[mem]`. No `test` mnemonic. No branch -- straight-line body, no label needed.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                       // rbx = target_ptr
+
+        // ---- Segment 1: "[mkfs.pdxfs --dry-run " -------------------------
+        mov rdi, 2;
+        lea rsi, [rip + sp_lit_fp_prefix];
+        mov rdx, 22;                        // sp_lit_fp_prefix_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- Segment 2: target path ---------------------------------------
+        mov rdi, rbx;
+        call format_record_strlen;
+        mov rdx, rax;                       // rdx = target_len
+        mov rdi, 2;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: " OK]\n" --------------------------------------------
+        mov rdi, 2;
+        lea rsi, [rip + sp_lit_fp_suffix];
+        mov rdx, 5;                         // sp_lit_fp_suffix_len
+        mov rax, 1;
+        syscall;
+
         pop rbx;
         ret;
       }

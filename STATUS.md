@@ -3,7 +3,7 @@
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
 **Current milestone:** LV11 (libpdx-volume v1.1 adoption pass, issues
 #24 + #25) — **landed**; supersedes M5 (dual-signed release) — landed.
-**Version:** 1.1.4 (fix #29: `--dry-run` silent exit(0) — hoist DRY_RUN gate above target_classify, mirrors mount.pdxfs#26)
+**Version:** 1.1.5 (fix #28: fd-2 dry-run fingerprint; #26 LE-001 fd-2 refusal fingerprint — see CHANGELOG.md for why #26 stays open)
 
 See `design/tooling/volume-tooling-ux.md` §9.1 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the

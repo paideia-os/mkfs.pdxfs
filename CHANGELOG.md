@@ -1,5 +1,59 @@
 # mkfs.pdxfs — CHANGELOG
 
+## 1.1.5 — 2026-09-13 (fix #28: fd-2 dry-run fingerprint; #26 LE-001 fd-2 refusal fingerprint)
+
+**Patch bump — purely additive, no exit-code or fd-1 record contract
+changes.** Two-issue wave.
+
+### Fixed / Added (#28)
+
+- **`src/pipe_wire.pdx`** — new `mkfs_sp_emit_dry_run_fingerprint(target_ptr)`
+  writes a second, compact line to fd 2 (stderr): `[mkfs.pdxfs --dry-run
+  <target> OK]\n`. Issue #28 repro'd `mkfs.pdxfs --dry-run <path>` under a
+  2026-09-11 tool-sweep run as silently returning within 3ms with no
+  output at all. A fresh read of `src/main.pdx` shows the SOURCE at HEAD
+  already carries the 1.1.4 (#29) fix for the matching bug shape (the
+  `--dry-run` gate hoisted above `target_classify`); issue #28's own
+  "seeded binary is 512 bytes" note points at a stale `bin_seeds.pdx`
+  artifact in the superproject as the more likely root cause of that
+  specific repro — a superproject-level concern out of this satellite's
+  scope. This landing adds the requested fd-2 fingerprint as defense in
+  depth: a short, deterministic line a smoke harness can grep without
+  parsing the longer fd-1 `PdxFsFormatRecord@0.1` rendering.
+- **`src/main.pdx`** — `mkfs_main_emit_dry_run` now also calls the new
+  emitter immediately after `mkfs_sp_emit_dry_run`. Exit code (0) and the
+  fd-1 record are unchanged.
+- **`tests/mkfs_dry_run.pdx`** (new) — `MkfsDryRun::run()` exercises both
+  emitters against a real scratch path and asserts the shared no-write
+  invariant. See the file's own header for why a byte-for-byte fd-2
+  capture is not constructible in this repo's syscall-direct test
+  harness.
+
+### Progress, NOT closure (#26 — LE-001)
+
+- **`src/elevate_wire.pdx`** — new `mkfs_elev_emit_le001_refusal(target_ptr)`
+  writes `[mkfs.pdxfs.LE-001 EACCES]\n` to fd 2, called from
+  `src/main.pdx`'s device-target DENY arm IN ADDITION to the existing fd-1
+  `PdxFsFormatRecord@0.1 { result_code: ELEVATION_DENIED }` record. Exit
+  code stays **6** (`MKFS_EXIT_ELEVATION_DENIED`) — this repo's
+  `RELEASE-1.0.0.md`/`README.md`/`STATUS.md` document that as the
+  released, stable exit-code contract; this landing does not rename it to
+  the exit 13 the dispatched task text suggested, since that would be an
+  undocumented breaking ABI change with no superproject/osarch
+  coordination behind it.
+- **This does NOT close #26.** A fresh re-verification against
+  `paideia-os/tools/build.sh` at this landing confirms both blockers
+  commit `4a42ef5` ("LE-001: specify real elevate wire design; do not
+  wire it yet") already documented are still unresolved: libpdx-elevate
+  is still excluded from this tool's link line, and this repo still holds
+  no `KIND_ELEVATE_CHANNEL` broker-endpoint capability to construct an
+  honest `elevate_client_acquire` request with. The real
+  acquire/bind-scope/require-scoped/cascade-revoke round trip issue #26's
+  acceptance criteria describe needs a superproject build.sh change plus
+  osarch-coordinated broker-cap provisioning — cross-repo work outside a
+  satellite-only dispatch. Recommend #26 stay open or be re-scoped to
+  track that cross-repo follow-up.
+
 ## 1.1.4 — 2026-09-11 (fix #29: `--dry-run` silent exit(0) — hoist DRY_RUN gate above target_classify)
 
 **Patch bump — fixes a silent-succeed regression under

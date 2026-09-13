@@ -249,7 +249,66 @@
 // gap, not yet revisited against this addendum's build-exclusion
 // finding).
 
+// ----------------------------------------------------------------------
+// 1.1.5 fixup addendum: LE-001 fd-2 refusal fingerprint (additive only --
+// does NOT close #26)
+// ----------------------------------------------------------------------
+//
+// A fresh re-verification at this landing confirms NOTHING has changed
+// since commit 4a42ef5 ("LE-001: specify real elevate wire design; do
+// not wire it yet") about either blocker the LE-001 addendum above
+// documents: `paideia-os/tools/build.sh` still builds this tool with
+// only `--extra-obj-dir .../libpdx-volume-link --extra-obj-dir
+// .../libpdx-audit-link --extra-obj-dir .../libpdx-argv-link` (grepped
+// fresh against the superproject root at this landing) -- libpdx-elevate
+// is still absent from the link line -- and this repo still holds no
+// `KIND_ELEVATE_CHANNEL` broker-endpoint capability to construct an
+// honest `parent_ep_slot`/`reply_ep_id` with. Both are cross-repo /
+// cross-milestone blockers (a superproject build.sh change; osarch-
+// coordinated broker-cap provisioning for standalone CLI tools) outside
+// what a satellite-only dispatch against this repo alone can resolve --
+// see the addendum above for the full verification trail.
+//
+// What THIS landing adds is a distinct, grep-friendly fd 2 (stderr)
+// fingerprint for the one path that already IS real and wired:
+// `src/main.pdx`'s device-target DENY arm, which today always fires for
+// a `cap:blkdev:` target. `mkfs_elev_emit_le001_refusal` below writes
+// `[mkfs.pdxfs.LE-001 EACCES]\n` to fd 2, called IN ADDITION to (never
+// instead of) the existing `PdxFsFormatRecord@0.1 { result_code:
+// ELEVATION_DENIED }` fd-1 record `mkfs_sp_emit_result` already emits.
+// The process exit code is UNCHANGED at 6 (`FormatRecord::
+// FR_RESULT_ELEVATION_DENIED` / `format.pdx`'s own
+// `MKFS_EXIT_ELEVATION_DENIED`) -- this repo's `RELEASE-1.0.0.md`,
+// `README.md`, and `STATUS.md` all document exit 6 as the released,
+// stable "elevation denied" contract; renaming it (e.g. to the exit 13
+// this issue's own generic task text suggested) would be an undocumented
+// breaking ABI change for a public, already-shipped v1.0.0 exit code,
+// made without the superproject-level and osarch coordination such a
+// change would need. A new, ADDITIVE fd-2 line carries no such risk.
+//
+// This addendum therefore makes the device-target refusal path more
+// operator/script-greppable (issue #26's own spirit: "mkfs.pdxfs stops
+// being an unaudited super-destructive path"), but does NOT close #26 --
+// the real `elevate_client_acquire` + `elevate_client_cap_bind_scope` +
+// `elevate_client_require_scoped` + `elevate_client_cap_revoke_cascade`
+// round trip against a live broker, scope-bound per target device, that
+// issue #26's own acceptance criteria describe, still cannot be honestly
+// constructed or linked from this repo alone. Recommend #26 stay open
+// (or be re-scoped into a tracked cross-repo follow-up covering the
+// build.sh link-line change + osarch broker-cap provisioning) rather
+// than being marked resolved by this fingerprint-only landing.
+//
+// Encoder-gap discipline (restated): no `add reg,[mem]`; no `test`
+// mnemonic; every new branch label in this addendum (none needed --
+// `mkfs_elev_emit_le001_refusal` is a straight-line body) is prefixed
+// `mkfs_elev_`.
+
 module ElevateWire = structure {
+
+  // --- 1.1.5 (#26 LE-001 addendum): fd-2 refusal fingerprint literal.
+  //     Length verified via `python3 -c "print(len(...))"`. ---------------
+  pub let elev_lit_le001_refusal     : [u8; 28] = "[mkfs.pdxfs.LE-001 EACCES]\n\0"
+  pub let elev_lit_le001_refusal_len : u64 = 27
 
   // --- mkfs_elev_require_device_write return values. ---------------------
   pub let MKFS_ELEV_DENY  : u64 = 0
@@ -308,6 +367,40 @@ module ElevateWire = structure {
       justification: "mkfs.pdxfs.M3-005 (#12), revisited at LE-001 (#26): mkfs_elev_require_device_write entry point. target_ptr (rdi) and dev_slot (rsi) are accepted but READ BY NOTHING in this landing's body -- see module header's LE-001 addendum for the fully-specified real call sequence and the two independent, verified blockers (no honest parent_ep_slot/reply_ep_id value to supply; paideia-os/tools/build.sh deliberately excludes libpdx-elevate from this tool's link line) that keep it from being placed here today. `mov rax, 0` (MKFS_ELEV_DENY) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`. Labels prefixed mkfs_elev_ (none needed -- no branch).",
       block: {
         mov rax, 0;                          // MKFS_ELEV_DENY (fail-closed; see module header)
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_elev_emit_le001_refusal(target_ptr) -> ()
+  //     (1.1.5, #26 LE-001 addendum -- see module header)
+  //
+  //   rdi = target_ptr  (NUL-terminated <target> string; unused by this
+  //                       body -- the fingerprint is a fixed literal, not
+  //                       target-specific, matching the compact
+  //                       single-line shape issue #26's own task text
+  //                       asked for; kept as a parameter so a future
+  //                       caller can extend this to an audit/logging
+  //                       context without an ABI change)
+  //
+  // Writes exactly one line to fd 2 (stderr): "[mkfs.pdxfs.LE-001
+  // EACCES]\n" via a single sys_write. Called by src/main.pdx's
+  // mkfs_main_target_device DENY arm, IN ADDITION to the existing
+  // PdxFsFormatRecord@0.1 fd-1 record -- see this file's own module
+  // header for why this does not change the exit-code contract.
+  //
+  // Pure leaf: rax/rdi/rsi/rdx are all SysV caller-save; no push/pop.
+  // ==========================================================================
+  pub let mkfs_elev_emit_le001_refusal : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.1.1.5 fixup (#26 LE-001 addendum): mkfs_elev_emit_le001_refusal entry point. target_ptr (rdi) is accepted but read by nothing in this body -- the fingerprint is a fixed literal (see this function's own header for why). sys_write(2, elev_lit_le001_refusal, 27) -- SC+ ID 1, fd=2 (stderr), rdi/rsi/rdx/rax all freshly loaded. ret. Pure leaf -- rax/rdi/rsi/rdx all SysV caller-save, no push/pop, no callee-save register touched. No `add reg,[mem]`, no `test` mnemonic. No branch -- straight-line body, no label needed.",
+      block: {
+        mov rdi, 2;
+        lea rsi, [rip + elev_lit_le001_refusal];
+        mov rdx, 27;                        // elev_lit_le001_refusal_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
         ret;
       }
     }

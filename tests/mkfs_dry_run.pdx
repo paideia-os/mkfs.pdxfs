@@ -1,0 +1,120 @@
+// tests/mkfs_dry_run.pdx — mkfs.pdxfs.1.1.5 fixup (#28) — TestMkfsDryRun /
+// module MkfsDryRun: provokes the --dry-run emit path (both the existing
+// fd-1 PdxFsFormatRecord@0.1 preview and the new fd-2
+// "[mkfs.pdxfs --dry-run <path> OK]\n" fingerprint from src/pipe_wire.pdx's
+// mkfs_sp_emit_dry_run_fingerprint) and asserts the one thing this
+// driver's real, syscall-based harness CAN observe.
+//
+// ================================================================
+// Why this cannot literally "assert fingerprint on stderr"
+// ================================================================
+//
+// This repo's test drivers (see tests/README.md) are plain `run() -> u64`
+// functions, called directly -- no fork/exec, no pipe/dup2 redirection of
+// fd 1 or fd 2 anywhere in this repo's own call graph. test_file_target_
+// happy.pdx's own Phase 1 documents the identical constraint for fd 1's
+// dry-run preview line: "the only externally observable proof ... without
+// a stdout-capture harness" is that the target path still does NOT exist
+// afterward. The same constraint applies here to fd 2: there is no
+// mechanism in this repo to capture the bytes a sys_write(2, ...) call
+// actually produced. This driver therefore does the strongest real thing
+// available -- it calls BOTH emitters (mkfs_sp_emit_dry_run for fd 1,
+// mkfs_sp_emit_dry_run_fingerprint for the new fd-2 line) against a real
+// scratch path and then asserts the shared invariant both must uphold:
+// neither performs any write to the target itself. A future consumer with
+// a real stdout/stderr-capture harness (a real QEMU boot piping this
+// binary's output, per tests/README.md's own "what a full QEMU smoke
+// matrix still needs" section) is the first place a byte-for-byte
+// fingerprint match becomes possible.
+//
+// ================================================================
+// Return-code convention
+// ================================================================
+//
+// Matches this repo's own established M4-driver convention (tests/
+// README.md): 0 — the scratch path does not exist after both emit calls
+// (the dry-run invariant holds for both the pre-existing and the new
+// emitter). 1 — the scratch path unexpectedly exists (a write leaked from
+// either emitter).
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp reg, imm`.
+//   - Cross-file calls (`call mkfs_sp_emit_dry_run;`, `call
+//     mkfs_sp_emit_dry_run_fingerprint;`) use the bare unqualified symbol
+//     name, per this repo's established convention (src/main.pdx already
+//     calls both the same way) -- unresolved-external references in this
+//     file's own .o, resolved only once a future consumer links
+//     src/pipe_wire.pdx alongside it.
+//   - No register survives across a nested call in this file -- every
+//     phase re-`lea`s its own pointer immediately before use. No
+//     push/pop anywhere.
+//   - Reserved-label discipline (project non-negotiable): every label in
+//     this file is prefixed `mkfs_test_dryrun_` (distinct from
+//     test_file_target_happy.pdx's own `mkfs_test_` labels, avoiding any
+//     duplicate-symbol risk if both files' .o are ever linked together).
+//
+// Upstream: src/pipe_wire.pdx (this repo, mkfs_sp_emit_dry_run,
+// mkfs_sp_emit_dry_run_fingerprint); tests/test_file_target_happy.pdx
+// (this repo, the Phase-1 "no write occurred" precedent this driver's
+// assertion strategy is adapted from); tests/README.md (this repo,
+// return-code convention); design/user/syscall-table.md (paideia-os,
+// sysno 2 = open, sysno 3 = close, sysno 81 = unlink).
+
+module MkfsDryRun = structure {
+
+  pub let mkfs_dryrun_test_path : [u8; 29] = "/tmp/mkfs_test_dryrun_fp.img\0"
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Best-effort unlinks the scratch path, calls both dry-run emitters
+  // against it, then confirms it still does not exist. See module header
+  // for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs.1.1.5 fixup (#28): MkfsDryRun::run entry point. Best-effort cleanup: sys_unlink (SC+ ID 81, path_len_hint=255, matching test_file_target_happy.pdx's own convention) against mkfs_dryrun_test_path, return value ignored -- ENOENT is the expected/common case. Phase A: rdi=&mkfs_dryrun_test_path, rsi=0 (label_ptr unset), rdx=4 (journal_size blocks), `call mkfs_sp_emit_dry_run` (src/pipe_wire.pdx) -- the pre-existing fd-1 preview, unchanged since M1/M3-003. Phase B: rdi=&mkfs_dryrun_test_path, `call mkfs_sp_emit_dry_run_fingerprint` (src/pipe_wire.pdx, 1.1.5 #28) -- the new fd-2 fingerprint this landing adds. Neither call touches the target path itself (both only ever sys_write to fd 1 / fd 2 respectively). Assertion: sys_open(rdi=&mkfs_dryrun_test_path, rsi=0 (O_RDONLY), rdx=0 (mode unused), rax=2); `cmp rax,0; jl mkfs_test_dryrun_ok` -- a negative return (ENOENT, expected) confirms no write occurred from either emitter. A non-negative return means a write leaked: sys_close(rax) via SC+ ID 3, then `mov rax,1; ret` (failure). mkfs_test_dryrun_ok: `xor rax,rax; ret` (0, invariant held for both emitters). No register survives any nested call -- every phase re-leas its own pointer. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mkfs_test_dryrun_.",
+      block: {
+        // ---- Best-effort cleanup. ------------------------------------------
+        lea rdi, [rip + mkfs_dryrun_test_path];
+        mov rsi, 255;
+        mov rax, 81;                         // SC+ ID 81 = unlink
+        syscall;
+
+        // ---- Phase A: pre-existing fd-1 dry-run preview. -------------------
+        lea rdi, [rip + mkfs_dryrun_test_path];
+        xor rsi, rsi;                        // label_ptr = 0 (no --label)
+        mov rdx, 4;                          // journal_size (blocks)
+        call mkfs_sp_emit_dry_run;
+
+        // ---- Phase B: new fd-2 dry-run fingerprint (1.1.5, #28). -----------
+        lea rdi, [rip + mkfs_dryrun_test_path];
+        call mkfs_sp_emit_dry_run_fingerprint;
+
+        // ---- Assertion: no write occurred from either emitter. ------------
+        lea rdi, [rip + mkfs_dryrun_test_path];
+        xor rsi, rsi;                        // O_RDONLY
+        xor rdx, rdx;                        // mode unused
+        mov rax, 2;                          // SC+ ID 2 = sys_open
+        syscall;
+        cmp rax, 0;
+        jl mkfs_test_dryrun_ok;              // negative = ENOENT, as expected
+
+        // Unexpected: the path exists. Close the fd and fail.
+        mov rdi, rax;
+        mov rax, 3;                          // SC+ ID 3 = sys_close
+        syscall;
+        mov rax, 1;
+        ret;
+
+      mkfs_test_dryrun_ok:
+        xor rax, rax;                        // 0: invariant held for both emitters
+        ret;
+      }
+    }
+}
