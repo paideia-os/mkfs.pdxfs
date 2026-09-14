@@ -302,6 +302,38 @@
 // mnemonic; every new branch label in this addendum (none needed --
 // `mkfs_elev_emit_le001_refusal` is a straight-line body) is prefixed
 // `mkfs_elev_`.
+//
+// ----------------------------------------------------------------------
+// Wave-o hygiene addendum: naming #26's blocker precisely --
+// KIND_ELEVATE_CHANNEL broker cap is not allocated at boot for
+// mkfs.pdxfs
+// ----------------------------------------------------------------------
+//
+// The LE-001 addendum above already establishes, in careful cross-
+// referenced detail, that this repo holds no `KIND_ELEVATE_CHANNEL`
+// broker-endpoint capability to build a real `parent_ep_slot`/
+// `reply_ep_id` with. This addendum exists purely to state that same
+// fact in the one sentence #26 itself is filed against, so a reader
+// searching for the issue's own wording finds it without walking the
+// full addendum trail above:
+//
+//   The KIND_ELEVATE_CHANNEL broker cap is not allocated at boot for
+//   mkfs.pdxfs. No init-time mechanism hands this process (or any
+//   standalone CLI tool exec'd outside a long-lived session) an
+//   elevate-channel capability slot to present to
+//   `elevate_client_acquire`. This is a BOOT-TIME provisioning gap,
+//   distinct from (and upstream of) the link-line exclusion blocker:
+//   even with libpdx-elevate on mkfs.pdxfs's link line, there is
+//   still no cap in this process's table for a real call to name.
+//
+// What closing this gap requires is now written up separately, since
+// it is an init/broker-side design question, not something this
+// tool's own tree can resolve: see
+// `design/mkfs-elevate-cap-provisioning.md` (this repo) for the
+// init-side cap-mint-pool + hand-off contract sketch. That document
+// does not change this file's behaviour; it exists so the
+// cross-repo/osarch follow-up #26 needs has a concrete starting
+// proposal instead of only a documented absence.
 
 module ElevateWire = structure {
 
