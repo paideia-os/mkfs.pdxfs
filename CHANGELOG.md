@@ -1,5 +1,96 @@
 # mkfs.pdxfs — CHANGELOG
 
+## 1.2.0 — 2026-09-22 (feat #26 LE-001: scoped elevate-gate on block-device format)
+
+**Minor bump — additive surface (new scoped-elevate gate + write guard
++ paired release helper). No observable exit-code change today** because
+both cross-repo blockers documented in `src/elevate_gate.pdx`'s module
+header remain unresolved (libpdx-elevate is still excluded from this
+tool's link line; mkfs.pdxfs still holds no `KIND_ELEVATE_CHANNEL`
+broker cap allocated at boot), so every `cap:blkdev:` invocation still
+exits **6** (`MKFS_EXIT_ELEVATION_DENIED`) with the existing
+`[mkfs.pdxfs.LE-001 EACCES]` fd-2 fingerprint. The new gate wires the
+STRUCTURE issue #26's acceptance criteria describe end-to-end so the
+day both blockers clear, only a small set of function BODIES flip live.
+
+**Depends on `libpdx-elevate` v1.1.0+** (LE.M1-003 tag), for the
+following symbols the swap-day body will call:
+`elevate_client_acquire`, `elevate_client_cap_bind_scope`,
+`elevate_client_require_scoped`, `elevate_client_cap_revoke_cascade`.
+All four are present in the sibling submodule at this landing (verified
+against `paideia-os/tools/user/libpdx-elevate/src/`); the runtime
+LINKING is what remains gated by the superproject `tools/build.sh`
+exclusion.
+
+### Added (#26)
+
+- **`src/elevate_gate.pdx`** (new) — `mkfs_elevate_open(target_ptr,
+  path_len) -> u64` and `mkfs_elevate_close(row_id) -> u64`, the
+  acquire+bind_scope and cascade-revoke wrappers. Landing constants:
+  `EX_ELEVATE_REFUSED = 0xFFFFFFFFEB195C4F` (distinct return-band
+  sentinel, disjoint from every `ElevateClient*::ELCA_/ELCC_` error
+  code and from every real `row_id`), `R_BLOCK_FORMAT = 0x01` (kept
+  in sync with `elevate_wire.pdx`'s `MKFS_ELEV_CAP_BLOCK_FORMAT`
+  reservation over the same bit), `MKFS_ELEV_DUR_NS = 30_000_000_000`
+  (30s format-lifetime grant). Ships a real, wired `mkfs_elevate_
+  scope_fp_fnv1a(target_ptr)` computing `SCOPE_FP_ALGO_TAG_FNV1A_64
+  | (fnv1a_64(path) & 0x00FFFFFFFFFFFFFF)`; the algo-tag top byte lets
+  a future blake3-truncation swap update `SCOPE_FP_ALGO_TAG_BLAKE3_
+  T64` (0x02) without silently accepting an older FNV-tagged handle.
+  Blake3 is used aspirationally in issue #26's own AC but is not
+  reachable from this satellite (no `libpdx-crypto`; `libpdx-volume`'s
+  `pdxb_sign.pdx` references BLAKE3 only in comments), so FNV-1a-64
+  is the pragmatic-and-versioned placeholder. Ships the `[MKFS ELEVATE
+  OK]\n` fd-2 fingerprint literal — emitted from `mkfs_elevate_close`'s
+  cascade-revoke success path, never reached at this landing (honest).
+- **`src/elevate_write_guard.pdx`** (new) — `mkfs_elevate_write_guard(
+  row_id, offset, buf, len) -> u64`, the per-write scope-re-assertion
+  wrapper the format pipeline routes every device-target `sys_write`
+  through once a real block-device write ordinal lands. At this
+  landing the body unconditionally returns `EX_ELEVATE_REFUSED` (the
+  fail-closed posture matches `mkfs_elevate_open`'s own body); a `.bss`
+  cache slot `mkfs_elg_wg_scope_fp` is landed for the swap-day body so
+  the caller-side wire-through does not have to change again.
+- **`src/format.pdx`** — `mkfs_format_run_device` now routes through
+  `ElevateGate::mkfs_elevate_open` FIRST (before `mkfs_dev_parse_slot`
+  or any emit). On `EX_ELEVATE_REFUSED` (today, always): emit
+  `FR_RESULT_ELEVATION_DENIED` (6) via `mkfs_sp_emit_result`, call
+  `mkfs_elevate_close(EX_ELEVATE_REFUSED)` — short-circuits, no
+  fingerprint — return `MKFS_EXIT_ELEVATION_DENIED` (6). On the
+  nominal path (unreachable today): parse slot, emit
+  `FR_RESULT_DEVICE_TARGET_STUB` (5) as before, call
+  `mkfs_elevate_close(row_id)` — future body cascade-revokes and
+  emits the `[MKFS ELEVATE OK]` fingerprint — return `MKFS_EXIT_
+  DEVICE_STUB` (4). Register plan grows from one to three
+  callee-save pushes (rbx=target_ptr, r12=row_id, r13=exit-code
+  scratch) to hold `row_id` across the two nested `call`s that reach
+  `mkfs_elevate_close` with the exact value the gate returned.
+
+### Progress, NOT closure (#26 — LE-001)
+
+- **This does NOT close #26.** The two cross-repo blockers documented
+  since `4a42ef5` remain unresolved: `paideia-os/tools/build.sh`'s
+  R64v2 satellite-tool block still deliberately excludes
+  `libpdx-elevate` from `mkfs.pdxfs`'s link line, and mkfs.pdxfs still
+  holds no `KIND_ELEVATE_CHANNEL` broker-endpoint capability at boot
+  to construct a real `elevate_client_acquire` request with. Every
+  `cap:blkdev:` invocation still exits 6 with the existing fd-2
+  refusal fingerprint — externally observable behavior is unchanged
+  by this landing.
+- **What this landing delivers** is the structural scaffold every
+  acceptance-criterion bullet #26 lists needs to be honestly closed:
+  a scope-bound acquire wrapper, a per-write re-assert wrapper, a
+  paired cascade-revoke release helper, a distinct refusal sentinel,
+  and a stderr fingerprint on the success path — all wired into the
+  device-target format pipeline. The day both cross-repo blockers
+  clear (a superproject `tools/build.sh` change adding
+  `libpdx-elevate` to the tool link line + osarch-coordinated
+  broker-cap provisioning for standalone CLI tools), only the BODIES
+  of `mkfs_elevate_open` / `mkfs_elevate_close` /
+  `mkfs_elevate_write_guard` need to flip — no caller-side change
+  beyond that. Recommend #26 stay open or be re-scoped to track that
+  cross-repo follow-up.
+
 ## 1.1.5 — 2026-09-13 (fix #28: fd-2 dry-run fingerprint; #26 LE-001 fd-2 refusal fingerprint)
 
 **Patch bump — purely additive, no exit-code or fd-1 record contract

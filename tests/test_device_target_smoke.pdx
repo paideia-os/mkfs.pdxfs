@@ -75,19 +75,32 @@
 // smoke test, rather than writing one from scratch.
 //
 // ================================================================
-// Return-code convention
+// Return-code convention (updated 1.2.0 for issue #26 LE-001)
 // ================================================================
 //
 // Matches this org's established M4-driver convention (see this repo's
 // own tests/README.md):
 //
-//   0 — `mkfs_format_run_device` returned `MKFS_EXIT_DEVICE_STUB` (4)
-//       verbatim -- the documented stub contract still holds.
-//   1 — it returned anything else. This is the signal a future landing
-//       of a real device-write body should expect to see once the
-//       three substrate items above land and this stub's caller (or
-//       this driver itself) is updated to exercise a real write-then-
-//       readback round trip instead of a sentinel check.
+//   0 — `mkfs_format_run_device` returned `MKFS_EXIT_ELEVATION_DENIED`
+//       (6) verbatim -- the 1.2.0 #26 LE-001 contract holds: the inner
+//       scoped-elevate gate (src/elevate_gate.pdx) fail-closes as
+//       EX_ELEVATE_REFUSED (both cross-repo blockers still open at this
+//       landing -- see that file's module header), so
+//       mkfs_format_run_device now takes the ELEVATION_DENIED arm
+//       BEFORE the M3-001 DEVICE_TARGET_STUB emit. The historical
+//       MKFS_EXIT_DEVICE_STUB (4) return is now on the nominal
+//       (unreachable-at-this-landing) row_id arm only -- see
+//       src/format.pdx's mkfs_format_run_device header for the pipeline
+//       shape.
+//   1 — it returned anything else. Two signals a future landing might
+//       trigger this:
+//         * both cross-repo blockers cleared and a real block-write
+//           syscall landed -- expect a 0-or-positive success return
+//         * partial resolution (e.g. elevate wired but block-write
+//           still absent) -- expect MKFS_EXIT_DEVICE_STUB (4) on the
+//           nominal path this driver would then need updated to check
+//           for. Either transition means this stub is due for a real
+//           write-then-readback smoke replacement.
 //
 // ================================================================
 // paideia-as encoder notes
@@ -95,7 +108,7 @@
 //   - No `@no_frame` anywhere.
 //   - No `add reg, [mem]` anywhere.
 //   - No `test` mnemonic; the only comparison in this file is
-//     `cmp rax, 4`, well within the 0x7FFFFFFF cmp-imm bound -- no
+//     `cmp rax, 6`, well within the 0x7FFFFFFF cmp-imm bound -- no
 //     r10/r11 staging needed.
 //   - Cross-file call (`call mkfs_format_run_device;`) uses the bare
 //     unqualified symbol name, per this repo's established convention
@@ -132,7 +145,7 @@ module TestDeviceTargetSmoke = structure {
   pub let run : () -> u64 !{mem, sysreg} @{fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mkfs.pdxfs.M4-003 (#15): TestDeviceTargetSmoke::run entry point. rdi=&mkfs_test_device_target (target_ptr), rsi=0 (force_flag, unused by the stub body per src/format.pdx's own module header), rdx=1024 (journal_size_blocks, likewise unused), `call mkfs_format_run_device` (src/format.pdx, M3-001 #8) -- a real, wired call: internally parses the device-cap slot via Target::mkfs_dev_parse_slot and emits PdxFsFormatRecord@0.1 { result_code: DEVICE_TARGET_STUB } via src/pipe_wire.pdx's mkfs_sp_emit_result, performing no write of any kind. `cmp rax,4; jne mkfs_test_unexpected` (MKFS_EXIT_DEVICE_STUB -- the function's own u64 exit-status contract, a DIFFERENT layer/constant from the record's result_code field, see module header). Matching falls to `xor rax,rax; ret` (0: the stub contract holds). mkfs_test_unexpected: `mov rax,1; ret` (1: the stub's behaviour changed -- a signal a real device-write body has landed and this driver needs a real update). No register survives the one nested call, so no push/pop. No `add reg,[mem]`. No `test` mnemonic. No branch label needed beyond mkfs_test_unexpected.",
+      justification: "mkfs.pdxfs.M4-003 (#15) + 1.2.0 #26 LE-001 update: TestDeviceTargetSmoke::run entry point. rdi=&mkfs_test_device_target (target_ptr), rsi=0 (force_flag, unused by mkfs_format_run_device's body), rdx=1024 (journal_size_blocks, likewise unused), rcx=0 (LV11-025 flags), r8=0 (LV11-025 passphrase_fd), `call mkfs_format_run_device` (src/format.pdx, M3-001 #8 + 1.2.0 #26 LE-001) -- a real, wired call: internally now routes through ElevateGate::mkfs_elevate_open FIRST (src/elevate_gate.pdx, 1.2.0). At this landing that gate fail-closes as EX_ELEVATE_REFUSED (0xFFFFFFFFEB195C4F, per elevate_gate.pdx's module header), so mkfs_format_run_device emits PdxFsFormatRecord@0.1 { result_code: ELEVATION_DENIED } via src/pipe_wire.pdx's mkfs_sp_emit_result, calls mkfs_elevate_close(EX_ELEVATE_REFUSED) -- short-circuits, no fingerprint -- and returns MKFS_EXIT_ELEVATION_DENIED (6). `cmp rax,6; jne mkfs_test_unexpected` (was cmp rax,4 pre-1.2.0). Matching falls to `xor rax,rax; ret` (0: the 1.2.0 #26 LE-001 fail-closed contract holds). mkfs_test_unexpected: `mov rax,1; ret` (1: the contract changed -- see updated return-code convention header for the two shapes that would trip this). No register survives the one nested call, so no push/pop. No `add reg,[mem]`. No `test` mnemonic. No branch label needed beyond mkfs_test_unexpected.",
       block: {
         // LV11-025 (#25) widened mkfs_format_run_device's signature to
         // 5 args (rcx=flags, r8=passphrase_fd). This stub driver's
@@ -141,20 +154,20 @@ module TestDeviceTargetSmoke = structure {
         // ignores them at this landing -- zero both so a future real
         // device-write body inherits a deterministic starting state.
         lea rdi, [rip + mkfs_test_device_target];
-        xor rsi, rsi;                        // force_flag (unused by the stub body)
-        mov rdx, 1024;                       // journal_size_blocks (unused by the stub body)
+        xor rsi, rsi;                        // force_flag (unused by the body)
+        mov rdx, 1024;                       // journal_size_blocks (unused by the body)
         xor rcx, rcx;                        // flags = 0 (LV11-025)
         xor r8,  r8;                         // passphrase_fd = 0 (LV11-025)
         call mkfs_format_run_device;
 
-        cmp rax, 4;                          // MKFS_EXIT_DEVICE_STUB
+        cmp rax, 6;                          // MKFS_EXIT_ELEVATION_DENIED (1.2.0 #26 LE-001)
         jne mkfs_test_unexpected;
 
-        xor rax, rax;                        // 0: stub contract holds
+        xor rax, rax;                        // 0: 1.2.0 #26 LE-001 contract holds
         ret;
 
       mkfs_test_unexpected:
-        mov rax, 1;                          // 1: stub no longer returns MKFS_EXIT_DEVICE_STUB
+        mov rax, 1;                          // 1: contract changed -- see header for possible shapes
         ret;
       }
     }

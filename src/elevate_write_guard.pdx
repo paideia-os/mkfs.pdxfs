@@ -1,0 +1,193 @@
+// src/elevate_write_guard.pdx -- mkfs.pdxfs #26 (LE-001 second landing)
+// -- per-write re-assertion of the format-lifetime elevate grant.
+//
+// ======================================================================
+// What this file is
+// ======================================================================
+//
+// The write-side companion to src/elevate_gate.pdx. Issue #26's
+// acceptance criteria describe every sys_write into the target during
+// format re-asserting the grant via
+// elevate_client_require_scoped(row_id, R_BLOCK_FORMAT, scope_fp) --
+// so a grant race with a scope-remap that would rebind the same row to
+// a different device is caught at every write, not only at open. This
+// file provides that guard as a single function every device-target
+// sys_write in the format pipeline routes through.
+//
+// ======================================================================
+// Signature contract
+// ======================================================================
+//
+// mkfs_elevate_write_guard(row_id, offset, buf, len) -> u64
+//   returns 0 on success, EX_ELEVATE_REFUSED (from ElevateGate) on
+//   any refusal, or a negative errno (mirroring a raw sys_write return
+//   convention) on syscall failure.
+//
+// row_id  -- the value ElevateGate::mkfs_elevate_open returned on the
+//            per-format open. Callers MUST NOT invoke this function
+//            with a row_id of EX_ELEVATE_REFUSED (the caller should
+//            have short-circuited to its own refusal exit already);
+//            for hardening, this body checks the sentinel anyway and
+//            returns it verbatim rather than proceeding to sys_write.
+// offset  -- accepted for future use once a real block-write syscall
+//            exists (paideia-os has no sys_blkdev_write today -- see
+//            src/format.pdx's mkfs_format_run_device header for the
+//            re-verified absence). Read by NOTHING in this landing's
+//            body; passed so a caller does not need to change when the
+//            offset-aware body lands.
+// buf, len -- the write payload. On the future live-body path these
+//            flow into sys_write's rsi/rdx unchanged.
+//
+// ======================================================================
+// State of libpdx-elevate at this landing (same blockers as
+// src/elevate_gate.pdx -- see that file's module header for the full
+// verification trail)
+// ======================================================================
+//
+// Two independent, verified upstream blockers still make a real
+// require_scoped call impossible to LINK from this satellite alone:
+//
+//   1. paideia-os/tools/build.sh deliberately excludes libpdx-elevate
+//      from mkfs.pdxfs's link line (verified against the superproject
+//      root at this landing).
+//   2. mkfs.pdxfs has no KIND_ELEVATE_CHANNEL broker cap allocated at
+//      boot -- so even if libpdx-elevate were on the link line, no
+//      grant could ever be acquired to re-assert.
+//
+// Consequences for THIS file:
+//   * mkfs_elevate_open is fail-closed (always EX_ELEVATE_REFUSED)
+//   * mkfs_elevate_write_guard is therefore never called with a live
+//     row_id at this landing
+//   * The write path in mkfs_format_run_device is itself a stub (no
+//     block-device write syscall exists to route through this guard
+//     even if a grant were live) -- so this function is landed as
+//     scaffolding whose body respects the same fail-closed posture
+//     but is CALLABLE by any future caller that has both a real
+//     row_id and a real sys_blkdev_write ordinal to invoke.
+//
+// ======================================================================
+// The day both blockers clear -- body swap plan
+// ======================================================================
+//
+// mkfs_elevate_write_guard's new body (public signature unchanged):
+//
+//   (a) row_id == EX_ELEVATE_REFUSED: return EX_ELEVATE_REFUSED
+//       (belt-and-suspenders; the caller should not have gotten here
+//       with the sentinel).
+//   (b) Derive scope_fp -- inherited from the mkfs_elevate_open call
+//       that acquired row_id. The write path plumbs scope_fp through
+//       as a hidden argument via a per-format .bss cache below (a
+//       cache slot, not a fifth register argument, so this function's
+//       public signature stays at 4 args -- within the paideia-as
+//       unsafe-body 6-arg cap comfortably, but keeping a shorter shape
+//       makes the callable surface stable across encoder-cap changes).
+//   (c) call elevate_client_require_scoped(row_id, R_BLOCK_FORMAT,
+//       scope_fp) -> ELCA_OK | ELCA_ERR_*. On any non-zero return,
+//       propagate as EX_ELEVATE_REFUSED (the caller cannot
+//       distinguish EXPIRED / CAPS_INSUFFICIENT / SCOPE_MISMATCH here
+//       and does not need to -- all three mean "do not write").
+//   (d) sys_write(fd_from_offset_context, buf, len) -- the exact
+//       shape depends on which real syscall paideia-os finally lands
+//       for block-device I/O; today's dispatch reads no bytes and
+//       writes no bytes, so this step's exact ordinal is a
+//       forward-looking placeholder.
+//   (e) return sys_write's rax (0-or-positive on success, negative
+//       errno on failure) verbatim -- matches every other write path
+//       in this repo's convention (see src/format.pdx's mkfs_format_
+//       write_zeros for the identical raw-syscall-return pattern).
+//
+// The .bss scope-fp cache slot is landed at this file (see
+// mkfs_elg_wg_scope_fp below), populated by mkfs_elevate_open the day
+// its body flips live, and read here on every guarded write. Landing
+// it ahead of the live body means the caller-side wire-through in
+// src/format.pdx does not need to change again once the body swap
+// happens.
+//
+// ======================================================================
+// Encoder-gap discipline (same set as src/elevate_gate.pdx -- kept
+// deliberately verbose per this codebase's per-file convention)
+// ======================================================================
+//
+// No `test rN,rN` -- every zero check is `cmp reg, 0`.
+// No `and r11, imm64` -- imm64 masks stage through r10 first.
+// No 2-op `imul r,imm` -- no multiply in this file at all.
+// No `neg` -- no negative-errno-conversion helper here.
+// No sil / dil / bl -- no byte-only writes in this file.
+// No `qword ptr` -- paideia-as infers width from register.
+// No `[reg+N*1]` -- no scale-1 SIB in this file.
+// No `mov r,-N` -- no negative immediates.
+// Module basename PascalCase: elevate_write_guard.pdx -> module
+// ElevateWriteGuard.
+// SysV rsp%16==0 preserved at every nested `call` (per the paideia-as
+// entry rsp%16==8 convention).
+// Reserved-label discipline: every branch label in this file is
+// prefixed `mkfs_elg_wg_`.
+//
+// Upstream: src/elevate_gate.pdx (this repo, the acquire-side); src/
+// format.pdx's mkfs_format_run_device (this repo, the caller pipeline
+// that will route its writes through this guard); libpdx-elevate/src/
+// elevate_client_require.pdx (the client-side API this file's swap-
+// day body would call).
+
+module ElevateWriteGuard = structure {
+
+  // --------------------------------------------------------------------
+  // Cross-call cache slot for the scope_fp the acquire path bound.
+  // Landed here so a future body swap in mkfs_elevate_open needs only
+  // to `mov [rip + mkfs_elg_wg_scope_fp], <fp>` right after its
+  // cap_bind_scope call, and this file's future body reads it via a
+  // matching rip-relative load. Scoped to a single format run; a
+  // caller that overlaps two mkfs_format_run_device invocations would
+  // race this slot, but no such caller exists (main.pdx invokes the
+  // device pipeline at most once per process, then sys_exits).
+  // Loader zero-init at process start means an uninitialised read
+  // gets 0 (unbound), which elevate_client_require_scoped treats as
+  // matching-any -- honest for the pre-swap fail-closed path where
+  // this slot is never written by anything.
+  pub let mut mkfs_elg_wg_scope_fp : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // mkfs_elevate_write_guard(row_id, offset, buf, len) -> u64
+  //   0 on success (nominal future path only -- unreachable at this
+  //   landing) | EX_ELEVATE_REFUSED (0xFFFFFFFFEB195C4F) on any
+  //   refusal, including the sentinel-row_id short-circuit and the
+  //   future require_scoped ELCA_ERR_* passthrough
+  //
+  //   rdi = row_id  (the value ElevateGate::mkfs_elevate_open returned;
+  //                   either a real row_id (0..15) or EX_ELEVATE_
+  //                   REFUSED)
+  //   rsi = offset  (target-relative byte offset; read by NOTHING in
+  //                   this landing's body -- accepted so a future
+  //                   sys_blkdev_write-aware body has it without an
+  //                   ABI change)
+  //   rdx = buf     (write-payload pointer; read by NOTHING in this
+  //                   landing's body)
+  //   rcx = len     (write-payload length; read by NOTHING in this
+  //                   landing's body)
+  //
+  // At this landing the body ALWAYS returns EX_ELEVATE_REFUSED --
+  // whether row_id is the sentinel (in which case the caller
+  // structurally could never have obtained a real grant to write
+  // against) or a nominal row_id (unreachable at this landing, but
+  // the honest refusal still holds: no grant is bindable so no write
+  // may proceed). This means a caller that unconditionally routes its
+  // writes through this guard structurally cannot write to any block
+  // device today -- exactly the fail-closed posture issue #26 asks for.
+  //
+  // Register plan: pure leaf at this landing (the fail-closed exit
+  // needs no callee-save reg). The day the body goes live, three
+  // callee-save pushes (rbx=row_id, r12=buf, r13=len) will be added
+  // -- offset stays dead if no sys_blkdev_write lands, or moves to r14
+  // if it does. Landed now as a pure leaf so the swap-day patch is a
+  // pure additive expansion.
+  // ==========================================================================
+  pub let mkfs_elevate_write_guard : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (offset: u64) (buf: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs #26 (LE-001 second landing): mkfs_elevate_write_guard entry point. Pure leaf at this landing -- no push/pop, no callee-save touched, no nested call. rsi/rdx/rcx (offset/buf/len) are accepted per the public signature but read by NOTHING in this body (see this function's own header for why). The body unconditionally returns EX_ELEVATE_REFUSED via `mov rax, 0xFFFFFFFFEB195C4F` (imm64 via MOVABS, same encoding elevate_gate.pdx's mkfs_elevate_open uses for the same sentinel -- the two values are bit-identical, must stay so, and are BOTH direct literal loads rather than reading a shared .bss constant because paideia-as does not resolve cross-file `pub let` bindings as inline immediates in another file's compilation unit -- see src/format.pdx's LV11-024 note on this codebase-wide convention); `ret`. The row_id sentinel check that the module header describes is ELIDED at this landing: a caller with row_id == EX_ELEVATE_REFUSED and a caller with row_id == any_real_row both receive the SAME EX_ELEVATE_REFUSED return, so a discriminating branch would be dead code today. The swap-day body will re-introduce the branch to short-circuit the sentinel BEFORE the require_scoped call (so a caller passing the sentinel does not accidentally trigger a broker round-trip on a row that was never acquired). No `add reg,[mem]`. No `test`. No branch -- straight-line body, no label needed.",
+      block: {
+        mov rax, 0xFFFFFFFFEB195C4F;           // EX_ELEVATE_REFUSED
+        ret;
+      }
+    }
+}

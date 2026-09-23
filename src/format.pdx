@@ -907,9 +907,13 @@ module Format = structure {
     }
 
   // ==========================================================================
-  // mkfs_format_run_device(target_ptr, force_flag, journal_size_blocks) -> u64
-  //   (always MKFS_EXIT_DEVICE_STUB -- see module header's "M3-001, #8"
-  //   section for why no real write path exists to attempt)
+  // mkfs_format_run_device(target_ptr, force_flag, journal_size_blocks,
+  //                        flags, passphrase_fd) -> u64
+  //   MKFS_EXIT_ELEVATION_DENIED (6) on any EX_ELEVATE_REFUSED from
+  //     the inner elevate gate |
+  //   MKFS_EXIT_DEVICE_STUB      (4) on the (currently unreachable)
+  //     nominal path where the inner gate would return a live row_id
+  //     and no real block-device write ordinal exists to attempt
   //
   //   rdi = target_ptr          (the full "cap:blkdev:0xNN" string,
   //                               already classified TARGET_DEVICE_CAP)
@@ -917,37 +921,112 @@ module Format = structure {
   //                               a future real body has it without an
   //                               ABI change)
   //   rdx = journal_size_blocks (unused by this stub body, same reason)
+  //   rcx = flags               (LV11-025 argv flags word, unused here)
+  //   r8  = passphrase_fd       (LV11-025 passphrase fd, unused here)
   //
   // Called by src/main.pdx's device-target dispatch only in the (today
-  // unreachable, per src/elevate_wire.pdx's module header) GRANT arm --
-  // i.e. this function's body has never actually executed against a
-  // real invocation at this landing, but it IS real, wired code, not
-  // dead code kept for tidiness.
+  // unreachable, per src/elevate_wire.pdx's module header) GRANT arm
+  // of the outer mkfs_elev_require_device_write probe. #26 (LE-001
+  // second landing) adds a second, structural inner gate here via
+  // ElevateGate::mkfs_elevate_open (see src/elevate_gate.pdx): every
+  // device-target format attempt now routes through an
+  // acquire+bind_scope+cascade_revoke round-trip inside THIS function
+  // regardless of what the outer probe decided, so the day the outer
+  // probe becomes non-DENY (which itself needs the two cross-repo
+  // blockers documented in src/elevate_gate.pdx to clear), the inner
+  // gate stays fail-closed on its own until the same blockers clear
+  // for it too -- there is no way to reach a real write path with an
+  // unscoped grant even by mistake.
   //
-  // Register plan: rbx=target_ptr, held across the one nested call.
-  // force_flag/journal_size_blocks are read-only and never referenced
-  // again after entry, so they need no register of their own (SysV
-  // caller-save rsi/rdx are simply left untouched until the call clobbers
-  // them, which is fine since nothing after that point reads them).
+  // Pipeline:
+  //   1. call ElevateGate::mkfs_elevate_open(target_ptr, path_len=0)
+  //      -- path_len is 0 (advisory; the inner scope_fp helper is
+  //      NUL-terminated). Today's fail-closed body ALWAYS returns
+  //      EX_ELEVATE_REFUSED; a future live body returns a row_id
+  //      (0..15).
+  //   2. Sentinel check: cmp rax against EX_ELEVATE_REFUSED
+  //      (0xFFFFFFFFEB195C4F). On sentinel: emit FR_RESULT_ELEVATION_
+  //      DENIED (6) via mkfs_sp_emit_result, call ElevateGate::
+  //      mkfs_elevate_close(EX_ELEVATE_REFUSED) -- which short-circuits
+  //      to 0 with no fingerprint emit, honest -- and return
+  //      MKFS_EXIT_ELEVATION_DENIED (6).
+  //   3. Nominal path (unreachable today, wired for the swap-day):
+  //      call mkfs_dev_parse_slot (kept from the M3-001 landing --
+  //      still valuable for its own future body). The M3-001 landing
+  //      has no block-device write syscall to route through
+  //      ElevateWriteGuard::mkfs_elevate_write_guard, so no guarded
+  //      write is emitted at this landing (a real write here would be
+  //      a fabrication of a syscall that does not exist); the guard's
+  //      wire-in happens the day sys_blkdev_write lands. Emit FR_
+  //      RESULT_DEVICE_TARGET_STUB (5) exactly as before, then call
+  //      mkfs_elevate_close(row_id) -- which on a nominal row_id
+  //      would today cascade_revoke + emit "MKFS ELEVATE OK" once
+  //      the elevate_gate live body lands. Return MKFS_EXIT_DEVICE_
+  //      STUB (4).
+  //
+  // Register plan: push rbx + push r12 + push r13 (three callee-save
+  // pushes = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, aligned
+  // across every nested call). rbx = target_ptr (held across
+  // mkfs_elevate_open, mkfs_dev_parse_slot, mkfs_sp_emit_result,
+  // mkfs_elevate_close); r12 = row_id from mkfs_elevate_open (held
+  // across mkfs_dev_parse_slot + mkfs_sp_emit_result to reach the
+  // trailing mkfs_elevate_close call site with the exact value the
+  // gate returned -- NOT re-derived); r13 = exit-code scratch (0-4-6),
+  // written into rax immediately before the shared epilogue.
   // ==========================================================================
   pub let mkfs_format_run_device : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (target_ptr: u64) (force_flag: u64) (journal_size_blocks: u64) (flags: u64) (passphrase_fd: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mkfs.pdxfs.M3-001 (#8) + LV11-025 (#25): mkfs_format_run_device entry point, the device-target stub pipeline. `push rbx` before repurposing it. `mov rbx, rdi` (rbx=target_ptr; rsi/rdx -- force_flag/journal_size_blocks -- are accepted per this function's public signature but read by nothing below, per module header). `call mkfs_dev_parse_slot` (src/target.pdx, rdi=rbx already in position) -> rax = the parsed device-cap slot number; this repo's own M3 landing reads no further use of it (no kind-validation syscall exists to check it against, per src/target.pdx's own module header) -- the call is made anyway so a future real body already has the parsed value threaded through without an ABI change. `mov rdi, rbx` (target_ptr), `mov rsi, 5` (FR_RESULT_DEVICE_TARGET_STUB), `xor rdx, rdx` (errno unused), `call mkfs_sp_emit_result` (src/pipe_wire.pdx). `mov rax, 4` (MKFS_EXIT_DEVICE_STUB). `pop rbx; ret`. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_format_rd_ (none needed -- no branch).",
+      justification: "mkfs.pdxfs.M3-001 (#8) + LV11-025 (#25) + #26 LE-001 second landing (inner scoped-elevate gate): mkfs_format_run_device entry point. Three callee-save pushes (rbx=target_ptr, r12=row_id from mkfs_elevate_open, r13=exit-code scratch) = 24 bytes; entry rsp%16==8 -> (8-24) mod 16 == 0, aligned across every nested call (mkfs_elevate_open, mkfs_dev_parse_slot, mkfs_sp_emit_result, mkfs_elevate_close). rsi/rdx/rcx/r8 (force_flag/journal_size_blocks/flags/passphrase_fd) are accepted per the public signature but read by nothing in this body (per module header -- the M3-001 device path remains a documented stub even after the #26 gate wire-in). Phase 1: rdi=rbx, xor rsi,rsi (path_len=0 -- advisory only; mkfs_elevate_scope_fp_fnv1a's inner loop is NUL-terminated), call mkfs_elevate_open (src/elevate_gate.pdx). mov r12, rax (row_id | EX_ELEVATE_REFUSED). Phase 2 (sentinel check): mov r10, 0xFFFFFFFFEB195C4F (EX_ELEVATE_REFUSED, imm64 via MOVABS, same encoding elevate_gate.pdx uses); cmp r12, r10 (register-vs-register, no imm64-in-cmp hazard); jne mkfs_format_rd_nominal. Fail-closed arm (the ONLY reachable arm at this landing per module header): mov rdi, rbx, mov rsi, 6 (FR_RESULT_ELEVATION_DENIED), xor rdx, rdx, call mkfs_sp_emit_result (src/pipe_wire.pdx). mov rdi, r12 (still EX_ELEVATE_REFUSED sentinel -- passing it verbatim to close so the short-circuit fires; NOT re-loaded from a literal, so the flow uses the exact value the gate returned), call mkfs_elevate_close (src/elevate_gate.pdx) -- returns 0 on the sentinel short-circuit, no fingerprint emit (honest, per elevate_gate module header). mov r13, 6 (MKFS_EXIT_ELEVATION_DENIED). jmp mkfs_format_rd_epilogue. Nominal arm (mkfs_format_rd_nominal, unreachable at this landing -- kept as documented dead code so the swap-day patch is minimal): mov rdi, rbx, call mkfs_dev_parse_slot (src/target.pdx) -- return value discarded exactly as in the M3-001 landing (no kind-validation syscall exists to check it against). mov rdi, rbx, mov rsi, 5 (FR_RESULT_DEVICE_TARGET_STUB), xor rdx, rdx, call mkfs_sp_emit_result. mov rdi, r12 (nominal row_id -- the value the future live gate would have returned), call mkfs_elevate_close -- on a nominal row_id the future live body cascade-revokes the row and emits [MKFS ELEVATE OK]\\n on fd 2; today's fail-closed body's live arm is unreachable-in-practice (row_id is always the sentinel), but the CALL is placed on the nominal exit anyway so the swap-day flip is a single body-swap inside elevate_gate.pdx with no touch to this function. mov r13, 4 (MKFS_EXIT_DEVICE_STUB). Fall through to epilogue. mkfs_format_rd_epilogue: mov rax, r13, pop r13, pop r12, pop rbx, ret. Every callee touches only caller-save regs internally or preserves the callee-save regs it repurposes (per each function's own justification), so rbx/r12/r13 all survive every `call` transparently. No `add reg,[mem]` anywhere. No `test` -- the sentinel check is `cmp reg,reg` after staging through r10. No `imul`/`mul`/`neg`. Labels prefixed mkfs_format_rd_.",
       block: {
         push rbx;
+        push r12;
+        push r13;
 
         mov rbx, rdi;                       // rbx = target_ptr
 
-        call mkfs_dev_parse_slot;           // src/target.pdx -- parsed slot, unused further (see justification)
-
+        // ---- Phase 1: inner scoped-elevate gate (src/elevate_gate.pdx). --
         mov rdi, rbx;
-        mov rsi, 5;                          // FR_RESULT_DEVICE_TARGET_STUB
+        xor rsi, rsi;                       // path_len = 0 (advisory)
+        call mkfs_elevate_open;             // src/elevate_gate.pdx
+        mov r12, rax;                       // r12 = row_id | EX_ELEVATE_REFUSED
+
+        // ---- Phase 2: sentinel check. -----------------------------------
+        mov r10, 0xFFFFFFFFEB195C4F;        // EX_ELEVATE_REFUSED (imm64 via MOVABS)
+        cmp r12, r10;
+        jne mkfs_format_rd_nominal;
+
+        // ---- Fail-closed arm (the only reachable arm at this landing). --
+        mov rdi, rbx;
+        mov rsi, 6;                         // FR_RESULT_ELEVATION_DENIED
         xor rdx, rdx;
         call mkfs_sp_emit_result;           // src/pipe_wire.pdx
 
-        mov rax, 4;                          // MKFS_EXIT_DEVICE_STUB
+        mov rdi, r12;                       // EX_ELEVATE_REFUSED -- short-circuit
+        call mkfs_elevate_close;            // src/elevate_gate.pdx
 
+        mov r13, 6;                         // MKFS_EXIT_ELEVATION_DENIED
+        jmp mkfs_format_rd_epilogue;
+
+      mkfs_format_rd_nominal:
+        // ---- Nominal arm (unreachable at this landing -- see header). ---
+        mov rdi, rbx;
+        call mkfs_dev_parse_slot;           // src/target.pdx (parsed slot discarded)
+
+        mov rdi, rbx;
+        mov rsi, 5;                         // FR_RESULT_DEVICE_TARGET_STUB
+        xor rdx, rdx;
+        call mkfs_sp_emit_result;           // src/pipe_wire.pdx
+
+        mov rdi, r12;                       // nominal row_id
+        call mkfs_elevate_close;            // src/elevate_gate.pdx (cascade + fingerprint on live body)
+
+        mov r13, 4;                         // MKFS_EXIT_DEVICE_STUB
+
+      mkfs_format_rd_epilogue:
+        mov rax, r13;
+        pop r13;
+        pop r12;
         pop rbx;
         ret;
       }

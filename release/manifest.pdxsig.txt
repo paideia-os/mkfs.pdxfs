@@ -55,7 +55,9 @@ source-tag:          v1.0.0
 caps.decl                          blake3-256 = <BLAKE3-caps.decl>
 src/argv.pdx                       blake3-256 = <BLAKE3-argv.pdx>
 src/audit_wire.pdx                 blake3-256 = <BLAKE3-audit_wire.pdx>
+src/elevate_gate.pdx               blake3-256 = <BLAKE3-elevate_gate.pdx>
 src/elevate_wire.pdx               blake3-256 = <BLAKE3-elevate_wire.pdx>
+src/elevate_write_guard.pdx        blake3-256 = <BLAKE3-elevate_write_guard.pdx>
 src/format.pdx                     blake3-256 = <BLAKE3-format.pdx>
 src/format_record.pdx              blake3-256 = <BLAKE3-format_record.pdx>
 src/main.pdx                       blake3-256 = <BLAKE3-main.pdx>

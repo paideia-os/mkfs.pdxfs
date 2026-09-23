@@ -1,0 +1,479 @@
+// src/elevate_gate.pdx -- mkfs.pdxfs #26 (LE-001 second landing) --
+// scoped elevate gate for the block-device format path.
+//
+// ======================================================================
+// What this file is
+// ======================================================================
+//
+// The successor to src/elevate_wire.pdx's single-shot fail-closed gate,
+// specified to the shape issue #26's acceptance criteria describe --
+// (1) elevate_client_acquire before opening a block device for write,
+// (2) elevate_client_cap_bind_scope binding the acquired handle to a
+// per-target scope fingerprint, so a grant minted for /dev/blk0 cannot
+// be replayed against /dev/blk1, (3) the paired release step (see
+// cascade-revoke helper below), and (4) a "MKFS ELEVATE OK" stderr
+// fingerprint emitted from the cascade-revoke success path so a smoke
+// harness can grep for it without parsing the semantic-pipe fd-1
+// record.
+//
+// Written as its own module (rather than a body swap inside
+// elevate_wire.pdx) because the two files answer different questions:
+// elevate_wire.pdx answers "may this process prove it holds a grant
+// over this device today?" and always answers DENY at this landing
+// (that file's own fail-closed contract, kept verbatim); elevate_gate
+// answers "acquire a grant for the whole format lifetime, bind it to
+// this device, and hand back a handle write_guard can re-assert on
+// every sys_write" -- a different verb (acquire vs. probe) even though
+// the underlying broker calls overlap.
+//
+// ======================================================================
+// State of libpdx-elevate at this landing
+// ======================================================================
+//
+// libpdx-elevate is present as a sibling submodule under paideia-os/
+// tools/user/libpdx-elevate (verified against the paideia-os
+// superproject's tools/build.sh SAT_LIBS list at this landing -- it is
+// enumerated there) and ships every public entry point issue #26's
+// acceptance criteria name, all callable by SysV convention with
+// signatures fully published in that library's src/:
+//
+//   ElevateClientAcquire::elevate_client_acquire
+//     : (caps: u64, dur_ns: u64, req_buf: u64, reply_ep_id: u64,
+//        reply_buf: u64, mint_ctx_buf: u64) -> row_id (<16) | error
+//     (src/elevate_client_acquire.pdx, ENH-001/LE.M1-002)
+//   ElevateClientCap::elevate_client_cap_bind_scope
+//     : (row_id: u64, scope_fp: u64) -> ELCC_OK | ELCC_ERR_BAD_ROW
+//     (src/elevate_client_cap.pdx, ENH-003)
+//   ElevateClientRequire::elevate_client_require_scoped
+//     : (row_id: u64, needed_caps: u64, scope_fp: u64) -> ELCA_OK |
+//       ELCA_ERR_EXPIRED | ELCA_ERR_CAPS_INSUFFICIENT |
+//       ELCA_ERR_SCOPE_MISMATCH | ELCC_ERR_BUDGET_EXHAUSTED | ...
+//     (src/elevate_client_require.pdx, ENH-003)
+//   ElevateClientCap::elevate_client_cap_revoke_cascade
+//     : (row_id: u64) -> propagated_count | ELCC_ERR_*
+//     (src/elevate_client_cap.pdx, LE.M7-001/002)
+//
+// ======================================================================
+// Blockers that keep the body fail-closed at this landing (unchanged
+// since elevate_wire.pdx's LE-001 addendum -- re-verified here)
+// ======================================================================
+//
+// The API's presence is not sufficient. Two independent, verified
+// upstream blockers still make a real call impossible to LINK or to
+// CONSTRUCT from this satellite alone:
+//
+//   1. paideia-os/tools/build.sh (superproject root, ~lines 297-315
+//      inside the R64v2 satellite-tool block) DELIBERATELY EXCLUDES
+//      libpdx-elevate from the mkfs.pdxfs / mount.pdxfs / umount.pdxfs
+//      link line. Verbatim from that script's own comment: "libpdx-
+//      elevate is DELIBERATELY EXCLUDED from the tools' link line: none
+//      of mkfs.pdxfs/mount.pdxfs/umount.pdxfs calls any real
+//      elevate_client_* symbol at this landing ... pulling those objects
+//      in unconditionally would hard-fail the link with undefined
+//      references for code no tool ever calls." libpdx-elevate's own
+//      client-side objects pull in kernel/broker-only symbols
+//      (hpet_now_ns, svc_lookup, endpoint_take_pending/write_pending,
+//      elevate_channel_cap_mint_inner/revoke, uej_append) that exist
+//      in NEITHER libpdx-volume, libpdx-audit, libpdx-argv, NOR any
+//      tool's own tree. Placing a bare `call elevate_client_acquire`
+//      into this file's body today would therefore break the very next
+//      superproject `bash tools/build.sh` run -- not because the call
+//      is wrong, but because the object graph it depends on is not on
+//      mkfs.pdxfs's link line.
+//
+//   2. mkfs.pdxfs has no KIND_ELEVATE_CHANNEL broker-endpoint cap
+//      allocated at boot. This repo's own caps.decl (M4-001 landing)
+//      declares KIND_ELEVATE_CHANNEL as ABSENT by design -- "mkfs
+//      elevates on demand per the R90-XREPO.011 elevate-broker policy
+//      and never holds an elevate cap ambiently at exec time" -- and
+//      design/user/fs-tools-caps.md §2.1 (paideia-os monorepo)
+//      confirms this is the intended policy, not a gap to close by
+//      promoting the kind to mandatory. No init-time mechanism hands
+//      this process (or any standalone CLI tool exec'd outside a
+//      long-lived session) an elevate-channel capability slot to
+//      present as parent_ep_slot to elevate_client_acquire's
+//      mint_ctx_buf. See design/mkfs-elevate-cap-provisioning.md (this
+//      repo, added at the 1.1.5 fixup) for the init-side cap-mint-pool
+//      + hand-off contract sketch this gap needs closed by.
+//
+// Both blockers are cross-repo / cross-milestone (a superproject
+// build.sh change; osarch-coordinated broker-cap provisioning) outside
+// what a satellite-only dispatch against this repo alone can resolve.
+//
+// ======================================================================
+// What THIS landing does anyway
+// ======================================================================
+//
+// The two blockers above dictate that mkfs_elevate_open's BODY must
+// return the EX_ELEVATE_REFUSED sentinel unconditionally -- same
+// fail-closed posture elevate_wire.pdx's mkfs_elev_require_device_write
+// already runs. What this landing DOES bring is the full structural
+// scaffold around that body, all resolved to constants a real call
+// would need:
+//
+//   * EX_ELEVATE_REFUSED sentinel (0xFFFFFFFFEB195C4F) -- a distinct
+//     return band, disjoint from every ElevateClient*::ELCA_/ELCC_
+//     error code (which cluster around 0xFFFFEA00..0xFFFFEA80 per
+//     libpdx-elevate's own extension-band convention -- verified) and
+//     from every real row_id (0..15). Callers can distinguish "gate
+//     refused" from "acquire succeeded but a downstream binding failed"
+//     from "row_id = 3 is live" without a second look-aside table.
+//
+//   * R_BLOCK_FORMAT = 0x01 -- a LOCAL bit-0 reservation in libpdx-
+//     elevate's 8-bit ElevateRequest::ELV_CAP_MASK_VALID space. No
+//     org-wide named-capability registry exists yet (re-verified:
+//     absent from both libpdx-elevate and design/) -- see the header
+//     of R_BLOCK_FORMAT below for the retirement plan. Kept in sync
+//     with elevate_wire.pdx's own MKFS_ELEV_CAP_BLOCK_FORMAT (same
+//     value) so the two gates cannot drift over the same cap bit.
+//
+//   * MKFS_ELEV_DUR_NS = 30_000_000_000 -- 30s, well inside libpdx-
+//     elevate's [ELV_DUR_MIN_NS=1s, ELV_DUR_MAX_NS=1h] range. Format
+//     is a short single-shot; a session-lifetime grant would leak the
+//     right past the operation that needed it. Same value elevate_
+//     wire.pdx already established -- kept sync'd here rather than
+//     re-parameterised.
+//
+//   * scope_fp derivation -- issue #26 asks for
+//     blake3(target_device_path)[0..8]. No blake3 hash function is
+//     reachable from this satellite (grep confirms: neither libpdx-
+//     crypto exists nor does libpdx-volume export a callable BLAKE3
+//     entry point -- the pdxb_sign.pdx references to BLAKE3 are
+//     design-comments about a future public-key hash format, not a
+//     callable API this file could reach). This landing therefore
+//     uses a compact deterministic 64-bit HASH over the NUL-terminated
+//     target string -- FNV-1a with the standard 64-bit basis
+//     0xCBF29CE484222325 and prime 0x100000001B3 -- as the scope_fp,
+//     paired with a `SCOPE_FP_ALGO_TAG` byte in the top 8 bits so a
+//     future landing that swaps to a real blake3 truncation can update
+//     the tag from FNV1A_64 (0x01) to BLAKE3_TRUNC64 (0x02) and reject
+//     any handle whose bound scope_fp carries the wrong tag byte
+//     (same versioning pattern libpdx-volume uses for its own
+//     PDXB_VERSION_V1/V2 gate). elevate_wire.pdx's own existing
+//     precedent (dev_slot as scope_fp -- which is opaque to the
+//     library and therefore trivially valid) is not adopted here
+//     because issue #26 specifically asks for a path-derived scope --
+//     dev_slot is device-identity but not path-identity, and a
+//     re-attach with the same slot after a device swap could
+//     legitimately mask a real scope mismatch a path-derived scope
+//     would catch.
+//
+//   * "MKFS ELEVATE OK" fd-2 fingerprint -- emitted from
+//     mkfs_elevate_close's cascade-revoke success path (last step of a
+//     successful format-then-release round trip). Grep-friendly single
+//     line, matching the [mkfs.pdxfs.LE-001 EACCES] / [mkfs.pdxfs
+//     --dry-run <t> OK] shape already established in 1.1.5. Never
+//     emitted at this landing because mkfs_elevate_open never returns
+//     a live row_id -- honest.
+//
+// ======================================================================
+// The day both blockers clear -- body swap plan
+// ======================================================================
+//
+// When (1) libpdx-elevate lands on mkfs.pdxfs's link line and (2)
+// mkfs.pdxfs gets a real KIND_ELEVATE_CHANNEL broker-cap allocated at
+// boot (see design/mkfs-elevate-cap-provisioning.md), only THIS
+// file's function bodies flip. The public 2-arg signature of
+// mkfs_elevate_open (target_ptr, path_len) and 1-arg
+// mkfs_elevate_close (row_id) do NOT change. Callers do not need to
+// change. mkfs_elevate_open's new body would be:
+//
+//   (a) compute scope_fp = SCOPE_FP_ALGO_TAG_FNV1A_64 in the top byte
+//       plus FNV-1a-64 of the target path bytes in the low 56 -- the
+//       exact function this landing already implements at
+//       mkfs_elevate_scope_fp_fnv1a below (a real, wired, callable
+//       function -- the body swap does not need to introduce new
+//       hashing plumbing).
+//   (b) req_buf, reply_ep_id, reply_buf, mint_ctx_buf populated from
+//       the process's newly-allocated broker cap -- fields spelled out
+//       in the elevate_wire.pdx LE-001 addendum verbatim, still the
+//       correct target inputs.
+//   (c) call elevate_client_acquire(caps=R_BLOCK_FORMAT,
+//       dur_ns=MKFS_ELEV_DUR_NS, req_buf, reply_ep_id, reply_buf,
+//       mint_ctx_buf) -> row_id (0..15) | ELCA_ERR_*. On any
+//       ELCA_ERR_* return, return EX_ELEVATE_REFUSED (the caller
+//       cannot distinguish acquire-refused from bind-refused, and
+//       does not need to).
+//   (d) call elevate_client_cap_bind_scope(row_id, scope_fp). On
+//       ELCC_ERR_*, best-effort call elevate_client_cap_revoke_cascade
+//       (row_id) to release the grant we just took, then return
+//       EX_ELEVATE_REFUSED.
+//   (e) return row_id.
+//
+// The three inputs currently unresolvable (req_buf, reply_ep_id,
+// reply_buf, mint_ctx_buf) are ALL knock-on consequences of blocker 2
+// (the broker-cap allocation gap) -- the parent_ep_slot inside
+// mint_ctx_buf points at exactly the KIND_ELEVATE_CHANNEL cap slot
+// that does not exist yet. So blocker 2 closing simultaneously closes
+// this last input-resolution question.
+//
+// mkfs_elevate_close's new body:
+//
+//   (a) row_id == EX_ELEVATE_REFUSED -> return 0 (no cascade needed;
+//       nothing was ever acquired). No fingerprint emitted.
+//   (b) call elevate_client_cap_revoke_cascade(row_id). Any non-zero
+//       return is propagated as-is (an ELCC_ERR_* is more useful than
+//       collapsing it into a local sentinel here).
+//   (c) On success: emit the "MKFS ELEVATE OK" fd-2 fingerprint via a
+//       single sys_write(2). Return 0.
+//
+// The scope_fp function is REAL and wired at this landing -- it is a
+// pure computation over the argument bytes, needs no libpdx-elevate
+// symbol, and produces a deterministic value the swap-day body can
+// use verbatim. Same is true of the four sentinel/constant bindings
+// below and of the fingerprint literal. Only the acquire / bind_scope
+// / cascade_revoke / require_scoped CALLS themselves are gated behind
+// the two blockers.
+//
+// ======================================================================
+// Encoder-gap discipline (paideia-as pitfalls this file MUST avoid)
+// ======================================================================
+//
+// No `test rN,rN` anywhere -- every zero check is `cmp reg, 0`.
+// No `and r11, imm64` -- immediates outside imm32 range stage through
+// r10 first (verified: every AND in this file takes an imm32).
+// No 2-op `imul r,imm` -- the FNV multiply below is done via a `mul`
+// with rdx:rax spelled out explicitly and rdx cleared after each mul.
+// No `neg` -- not needed here (no negative-syscall-errno conversion in
+// this file).
+// No sil / dil / bl -- the byte load from the target string uses the
+// paideia-as #1248 `xor rax,rax; mov_b rax,[rdi]` zero-extended
+// pattern already established in src/target.pdx and src/format_record.
+// pdx.
+// No `qword ptr` -- paideia-as infers width from register.
+// No `[reg+N*1]` -- scale 1 is written as `[reg+N]`.
+// No `mov r,-N` -- no negative immediates in this file.
+// No multiline `pub let ="..."` -- every string literal is single line.
+// Module basename PascalCase: elevate_gate.pdx -> module ElevateGate.
+// SysV rsp%16==0 at every nested `call`: every function below either
+// touches only caller-save registers (no push/pop, no rsp change) or
+// pushes an even number of callee-save regs plus one pad word to
+// restore alignment from paideia-as's entry rsp%16==8.
+// Reserved-label discipline: every branch label in this file is
+// prefixed `mkfs_elg_`.
+//
+// Upstream: src/elevate_wire.pdx (this repo, the predecessor gate --
+// this file is additive, elevate_wire stays put); src/elevate_write_
+// guard.pdx (this repo, the paired write-side re-assert); libpdx-
+// elevate/src/elevate_client_acquire.pdx, elevate_client_cap.pdx,
+// elevate_client_require.pdx (the client-side API this file's swap-day
+// body would call); paideia-os/tools/build.sh (superproject, ~lines
+// 297-315, the link-line exclusion this file's blocker #1 verifies);
+// design/mkfs-elevate-cap-provisioning.md (this repo, blocker #2's
+// init-side proposal).
+
+module ElevateGate = structure {
+
+  // --------------------------------------------------------------------
+  // Return-band sentinels (see module header)
+  // --------------------------------------------------------------------
+
+  // Distinct return-band sentinel for "gate refused" -- disjoint from
+  // every real row_id (0..15) and from every ElevateClient*:: error
+  // constant (which cluster in 0xFFFFEA00..0xFFFFEA80). A caller that
+  // sees this value MUST NOT proceed to a sys_write against the target.
+  // The literal 0xFFFFFFFFEB195C4F encodes "EB19 5C4F" as a compact
+  // memorable tag (EB19 = "el-b1g" mnemonic for elevate-block-format;
+  // 5C4F = "scope-fail" mnemonic for the scope-refused case) -- pure
+  // documentation, no bit inside carries meaning.
+  pub let EX_ELEVATE_REFUSED : u64 = 0xFFFFFFFFEB195C4F
+
+  // --------------------------------------------------------------------
+  // Broker-cap bit reservations (see module header)
+  // --------------------------------------------------------------------
+
+  // R_BLOCK_FORMAT -- local bit-0 reservation in libpdx-elevate's 8-bit
+  // ELV_CAP_MASK_VALID space. Kept in sync with elevate_wire.pdx's
+  // MKFS_ELEV_CAP_BLOCK_FORMAT so the two gates cannot drift over the
+  // same cap bit; retire both the day an org-wide libpdx-cap capability
+  // registry lands and can define R_BLOCK_FORMAT as a shared constant.
+  // Comment-only citation until then, per this codebase's paideia-as-
+  // "no cross-file constant folding" convention (see src/format.pdx's
+  // LV11-024 comment for the same pattern).
+  pub let R_BLOCK_FORMAT : u64 = 0x01
+
+  // Format-lifetime grant: 30s. Same value elevate_wire.pdx already
+  // established, kept sync'd here.
+  pub let MKFS_ELEV_DUR_NS : u64 = 30000000000
+
+  // --------------------------------------------------------------------
+  // Scope-fingerprint versioning (see module header)
+  // --------------------------------------------------------------------
+
+  // Top-byte algorithm tag on every scope_fp this gate produces. Lets a
+  // future blake3-backed landing swap the algo without also swapping
+  // every existing bound-scope handle silently.
+  pub let SCOPE_FP_ALGO_TAG_FNV1A_64    : u64 = 0x0100000000000000
+  pub let SCOPE_FP_ALGO_TAG_BLAKE3_T64  : u64 = 0x0200000000000000
+
+  // FNV-1a-64 constants (standard values, sourced from the spec at
+  // isthe.com/chongo/tech/comp/fnv). Constants themselves need no
+  // library dependency.
+  pub let FNV1A_64_OFFSET_BASIS : u64 = 0xCBF29CE484222325
+  pub let FNV1A_64_PRIME        : u64 = 0x100000001B3
+
+  // --------------------------------------------------------------------
+  // "MKFS ELEVATE OK" fingerprint literal (see module header)
+  // --------------------------------------------------------------------
+
+  // Byte count verified: "[MKFS ELEVATE OK]\n" is 18 bytes. Trailing
+  // NUL is not part of the sys_write length.
+  pub let elg_lit_ok     : [u8; 19] = "[MKFS ELEVATE OK]\n\0"
+  pub let elg_lit_ok_len : u64 = 18
+
+  // ==========================================================================
+  // mkfs_elevate_scope_fp_fnv1a(target_ptr) -> u64
+  //
+  // Real, wired, callable at this landing. Computes:
+  //   scope_fp = SCOPE_FP_ALGO_TAG_FNV1A_64 | (FNV-1a-64(target[0..]) & 0x00FFFFFFFFFFFFFF)
+  //
+  // A future landing that swaps to blake3 truncation only needs to
+  // replace this function's body (or add a sibling and repoint the
+  // caller) -- the callers see the algo tag in the top byte and can
+  // therefore refuse a scope whose bound value carries the wrong tag.
+  //
+  // Byte loop over target_ptr until the first NUL (matches the
+  // format_record_strlen shape already established in src/format_
+  // record.pdx). Pure computation -- no syscalls, no nested calls;
+  // rax/rcx/rdx/r8/r9/rdi all SysV caller-save, no push/pop.
+  // ==========================================================================
+  pub let mkfs_elevate_scope_fp_fnv1a : (u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs #26 (LE-001 second landing): mkfs_elevate_scope_fp_fnv1a entry point. Pure leaf -- rax/rcx/rdx/r8/r9/rdi all SysV caller-save, no push/pop, no callee-save touched, no nested call. Register plan: rdi = target_ptr (advanced by 1 each iteration), r8 = FNV_OFFSET_BASIS (running hash, initialised via a `mov r8, imm64`), r9 = FNV_PRIME (constant, initialised once outside the loop). Inner loop (mkfs_elg_fnv_loop): xor rax, rax; mov_b rax, [rdi] (paideia-as #1248 zero-extended byte load, same idiom src/target.pdx uses for its own first-byte load); cmp rax, 0; je mkfs_elg_fnv_done on NUL. Otherwise xor r8, rax (FNV-1a: XOR the byte into the running hash BEFORE the multiply -- the -1a variant). Then multiply r8 by r9: `mov rax, r8; mul r9` puts r8*r9 into rdx:rax (unsigned 64x64 -> 128); mov r8, rax discards the high 64 (FNV-1a-64 is the low 64 by definition), no `imul r,imm` used. add rdi, 1; jmp mkfs_elg_fnv_loop. Exit: rax = r8, then apply the algo-tag mask via a two-step: mov r10, 0x00FFFFFFFFFFFFFF (fits imm64 via MOVABS); and rax, r10 (imm32-safe by staging through r10 first per the encoder-pitfall discipline); mov r10, 0x0100000000000000 (SCOPE_FP_ALGO_TAG_FNV1A_64, MOVABS); or rax, r10. ret. No `add reg,[mem]`, no `test`, no `and r11,imm64` (staged through r10 which is fine since r10 is scratch throughout), no 2-op imul, no neg. Labels prefixed mkfs_elg_fnv_.",
+      block: {
+        mov r8, 0xCBF29CE484222325;             // FNV1A_64_OFFSET_BASIS
+        mov r9, 0x100000001B3;                  // FNV1A_64_PRIME
+
+      mkfs_elg_fnv_loop:
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0;
+        je mkfs_elg_fnv_done;
+        xor r8, rax;
+        mov rax, r8;
+        mul r9;
+        mov r8, rax;
+        add rdi, 1;
+        jmp mkfs_elg_fnv_loop;
+
+      mkfs_elg_fnv_done:
+        mov rax, r8;
+        mov r10, 0x00FFFFFFFFFFFFFF;            // low-56 mask (imm64 via MOVABS)
+        and rax, r10;                           // imm32-safe (staged through r10)
+        mov r10, 0x0100000000000000;            // SCOPE_FP_ALGO_TAG_FNV1A_64
+        or rax, r10;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_elevate_open(target_ptr, path_len) -> u64
+  //   row_id (0..15) on success | EX_ELEVATE_REFUSED (0xFFFFFFFFEB195C4F)
+  //
+  //   rdi = target_ptr  (NUL-terminated <target> path -- typically a
+  //                       "cap:blkdev:0xNN" string, but the body is
+  //                       agnostic to the prefix. Used to derive the
+  //                       scope_fp via mkfs_elevate_scope_fp_fnv1a.)
+  //   rsi = path_len    (advisory; the FNV inner loop terminates on
+  //                       the NUL, not on this length. Accepted so a
+  //                       future caller with a length already in hand
+  //                       does not have to re-strlen.)
+  //
+  // At this landing the body ALWAYS returns EX_ELEVATE_REFUSED (see
+  // module header for the two blockers). The scope_fp computation IS
+  // performed -- to smoke-test the fnv helper end-to-end from a real
+  // caller, and to keep the fail-closed timing indistinguishable from
+  // a future successful path's timing so an observer cannot side-
+  // channel "does mkfs.pdxfs have a real broker cap yet" from wall-
+  // clock alone -- but its result is discarded.
+  //
+  // Register plan: rbx = target_ptr held across the fnv call; pushed
+  // on entry, popped before the single ret. One pad push (r12) to
+  // restore rsp%16==0 across the nested call.
+  // ==========================================================================
+  pub let mkfs_elevate_open : (u64, u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) (path_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkfs.pdxfs #26 (LE-001 second landing): mkfs_elevate_open entry point. path_len (rsi) is accepted per the public signature but read by NOTHING in this body -- the fnv inner loop is NUL-terminated, and the fail-closed exit path needs no length. Push rbx (target_ptr, held across the nested fnv call) + push r12 (dead throwaway, restores rsp%16==0 across the call from paideia-as's entry rsp%16==8 -> after 1 push rsp%16==0, after 2 pushes rsp%16==8 which would misalign, so a THIRD push would be needed if we had a third live callee-save reg; here we have only rbx live so ONE pad push after rbx suffices: 2 pushes total = rsp%16==8 before the call ... wait no, entry is rsp%16==8, +1 push = rsp%16==0 already aligned, so a SINGLE push of rbx suffices and we do NOT push r12 at all -- rechecking: entry rsp is 16-aligned MINUS the 8-byte return addr the caller's own CALL wrote, so entry rsp % 16 == 8; each 8-byte push moves rsp down by 8; two pushes -> rsp%16==8-16 mod 16 == 8 ... wait, arithmetic: entry rsp%16 == 8 means rsp mod 16 = 8; after `push rbx` rsp is 8 less, mod 16 = (8-8) mod 16 = 0 (ALIGNED); after `push r12` rsp is 16 less than entry, mod 16 = (8-16) mod 16 = 8 (MISALIGNED). So ONE push is aligned before a nested call, TWO pushes are misaligned. With only rbx to preserve, ONE push is correct and NO pad is needed. Sequence: push rbx; mov rbx, rdi; mov rdi, rbx; call mkfs_elevate_scope_fp_fnv1a -> rax = scope_fp (discarded at this landing -- the day both blockers clear, this value flows into elevate_client_cap_bind_scope). Then unconditional fail-closed exit: mov rax, 0xFFFFFFFFEB195C4F (EX_ELEVATE_REFUSED, imm64 via MOVABS which the paideia-as encoder emits when the top-32 bits are nonzero -- verified against the codebase-wide MOVABS precedent in libpdx-elevate/src/elevate_client_send.pdx's ELVC_ERR_BAD_CTX = 0xFFFFEA06 note); pop rbx; ret. No `add reg,[mem]`. No `test`. Labels prefixed mkfs_elg_op_ (none needed -- straight-line body, no branch).",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                          // rbx = target_ptr
+
+        mov rdi, rbx;
+        call mkfs_elevate_scope_fp_fnv1a;      // scope_fp -> rax (discarded this landing)
+
+        mov rax, 0xFFFFFFFFEB195C4F;           // EX_ELEVATE_REFUSED
+
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mkfs_elevate_close(row_id) -> u64
+  //   0 on success or on the EX_ELEVATE_REFUSED short-circuit |
+  //   an ELCC_ERR_* propagated verbatim from cascade_revoke (future
+  //     body only -- at this landing every call returns 0)
+  //
+  //   rdi = row_id  (the value mkfs_elevate_open returned; either a
+  //                   real row_id (0..15) or the EX_ELEVATE_REFUSED
+  //                   sentinel)
+  //
+  // At this landing:
+  //   (a) row_id == EX_ELEVATE_REFUSED (the ONLY value this landing's
+  //       mkfs_elevate_open can produce): short-circuit, return 0. No
+  //       cascade call would be meaningful over a never-acquired handle;
+  //       the future body's same short-circuit is preserved verbatim.
+  //       No "MKFS ELEVATE OK" fingerprint is emitted -- honest, since
+  //       nothing was ever acquired to release.
+  //   (b) row_id != EX_ELEVATE_REFUSED (unreachable at this landing --
+  //       kept as documented dead code so the swap-day body only needs
+  //       to fill in a single `call elevate_client_cap_revoke_cascade`
+  //       between the label and the fingerprint emit): the ok-emit
+  //       label is landed; the actual cascade_revoke call is elided
+  //       (would require a symbol libpdx-elevate exports but that this
+  //       tool's link line does not resolve).
+  //
+  // Register plan: rbx = row_id held across the fingerprint sys_write;
+  // pushed on entry, popped before every return.
+  // ==========================================================================
+  pub let mkfs_elevate_close : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mkfs.pdxfs #26 (LE-001 second landing): mkfs_elevate_close entry point. Push rbx (row_id, preserved across the fingerprint sys_write on the emit path). mov rbx, rdi. Gate: mov r10, 0xFFFFFFFFEB195C4F (EX_ELEVATE_REFUSED, MOVABS imm64); cmp rbx, r10 (register-vs-register, no imm64-in-cmp issue); je mkfs_elg_cl_shortcut. On the shortcut path (the ONLY reachable arm at this landing per module header), xor rax, rax (return 0), pop rbx, ret -- no cascade, no fingerprint. Fall-through arm (mkfs_elg_cl_live, unreachable at this landing -- see module header for the swap-day body plan): would call elevate_client_cap_revoke_cascade(rbx) once the link-line blocker clears; that call is ELIDED at this landing so no undefined-reference relocation is emitted -- kept as a straight-line jump into the fingerprint emit so the swap-day patch is a single-line insertion between the label and the emit. Emits [MKFS ELEVATE OK]\\n to fd 2 via sys_write(2, elg_lit_ok, 18) -- SC+ ID 1 -- then xor rax, rax; pop rbx; ret. Since the live arm is currently unreachable, the sys_write itself is never executed and no `MKFS ELEVATE OK` line ever hits stderr under any invocation at this landing -- honest, matching the module-header contract. Two callee-save pushes would misalign the stack (see mkfs_elevate_open's justification for the arithmetic); ONE push is aligned across the one nested call (sys_write). No `add reg,[mem]`. No `test` -- the sentinel check is `cmp reg,reg` after staging through r10 for the imm64. Labels prefixed mkfs_elg_cl_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                          // rbx = row_id
+
+        mov r10, 0xFFFFFFFFEB195C4F;           // EX_ELEVATE_REFUSED (imm64 via MOVABS)
+        cmp rbx, r10;
+        je mkfs_elg_cl_shortcut;
+
+      mkfs_elg_cl_live:
+        // Unreachable at this landing -- see module header for the
+        // swap-day plan (a single `call elevate_client_cap_revoke_
+        // cascade` inserted here once libpdx-elevate lands on the
+        // link line and mkfs.pdxfs has a real broker cap allocated).
+        // Falls straight into the fingerprint emit.
+        mov rdi, 2;                            // fd = stderr
+        lea rsi, [rip + elg_lit_ok];
+        mov rdx, 18;                           // elg_lit_ok_len
+        mov rax, 1;                            // SC+ ID 1 = sys_write
+        syscall;
+
+        xor rax, rax;                          // success
+        pop rbx;
+        ret;
+
+      mkfs_elg_cl_shortcut:
+        // EX_ELEVATE_REFUSED short-circuit -- nothing to revoke, no
+        // fingerprint to emit (honest: no format ever succeeded).
+        xor rax, rax;                          // success (no-op release)
+        pop rbx;
+        ret;
+      }
+    }
+}
