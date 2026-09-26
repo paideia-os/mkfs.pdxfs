@@ -300,17 +300,19 @@ module ElevateGate = structure {
   // Scope-fingerprint versioning (see module header)
   // --------------------------------------------------------------------
 
-  // Top-byte algorithm tag on every scope_fp this gate produces. Lets a
-  // future blake3-backed landing swap the algo without also swapping
-  // every existing bound-scope handle silently.
+  // Top-byte algorithm tag on every scope_fp this gate produces. The
+  // FNV1A_64 tag is retired at paideia-os #2508 (RETIRE-1); this gate
+  // now stamps BLAKE3_T64 in the top byte. The two constants are kept
+  // side by side so a downstream verifier that observed a v1 handle
+  // with the 0x01 tag can still refuse it on shape (the acceptance
+  // predicate on the far side of the gate is `top-byte == 0x02`).
   pub let SCOPE_FP_ALGO_TAG_FNV1A_64    : u64 = 0x0100000000000000
   pub let SCOPE_FP_ALGO_TAG_BLAKE3_T64  : u64 = 0x0200000000000000
 
-  // FNV-1a-64 constants (standard values, sourced from the spec at
-  // isthe.com/chongo/tech/comp/fnv). Constants themselves need no
-  // library dependency.
-  pub let FNV1A_64_OFFSET_BASIS : u64 = 0xCBF29CE484222325
-  pub let FNV1A_64_PRIME        : u64 = 0x100000001B3
+  // paideia-os #2508: 32-byte scratch for the BLAKE3 digest output.
+  // Written on every mkfs_elevate_scope_fp_fnv1a call; caller reads
+  // the first 8 bytes as a little-endian u64.
+  pub let mut _mkfs_elg_hash_scratch : [u8; 32] = uninit @align(8)
 
   // --------------------------------------------------------------------
   // "MKFS ELEVATE OK" fingerprint literal (see module header)
@@ -324,45 +326,72 @@ module ElevateGate = structure {
   // ==========================================================================
   // mkfs_elevate_scope_fp_fnv1a(target_ptr) -> u64
   //
-  // Real, wired, callable at this landing. Computes:
-  //   scope_fp = SCOPE_FP_ALGO_TAG_FNV1A_64 | (FNV-1a-64(target[0..]) & 0x00FFFFFFFFFFFFFF)
+  // Function name retained (mkfs.pdxfs #26 froze it) but the body is
+  // now BLAKE3-truncated-64 per paideia-os #2508 (RETIRE-1) +
+  // paideia-as #1545 (Blake3::hash hook, v0.36.55+):
   //
-  // A future landing that swaps to blake3 truncation only needs to
-  // replace this function's body (or add a sibling and repoint the
-  // caller) -- the callers see the algo tag in the top byte and can
-  // therefore refuse a scope whose bound value carries the wrong tag.
+  //   len      = strlen(target_ptr)               (NUL-terminated)
+  //   digest32 = BLAKE3(target_ptr[0..len])       (paideia_crypto_blake3_hash)
+  //   scope_fp = SCOPE_FP_ALGO_TAG_BLAKE3_T64
+  //            | (u64::from_le_bytes(digest32[0..8]) & 0x00FFFFFFFFFFFFFF)
   //
-  // Byte loop over target_ptr until the first NUL (matches the
-  // format_record_strlen shape already established in src/format_
-  // record.pdx). Pure computation -- no syscalls, no nested calls;
-  // rax/rcx/rdx/r8/r9/rdi all SysV caller-save, no push/pop.
+  // The tag byte in bits [56..63] moves 0x01 -> 0x02. Downstream
+  // ElevateClient*::elevate_client_cap_bind_scope only reads the
+  // opaque u64; a wire-side verifier that checks the tag must accept
+  // 0x02. The gate body itself is still fail-closed at this landing
+  // (see module header for the two upstream blockers).
+  //
+  // Register plan (nested calls into strlen loop then extern-C
+  // BLAKE3): push rbx (target_ptr held across the strlen loop end
+  // condition and the BLAKE3 call) + push rbp (holds strlen result
+  // across the call). Two pushes on entry rsp%16==8 → rsp%16==8 mod
+  // 16 = 8 (unchanged); nested BLAKE3 call needs rsp%16==0, so add a
+  // sub rsp,8 pad. Labels prefixed mkfs_elg_.
   // ==========================================================================
   pub let mkfs_elevate_scope_fp_fnv1a : (u64) -> u64 !{mem} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkfs.pdxfs #26 (LE-001 second landing): mkfs_elevate_scope_fp_fnv1a entry point. Pure leaf -- rax/rcx/rdx/r8/r9/rdi all SysV caller-save, no push/pop, no callee-save touched, no nested call. Register plan: rdi = target_ptr (advanced by 1 each iteration), r8 = FNV_OFFSET_BASIS (running hash, initialised via a `mov r8, imm64`), r9 = FNV_PRIME (constant, initialised once outside the loop). Inner loop (mkfs_elg_fnv_loop): xor rax, rax; mov_b rax, [rdi] (paideia-as #1248 zero-extended byte load, same idiom src/target.pdx uses for its own first-byte load); cmp rax, 0; je mkfs_elg_fnv_done on NUL. Otherwise xor r8, rax (FNV-1a: XOR the byte into the running hash BEFORE the multiply -- the -1a variant). Then multiply r8 by r9: `mov rax, r8; mul r9` puts r8*r9 into rdx:rax (unsigned 64x64 -> 128); mov r8, rax discards the high 64 (FNV-1a-64 is the low 64 by definition), no `imul r,imm` used. add rdi, 1; jmp mkfs_elg_fnv_loop. Exit: rax = r8, then apply the algo-tag mask via a two-step: mov r10, 0x00FFFFFFFFFFFFFF (fits imm64 via MOVABS); and rax, r10 (imm32-safe by staging through r10 first per the encoder-pitfall discipline); mov r10, 0x0100000000000000 (SCOPE_FP_ALGO_TAG_FNV1A_64, MOVABS); or rax, r10. ret. No `add reg,[mem]`, no `test`, no `and r11,imm64` (staged through r10 which is fine since r10 is scratch throughout), no 2-op imul, no neg. Labels prefixed mkfs_elg_fnv_.",
+      justification: "paideia-os #2508 (RETIRE-1) + paideia-as #1545 (Blake3::hash hook, v0.36.55+): BLAKE3-truncated-64 scope-fingerprint over the NUL-terminated target path, stamped with SCOPE_FP_ALGO_TAG_BLAKE3_T64 (0x02) in bits [56..63]. Body: (1) push rbx (holds target_ptr across strlen + call) + push rbp (holds strlen result across call); entry rsp%16==8, +16 -> %16==8 unchanged; sub rsp,8 -> %16==0 for the extern-C call. (2) Inline strlen: r10=cursor at target_ptr, rcx=0; strlen_loop: xor rax,rax; mov_b rax,[r10]; cmp rax,0; je strlen_done; add r10,1; add rcx,1; jmp strlen_loop. strlen_done: rbp=rcx. (3) Marshal paideia_crypto_blake3_hash(rdi=target_ptr, rsi=len, rdx=&scratch): mov rdi,rbx; mov rsi,rbp; lea rdx,[rip+_mkfs_elg_hash_scratch]; call paideia_crypto_blake3_hash. (4) Load first 8 bytes of scratch as LE u64 (single 64-bit load on x86_64): lea r10,[rip+_mkfs_elg_hash_scratch]; mov rax,[r10]. (5) Mask low 56 bits via staged imm64: mov r10,0x00FFFFFFFFFFFFFF; and rax,r10 (imm32-safe, staged through r10). (6) OR the algo tag: mov r10,0x0200000000000000; or rax,r10. (7) add rsp,8; pop rbp; pop rbx; ret. No test, no `and r11,imm64`, no 2-op imul,imm. Labels prefixed mkfs_elg_fnv_.",
       block: {
-        mov r8, 0xCBF29CE484222325;             // FNV1A_64_OFFSET_BASIS
-        mov r9, 0x100000001B3;                  // FNV1A_64_PRIME
+        push rbx;
+        push rbp;
+        sub rsp, 8;                            // rsp%16==0 for nested call
 
-      mkfs_elg_fnv_loop:
+        mov rbx, rdi;                          // rbx = target_ptr (preserved)
+
+        // Inline strlen over NUL-terminated target string.
+        mov r10, rbx;                          // cursor
+        xor rcx, rcx;                          // count
+      mkfs_elg_fnv_strlen:
         xor rax, rax;
-        mov_b rax, [rdi];
+        mov_b rax, [r10];
         cmp rax, 0;
-        je mkfs_elg_fnv_done;
-        xor r8, rax;
-        mov rax, r8;
-        mul r9;
-        mov r8, rax;
-        add rdi, 1;
-        jmp mkfs_elg_fnv_loop;
+        je  mkfs_elg_fnv_strlen_done;
+        add r10, 1;
+        add rcx, 1;
+        jmp mkfs_elg_fnv_strlen;
 
-      mkfs_elg_fnv_done:
-        mov rax, r8;
-        mov r10, 0x00FFFFFFFFFFFFFF;            // low-56 mask (imm64 via MOVABS)
-        and rax, r10;                           // imm32-safe (staged through r10)
-        mov r10, 0x0100000000000000;            // SCOPE_FP_ALGO_TAG_FNV1A_64
-        or rax, r10;
+      mkfs_elg_fnv_strlen_done:
+        mov rbp, rcx;                          // rbp = strlen
+
+        // paideia_crypto_blake3_hash(target_ptr, len, &scratch).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        lea rdx, [rip + _mkfs_elg_hash_scratch];
+        call paideia_crypto_blake3_hash;
+
+        // Load first 8 bytes as LE u64.
+        lea r10, [rip + _mkfs_elg_hash_scratch];
+        mov rax, [r10];
+
+        mov r10, 0x00FFFFFFFFFFFFFF;           // low-56 mask (MOVABS)
+        and rax, r10;                          // imm32-safe (staged through r10)
+        mov r10, 0x0200000000000000;           // SCOPE_FP_ALGO_TAG_BLAKE3_T64
+        or  rax, r10;
+
+        add rsp, 8;
+        pop rbp;
+        pop rbx;
         ret;
       }
     }
